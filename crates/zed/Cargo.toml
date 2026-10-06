@@ -6,7 +6,7 @@ version = "1.24.0"
 publish.workspace = true
 license = "GPL-3.0-or-later"
 authors = ["Zed Team <hi@zed.dev>"]
-default-run = "zed"
+default-run = "cedian"
 
 [lints]
 workspace = true
@@ -54,8 +54,9 @@ visual-tests = [
     "title_bar/test-support",
 ]
 
+# cedian fork: the app binary is `cedian` (S9a).
 [[bin]]
-name = "zed"
+name = "cedian"
 path = "src/main.rs"
 
 [[bin]]
@@ -171,6 +172,7 @@ notifications.workspace = true
 onboarding.workspace = true
 outline.workspace = true
 outline_panel.workspace = true
+cedian_panel.workspace = true
 parking_lot.workspace = true
 paths.workspace = true
 picker.workspace = true

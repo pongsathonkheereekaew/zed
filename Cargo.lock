@@ -2788,6 +2788,88 @@ dependencies = [
 ]
 
 [[package]]
+name = "cedian_agent"
+version = "0.1.0"
+dependencies = [
+ "cedian_omp",
+ "omp-rpc",
+ "parking_lot",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "cedian_agent_ui"
+version = "0.1.0"
+dependencies = [
+ "cedian_agent",
+ "cedian_omp",
+ "omp-rpc",
+ "parking_lot",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "cedian_lsp"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "cedian_omp"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "omp-rpc",
+ "parking_lot",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "cedian_panel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cedian_agent",
+ "cedian_agent_ui",
+ "cedian_omp",
+ "cedian_workspace",
+ "clock",
+ "collections",
+ "editor",
+ "fs",
+ "futures 0.3.34",
+ "gpui",
+ "language",
+ "log",
+ "project",
+ "serde_json",
+ "settings",
+ "text",
+ "theme",
+ "theme_settings",
+ "ui",
+ "workspace",
+]
+
+[[package]]
+name = "cedian_workspace"
+version = "0.1.0"
+dependencies = [
+ "cedian_lsp",
+ "cedian_omp",
+ "omp-rpc",
+ "parking_lot",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cesu8"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12077,6 +12159,15 @@ dependencies = [
  "serde",
  "serde_json",
  "settings_content",
+]
+
+[[package]]
+name = "omp-rpc"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -22417,6 +22508,7 @@ dependencies = [
  "breadcrumbs",
  "call",
  "call_hierarchy",
+ "cedian_panel",
  "channel",
  "chrono",
  "clap",

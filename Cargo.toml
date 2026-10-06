@@ -25,6 +25,7 @@ members = [
     "crates/breadcrumbs",
     "crates/buffer_diff",
     "crates/call",
+    "crates/cedian_panel",
     "crates/call_hierarchy",
     "crates/channel",
     "crates/cli",
@@ -302,6 +303,7 @@ bedrock = { path = "crates/bedrock" }
 breadcrumbs = { path = "crates/breadcrumbs" }
 buffer_diff = { path = "crates/buffer_diff" }
 call = { path = "crates/call" }
+cedian_panel = { path = "crates/cedian_panel" }
 call_hierarchy = { path = "crates/call_hierarchy" }
 channel = { path = "crates/channel" }
 cli = { path = "crates/cli", default-features = false }

@@ -78,6 +78,21 @@ fn hold(file: &Path) -> Child {
         .unwrap()
 }
 
+/// Wait until `holder` has `file` open, as lsof sees it.
+fn until_held(file: &Path, holder: &Child) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !cedian_omp::driver::holders(&[file.to_path_buf()])
+        .unwrap()
+        .contains(&holder.id())
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the holder never opened {file:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn release(mut holder: Child) {
     holder.kill().ok();
     holder.wait().ok();
@@ -97,7 +112,7 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
     let held = sessions.join("held.jsonl");
     std::fs::write(&held, "").unwrap();
     let holder = hold(&held);
-    std::thread::sleep(Duration::from_millis(300));
+    until_held(&held, &holder);
 
     let project = Project::test(fs::RealFs::new(None, cx.executor()), [ws.as_path()], cx).await;
     let window = cx.add_window(|window, cx| CedianPanel::new(project.clone(), window, cx));
@@ -119,14 +134,17 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
     assert_eq!(turn, Turn::Idle);
     assert!(notice.contains("another process drives"), "{notice}");
 
-    // 2. Retry.
+    // 2. Retry: it checks again (the panel shows it checking) and still
+    // finds the holder.
     click(&mut vcx, "cedian-retry");
-    std::thread::sleep(Duration::from_millis(500));
-    cx.run_until_parked();
-    assert!(matches!(
+    assert_eq!(
         window.update(cx, |p, _, _| p.connection().clone()).unwrap(),
-        Connection::Taken { .. }
-    ));
+        Connection::Starting,
+        "Retry asked for a check"
+    );
+    wait(cx, &window, "Retry's check", |p| {
+        matches!(p.connection(), Connection::Taken { .. })
+    });
     release(holder);
     click(&mut vcx, "cedian-retry");
     wait(cx, &window, "the session to open", |p| {
@@ -135,12 +153,17 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
 
     // 3. A driver appears before the next prompt.
     let holder = hold(&held);
-    std::thread::sleep(Duration::from_millis(300));
+    until_held(&held, &holder);
     let (turn, _) = submit(cx, &window, "must not reach OMP");
     assert_eq!(turn, Turn::Queued, "the panel did not know yet");
     wait(cx, &window, "the prompt to be refused", |p| {
         matches!(p.connection(), Connection::Taken { .. }) && p.turn() == &Turn::Idle
     });
+    let transcript = window.update(cx, |p, _, _| p.transcript()).unwrap();
+    assert!(
+        !transcript.iter().any(|l| l.contains("must not reach OMP")),
+        "a refused prompt is not shown as sent: {transcript:?}"
+    );
 
     // 4. A new session.
     click(&mut vcx, "cedian-new-session");

@@ -316,8 +316,10 @@ impl CedianPanel {
 
     /// The Retry button of a taken session.
     pub fn retry_session(&mut self, cx: &mut Context<Self>) {
-        if let Some(Err(e)) = self.link.as_ref().map(OmpLink::retry) {
-            self.notice = Some(e);
+        match self.link.as_ref().map(OmpLink::retry) {
+            Some(Ok(())) => self.connection = Connection::Starting,
+            Some(Err(e)) => self.notice = Some(e),
+            None => {}
         }
         cx.notify();
     }

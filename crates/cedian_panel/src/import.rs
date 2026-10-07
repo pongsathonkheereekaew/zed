@@ -55,41 +55,52 @@ pub fn begin(buffer: &mut Buffer) -> Mark {
     }
 }
 
-/// Reload from disk and fold everything since [`begin`] into one transaction.
+/// Load the disk text and fold everything since [`begin`] into one
+/// transaction. The import applies the disk diff itself rather than calling
+/// `Buffer::reload`: the project's watcher reloads the same change on its
+/// own, and a second `reload` cancels the first, so the import would see
+/// nothing while the watcher's reload landed after it. Applying the diff
+/// directly is safe in either order: whichever lands second finds its hunks
+/// already in the buffer and applies nothing.
 pub async fn finish(
     buffer: Entity<Buffer>,
     mark: Mark,
     cx: &mut AsyncApp,
 ) -> Result<ImportOutcome> {
-    let (dirty, watcher_txn) = buffer.read_with(cx, |b, _| {
+    let (dirty, watcher_txn, load) = buffer.read_with(cx, |b, cx| {
         let raced = (top(b) != mark.start_top).then(|| top(b)).flatten();
-        (b.is_dirty(), raced)
+        let load = b.file().and_then(|f| f.as_local()).map(|f| f.load(cx));
+        (b.is_dirty(), raced, load)
     });
     if dirty {
         return Ok(ImportOutcome::Stale);
     }
+    let Some(load) = load else {
+        return Ok(ImportOutcome::Unchanged);
+    };
+    let new_text = load.await?;
+    let diff = buffer.read_with(cx, |b, cx| b.diff(new_text, cx)).await;
 
-    let before = buffer.read_with(cx, |b, _| b.version());
-    let reload = buffer.update(cx, |b, cx| b.reload(cx));
-    let reloaded = reload.await.ok().flatten();
-
-    buffer.update(cx, |b, _| {
-        // `reload` returns the previous top when its diff was empty, so only a
-        // version change proves it applied something.
-        let ours = reloaded.map(|txn| txn.id).filter(|_| b.version() != before);
+    buffer.update(cx, |b, cx| {
+        b.finalize_last_transaction();
+        let ours = b.apply_diff(diff, cx);
+        b.finalize_last_transaction();
+        let changed = b.version() != *mark.start.version();
+        if changed {
+            let mtime = b.file().and_then(|f| f.disk_state().mtime());
+            b.did_reload(b.version(), b.line_ending(), mtime, cx);
+        }
         let id = match (watcher_txn, ours) {
-            (Some(watcher), Some(ours)) => {
+            (Some(watcher), Some(ours)) if watcher != ours => {
                 b.merge_transactions(ours, watcher);
                 Some(watcher)
             }
-            (Some(one), None) | (None, Some(one)) => Some(one),
-            (None, None) => None,
+            // The watcher may have landed between the check above and the
+            // apply: the top of the undo stack is then its transaction.
+            _ => top(b).filter(|t| Some(*t) != mark.start_top),
         };
         Ok(match id {
-            Some(id) if b.version() != *mark.start.version() => {
-                b.finalize_last_transaction();
-                ImportOutcome::Imported(id)
-            }
+            Some(id) if changed => ImportOutcome::Imported(id),
             _ => ImportOutcome::Unchanged,
         })
     })

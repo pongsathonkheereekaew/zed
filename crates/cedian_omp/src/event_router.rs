@@ -35,11 +35,14 @@ pub enum RouterEvent {
     MessageEnd { message_id: String },
     /// Tool execution lifecycle from OMP's own tools. `args_preview` is a
     /// one-line human summary (never raw JSON); `result_summary` likewise,
-    /// filled at end. Phase 3 registry renders both.
+    /// filled at end. Phase 3 registry renders both. `paths` are the files an
+    /// edit-class tool is about to write, as OMP names them (workspace
+    /// relative), so the host can open and mark them before the write lands.
     ToolStart {
         tool_call_id: String,
         tool_name: String,
         args_preview: String,
+        paths: Vec<String>,
     },
     /// Tool execution finished.
     ToolEnd {
@@ -227,6 +230,7 @@ impl EventRouter {
                     tool_call_id,
                     tool_name,
                     args_preview,
+                    ..
                 } => {
                     started.insert(tool_call_id, (tool_name, args_preview));
                 }
@@ -353,6 +357,7 @@ fn classify_agent_event(event: &RpcAgentEvent) -> RouterEvent {
             tool_call_id: start.tool_call_id.clone(),
             tool_name: start.tool_name.clone(),
             args_preview: summarize_args(&start.tool_name, start.args.as_ref()),
+            paths: written_paths(&start.tool_name, start.args.as_ref()),
         },
         RpcAgentEvent::ToolExecutionEnd(end) => RouterEvent::ToolEnd {
             tool_call_id: end.tool_call_id.clone(),
@@ -371,6 +376,41 @@ fn classify_agent_event(event: &RpcAgentEvent) -> RouterEvent {
 }
 /// One-line human summary of tool args — never raw JSON. Per-tool shapes from
 /// `get_state.dumpTools` parameters; unknown tools fall back to key names.
+/// The files an edit-class tool writes. `write` and `ast_edit` name one
+/// `path`; `edit` takes a script whose `[path#hash]` headers name each file.
+pub fn written_paths(name: &str, args: Option<&serde_json::Value>) -> Vec<String> {
+    let Some(args) = args else {
+        return Vec::new();
+    };
+    let path = || {
+        args.get("path")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .into_iter()
+            .collect()
+    };
+    match name {
+        "write" | "ast_edit" => path(),
+        "edit" => {
+            let input = args.get("input").and_then(|v| v.as_str()).unwrap_or("");
+            let mut paths: Vec<String> = Vec::new();
+            for line in input.lines() {
+                let Some(body) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) else {
+                    continue;
+                };
+                match body.rsplit_once('#') {
+                    Some((path, _hash)) if !paths.iter().any(|p| p == path) => {
+                        paths.push(path.to_string())
+                    }
+                    _ => {}
+                }
+            }
+            paths
+        }
+        _ => Vec::new(),
+    }
+}
+
 fn summarize_args(name: &str, args: Option<&serde_json::Value>) -> String {
     let Some(args) = args else {
         return String::new();
@@ -467,6 +507,27 @@ fn summarize_result(name: &str, result: Option<&serde_json::Value>) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn written_paths_name_every_file_an_edit_tool_touches() {
+        use serde_json::json;
+        let edit = json!({"input": "[notes.txt#6193]\nPUT 2.=2:\n+BETA\n[src/a.rs#0585]\nPUT 1.=1:\n+x\n[notes.txt#6193]\n"});
+        assert_eq!(
+            super::written_paths("edit", Some(&edit)),
+            vec!["notes.txt".to_string(), "src/a.rs".to_string()]
+        );
+        let write = json!({"path": "new.txt", "content": "x"});
+        assert_eq!(
+            super::written_paths("write", Some(&write)),
+            vec!["new.txt".to_string()]
+        );
+        assert_eq!(
+            super::written_paths("ast_edit", Some(&write)),
+            vec!["new.txt".to_string()]
+        );
+        assert!(super::written_paths("bash", Some(&json!({"command": "rm notes.txt"}))).is_empty());
+        assert!(super::written_paths("edit", None).is_empty());
+    }
+
     use super::*;
     use omp_rpc::wire::{PromptResultEvent, SessionSettledEvent};
 
@@ -481,6 +542,7 @@ mod tests {
             tool_call_id: id.into(),
             tool_name: name.into(),
             args_preview: format!("{name} args"),
+            paths: Vec::new(),
         };
         let end = |id: &str, name: &str, is_error| RouterEvent::ToolEnd {
             tool_call_id: id.into(),

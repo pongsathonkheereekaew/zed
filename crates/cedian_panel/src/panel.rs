@@ -10,13 +10,21 @@
 //! OMP's dialogs (approvals, `confirm`, `input`, `editor`, `ask`) are answered
 //! here (U4, §63): several can be open at once, keyed by request id. A turn
 //! can be stopped, and images pasted into the composer go with the prompt.
+//!
+//! Every imported agent transaction feeds the task's [`TaskReview`] (U5,
+//! §18, ADR-0006). A file OMP is about to write that is not open is opened
+//! first, so its write is a reviewable transaction too. The Review Changes
+//! view lists each file's hunks with Accept and Reject, Accept all, and
+//! Revert turn.
 
 use crate::dialogs::OpenDialog;
 use crate::import::{self, ImportOutcome, Mark};
 use crate::omp_link::{AnswerError, LaunchSpec, LinkEvent, OmpLink, Prompt};
 use crate::omp_settings::OmpSettings;
+use crate::review::{ReviewError, ReviewEvent, TaskReview};
 use cedian_agent::Thread;
 use cedian_omp::{RouterEvent, UserAnswer};
+use cedian_review::HunkStatus;
 use collections::{HashMap, IndexMap};
 use editor::{Editor, actions::Paste};
 use futures::{StreamExt, channel::mpsc};
@@ -29,7 +37,6 @@ use omp_rpc::{ExtensionUiRequest, ImageContent};
 use project::Project;
 use std::path::PathBuf;
 use std::time::Duration;
-use text::TransactionId;
 use ui::{Button, Label, prelude::*};
 use workspace::{
     Workspace,
@@ -57,11 +64,13 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
-/// One agent edit imported as a native transaction.
-pub struct ImportedEdit {
-    pub tool_call_id: String,
-    pub buffer: Entity<Buffer>,
-    pub transaction: TransactionId,
+/// One edit-class tool call in flight: the buffers marked before its write,
+/// and how many files it names that are still being opened.
+struct CallMarks {
+    marks: Vec<(Entity<Buffer>, Mark)>,
+    opening: usize,
+    /// `ToolEnd` came (with its `is_error`) before every open finished.
+    ended: Option<bool>,
 }
 
 /// How long a dialog waits on the person before cedian closes it (§63,
@@ -124,9 +133,9 @@ pub struct CedianPanel {
     thread: Thread,
     link: Option<OmpLink>,
     connection: Connection,
-    marks: HashMap<String, Vec<(Entity<Buffer>, Mark)>>,
-    imported: Vec<ImportedEdit>,
-    stale: usize,
+    calls: HashMap<String, CallMarks>,
+    review: TaskReview,
+    show_review: bool,
     turn: Turn,
     /// The last thing the person should know that is not on a dialog: a
     /// refused prompt, a failed turn, a dialog cedian closed.
@@ -167,9 +176,9 @@ impl CedianPanel {
             thread: Thread::new(),
             link: None,
             connection: Connection::NotStarted,
-            marks: HashMap::default(),
-            imported: Vec::new(),
-            stale: 0,
+            calls: HashMap::default(),
+            review: TaskReview::new("panel"),
+            show_review: false,
             turn: Turn::Idle,
             notice: None,
             dialogs: IndexMap::default(),
@@ -269,9 +278,70 @@ impl CedianPanel {
         }
     }
 
-    /// Agent edits imported so far (newest last).
-    pub fn imported(&self) -> &[ImportedEdit] {
-        &self.imported
+    /// The task's review: every agent transaction imported so far.
+    pub fn review(&self) -> &TaskReview {
+        &self.review
+    }
+
+    /// Show or hide the Review Changes view.
+    pub fn toggle_review(&mut self, cx: &mut Context<Self>) {
+        self.show_review = !self.show_review;
+        self.review.rebuild(cx);
+        self.after_review_change(cx);
+    }
+
+    /// The Accept button of one hunk.
+    pub fn accept_hunk(&mut self, path: &std::path::Path, index: usize, cx: &mut Context<Self>) {
+        self.review.rebuild(cx);
+        let result = self.review.accept(path, index, cx);
+        self.report_review(result, cx);
+    }
+
+    /// The Reject button of one hunk: the baseline lines come back as one
+    /// transaction (one native undo restores the agent's text).
+    pub fn reject_hunk(&mut self, path: &std::path::Path, index: usize, cx: &mut Context<Self>) {
+        self.review.rebuild(cx);
+        let result = self.review.reject(path, index, cx).map(|_| ());
+        self.report_review(result, cx);
+    }
+
+    /// The Accept all button: every pending hunk; STALE ones stay.
+    pub fn accept_all(&mut self, cx: &mut Context<Self>) {
+        self.review.rebuild(cx);
+        let accepted = self.review.accept_all(cx);
+        self.notice = Some(format!("accepted {} hunk(s)", accepted.len()));
+        self.after_review_change(cx);
+    }
+
+    /// The Revert turn button: reject every pending hunk the turn made.
+    pub fn revert_turn(&mut self, turn: u32, cx: &mut Context<Self>) {
+        let result = self.review.revert_turn(turn, cx).map(|event| {
+            if let ReviewEvent::TurnReverted {
+                turn,
+                reverted,
+                stale,
+            } = event
+            {
+                self.notice = Some(format!(
+                    "turn {turn} reverted: {reverted} hunk(s) put back, {stale} STALE kept"
+                ));
+            }
+        });
+        self.report_review(result, cx);
+    }
+
+    fn report_review(&mut self, result: Result<(), ReviewError>, cx: &mut Context<Self>) {
+        if let Err(e) = result {
+            self.notice = Some(e.to_string());
+        }
+        self.after_review_change(cx);
+    }
+
+    fn after_review_change(&mut self, cx: &mut Context<Self>) {
+        for event in self.review.drain_events() {
+            log::info!("cedian review: {event:?}");
+        }
+        cx.notify();
     }
 
     fn workspace_root(&self, cx: &App) -> Option<PathBuf> {
@@ -436,7 +506,7 @@ impl CedianPanel {
     fn stop(&mut self, reason: String) {
         self.link = None;
         self.dialogs.clear();
-        self.marks.clear();
+        self.calls.clear();
         self.turn = Turn::Idle;
         self.connection = Connection::Stopped(reason);
     }
@@ -473,6 +543,7 @@ impl CedianPanel {
         self.input.update(cx, |editor, cx| editor.clear(window, cx));
         self.images.clear();
         self.thread.push_user(&text);
+        self.review.begin_turn();
         self.notice = None;
         self.turn = Turn::Queued;
         cx.notify();
@@ -483,33 +554,19 @@ impl CedianPanel {
             RouterEvent::ToolStart {
                 tool_call_id,
                 tool_name,
+                paths,
                 ..
             } if EDIT_TOOLS.contains(&tool_name.as_str()) => {
-                let buffers: Vec<_> = self
-                    .project
-                    .read(cx)
-                    .opened_buffers(cx)
-                    .into_iter()
-                    .filter(|b| b.read(cx).file().is_some_and(|f| f.is_local()))
-                    .collect();
-                let marks = buffers
-                    .into_iter()
-                    .map(|b| {
-                        let mark = b.update(cx, |b, _| import::begin(b));
-                        (b, mark)
-                    })
-                    .collect();
-                self.marks.insert(tool_call_id.clone(), marks);
+                self.mark_before_write(tool_call_id.clone(), paths, cx);
             }
             RouterEvent::ToolEnd {
                 tool_call_id,
                 is_error,
                 ..
             } => {
-                if let Some(marks) = self.marks.remove(tool_call_id) {
-                    if !is_error {
-                        self.import(tool_call_id.clone(), marks, cx);
-                    }
+                if let Some(call) = self.calls.get_mut(tool_call_id) {
+                    call.ended = Some(*is_error);
+                    self.import_when_ready(tool_call_id.clone(), cx);
                 }
             }
             RouterEvent::AgentStart if self.turn == Turn::Queued => self.turn = Turn::Streaming,
@@ -735,34 +792,245 @@ impl CedianPanel {
             .into_any_element()
     }
 
-    fn import(
+    /// An edit-class tool starts: mark every open local buffer, and open the
+    /// files it names that are not open yet so their write is imported too.
+    fn mark_before_write(
         &mut self,
         tool_call_id: String,
-        marks: Vec<(Entity<Buffer>, Mark)>,
+        paths: &[String],
         cx: &mut Context<Self>,
     ) {
+        let buffers: Vec<_> = self
+            .project
+            .read(cx)
+            .opened_buffers(cx)
+            .into_iter()
+            .filter(|b| b.read(cx).file().is_some_and(|f| f.is_local()))
+            .collect();
+        let open: Vec<PathBuf> = buffers
+            .iter()
+            .filter_map(|b| b.read(cx).file().and_then(|f| f.as_local()))
+            .map(|f| f.abs_path(cx))
+            .collect();
+        let marks = buffers
+            .into_iter()
+            .map(|b| {
+                self.review.observe(&b, cx);
+                let mark = b.update(cx, |b, _| import::begin(b));
+                (b, mark)
+            })
+            .collect();
+        let root = self.workspace_root(cx);
+        let to_open: Vec<PathBuf> = paths
+            .iter()
+            .filter_map(|p| {
+                let path = std::path::Path::new(p);
+                if path.is_absolute() {
+                    Some(path.to_path_buf())
+                } else {
+                    root.as_ref().map(|r| r.join(path))
+                }
+            })
+            .filter(|p| !open.iter().any(|o| o == p))
+            .collect();
+        self.calls.insert(
+            tool_call_id.clone(),
+            CallMarks {
+                marks,
+                opening: to_open.len(),
+                ended: None,
+            },
+        );
+        for path in to_open {
+            let open = self
+                .project
+                .update(cx, |p, cx| p.open_local_buffer(path.clone(), cx));
+            let id = tool_call_id.clone();
+            cx.spawn(async move |this, cx| {
+                let opened = open.await;
+                this.update(cx, |this, cx| {
+                    let Some(call) = this.calls.get_mut(&id) else {
+                        return;
+                    };
+                    match opened {
+                        Ok(buffer) => {
+                            let mark = buffer.update(cx, |b, _| import::begin(b));
+                            call.marks.push((buffer, mark));
+                        }
+                        Err(e) => {
+                            log::error!("cedian: cannot open {} for review: {e}", path.display())
+                        }
+                    }
+                    call.opening -= 1;
+                    this.import_when_ready(id, cx);
+                })
+                .ok();
+            })
+            .detach();
+        }
+    }
+
+    /// Import a call's marks once its `ToolEnd` came and every open finished.
+    fn import_when_ready(&mut self, tool_call_id: String, cx: &mut Context<Self>) {
+        let ready = self
+            .calls
+            .get(&tool_call_id)
+            .is_some_and(|c| c.opening == 0 && c.ended.is_some());
+        if !ready {
+            return;
+        }
+        let call = self.calls.remove(&tool_call_id).expect("checked above");
+        if call.ended == Some(true) {
+            return;
+        }
         cx.spawn(async move |this, cx| {
-            for (buffer, mark) in marks {
-                let outcome = import::finish(buffer.clone(), mark, cx).await;
+            for (buffer, mark) in call.marks {
+                let outcome = import::finish(buffer.clone(), mark.clone(), cx).await;
                 this.update(cx, |this, cx| {
                     match outcome {
-                        Ok(ImportOutcome::Imported(transaction)) => {
-                            this.imported.push(ImportedEdit {
-                                tool_call_id: tool_call_id.clone(),
-                                buffer,
-                                transaction,
-                            })
+                        Ok(ImportOutcome::Imported(transaction)) => this.review.agent_edited(
+                            &buffer,
+                            &tool_call_id,
+                            transaction,
+                            mark.start().clone(),
+                            cx,
+                        ),
+                        Ok(ImportOutcome::Stale) => {
+                            this.review.import_refused(&buffer, &tool_call_id, cx)
                         }
-                        Ok(ImportOutcome::Stale) => this.stale += 1,
                         Ok(ImportOutcome::Unchanged) => {}
                         Err(e) => log::error!("cedian: import failed: {e}"),
                     }
-                    cx.notify();
+                    this.after_review_change(cx);
                 })
                 .ok();
             }
         })
         .detach();
+    }
+
+    fn render_review(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        self.review.rebuild(cx);
+        let turn = self.review.current_turn();
+        let mut body = v_flex()
+            .id("cedian-review")
+            .debug_selector(|| "cedian-review".to_string())
+            .flex_1()
+            .overflow_y_scroll()
+            .gap_2()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(Label::new("Review changes"))
+                    .child(
+                        div()
+                            .debug_selector(|| "cedian-accept-all".to_string())
+                            .child(
+                                Button::new("cedian-accept-all", "Accept all")
+                                    .on_click(cx.listener(|this, _, _, cx| this.accept_all(cx))),
+                            ),
+                    )
+                    .when(turn > 0, |row| {
+                        row.child(
+                            div()
+                                .debug_selector(|| "cedian-revert-turn".to_string())
+                                .child(
+                                    Button::new(
+                                        "cedian-revert-turn",
+                                        format!("Revert turn {turn}"),
+                                    )
+                                    .on_click(
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.revert_turn(turn, cx)
+                                        }),
+                                    ),
+                                ),
+                        )
+                    }),
+            );
+        if self.review.is_empty() {
+            return body
+                .child(Label::new("No agent edits yet").color(Color::Muted))
+                .into_any_element();
+        }
+        let files: Vec<_> = self
+            .review
+            .files()
+            .iter()
+            .map(|file| {
+                (
+                    self.review.path(file, cx),
+                    file.stale_import().map(str::to_string),
+                    file.hunks().to_vec(),
+                )
+            })
+            .collect();
+        for (path, stale_import, hunks) in files {
+            let name = path.display().to_string();
+            let mut section = v_flex()
+                .gap_1()
+                .child(Label::new(name.clone()).size(LabelSize::Small));
+            if let Some(reason) = stale_import {
+                section = section.child(
+                    Label::new(format!("STALE: {reason}"))
+                        .size(LabelSize::Small)
+                        .color(Color::Warning),
+                );
+            }
+            for (index, hunk) in hunks.into_iter().enumerate() {
+                let selector = |action: &str| format!("cedian-{action}-{name}-{index}");
+                let head = format!(
+                    "lines {}-{} · {:?} · {}",
+                    hunk.rows.start + 1,
+                    hunk.rows.end,
+                    hunk.status,
+                    hunk.tool_call_ids.join(", ")
+                );
+                let mut card = v_flex()
+                    .p_1()
+                    .border_1()
+                    .border_color(cx.theme().colors().border)
+                    .child(Label::new(head).size(LabelSize::Small))
+                    .children(hunk.old_text.lines().map(|l| {
+                        Label::new(format!("- {l}"))
+                            .size(LabelSize::Small)
+                            .color(Color::Deleted)
+                            .into_any_element()
+                    }))
+                    .children(hunk.new_text.lines().map(|l| {
+                        Label::new(format!("+ {l}"))
+                            .size(LabelSize::Small)
+                            .color(Color::Created)
+                            .into_any_element()
+                    }));
+                let accept = matches!(
+                    hunk.status,
+                    HunkStatus::Pending | HunkStatus::Unattributed | HunkStatus::Stale
+                );
+                let reject = matches!(hunk.status, HunkStatus::Pending | HunkStatus::Unattributed);
+                let mut buttons = h_flex().gap_1();
+                if accept {
+                    let (p, s) = (path.clone(), selector("accept"));
+                    buttons = buttons.child(div().debug_selector(|| s.clone()).child(
+                        Button::new(ElementId::Name(s.clone().into()), "Accept").on_click(
+                            cx.listener(move |this, _, _, cx| this.accept_hunk(&p, index, cx)),
+                        ),
+                    ));
+                }
+                if reject {
+                    let (p, s) = (path.clone(), selector("reject"));
+                    buttons = buttons.child(div().debug_selector(|| s.clone()).child(
+                        Button::new(ElementId::Name(s.clone().into()), "Reject").on_click(
+                            cx.listener(move |this, _, _, cx| this.reject_hunk(&p, index, cx)),
+                        ),
+                    ));
+                }
+                card = card.child(buttons);
+                section = section.child(card);
+            }
+            body = body.child(section);
+        }
+        body.into_any_element()
     }
 }
 
@@ -820,17 +1088,37 @@ impl Render for CedianPanel {
         let stoppable = matches!(self.turn, Turn::Queued | Turn::Streaming);
         let idle = self.turn == Turn::Idle;
         let images = self.images.len();
+        let imported: usize = self
+            .review
+            .files()
+            .iter()
+            .map(|f| f.agent_txns().len())
+            .sum();
+        let open: usize = self
+            .review
+            .files()
+            .iter()
+            .flat_map(|f| f.hunks())
+            .filter(|h| !matches!(h.status, HunkStatus::Accepted | HunkStatus::Rejected))
+            .count();
+        let stale_files = self
+            .review
+            .files()
+            .iter()
+            .filter(|f| f.stale_import().is_some())
+            .count();
         let footer = format!(
             "{} · {} · imported {} agent edit(s){}",
             connection,
             self.turn.label(),
-            self.imported.len(),
-            if self.stale > 0 {
-                format!(" · {} STALE", self.stale)
+            imported,
+            if stale_files > 0 {
+                format!(" · {stale_files} STALE file(s)")
             } else {
                 String::new()
             }
         );
+        let review = self.show_review.then(|| self.render_review(cx));
         v_flex()
             .key_context("CedianPanel")
             .track_focus(&self.focus_handle)
@@ -839,23 +1127,46 @@ impl Render for CedianPanel {
             .p_2()
             .gap_2()
             .child(
-                h_flex().justify_end().child(
-                    Button::new(
-                        "cedian-settings",
-                        if self.show_settings {
-                            "Back to chat"
-                        } else {
-                            "OMP settings"
-                        },
+                h_flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        div()
+                            .debug_selector(|| "cedian-review-toggle".to_string())
+                            .child(
+                                Button::new(
+                                    "cedian-review-toggle",
+                                    if self.show_review {
+                                        "Back to chat".to_string()
+                                    } else {
+                                        format!("Review changes ({open})")
+                                    },
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_review(cx))),
+                            ),
                     )
-                    .on_click(cx.listener(|this, _, window, cx| this.toggle_settings(window, cx))),
-                ),
+                    .child(
+                        Button::new(
+                            "cedian-settings",
+                            if self.show_settings {
+                                "Back to chat"
+                            } else {
+                                "OMP settings"
+                            },
+                        )
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.toggle_settings(window, cx)),
+                        ),
+                    ),
             )
+            .when_some(review, |panel, review| panel.child(review))
             .when_some(
-                self.settings.clone().filter(|_| self.show_settings),
+                self.settings
+                    .clone()
+                    .filter(|_| self.show_settings && !self.show_review),
                 |panel, settings| panel.child(div().flex_1().child(settings)),
             )
-            .when(!self.show_settings, |panel| {
+            .when(!self.show_settings && !self.show_review, |panel| {
                 panel.child(
                     v_flex()
                         .id("cedian-thread")
@@ -1002,7 +1313,8 @@ mod tests {
     //! undo. Needs OMP auth:
     //! `cargo test -p cedian_panel -- --ignored --nocapture live_`
     use super::*;
-    use gpui::TestAppContext;
+    use fs::Fs as _;
+    use gpui::{Modifiers, TestAppContext, VisualTestContext};
     use settings::SettingsStore;
     use std::time::{Duration, Instant};
 
@@ -1101,6 +1413,225 @@ mod tests {
             .unwrap();
     }
 
+    const ORIGINAL: &str = "alpha\nbeta\ngamma\n";
+
+    struct Fixture {
+        fs: std::sync::Arc<fs::FakeFs>,
+        project: Entity<Project>,
+        window: gpui::WindowHandle<CedianPanel>,
+    }
+
+    /// A workspace with `notes.txt` open and `other.txt` on disk only; no
+    /// OMP (the panel is driven with router events directly).
+    async fn fixture(cx: &mut TestAppContext) -> (Fixture, Entity<Buffer>) {
+        init(cx);
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/ws",
+            serde_json::json!({"notes.txt": ORIGINAL, "other.txt": "one\ntwo\n"}),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [std::path::Path::new("/ws")], cx).await;
+        let buffer = project
+            .update(cx, |p, cx| p.open_local_buffer("/ws/notes.txt", cx))
+            .await
+            .unwrap();
+        let window = cx.add_window(|window, cx| CedianPanel::new(project.clone(), window, cx));
+        window
+            .update(cx, |panel, _, _| {
+                panel.review.begin_turn();
+            })
+            .unwrap();
+        (
+            Fixture {
+                fs,
+                project,
+                window,
+            },
+            buffer,
+        )
+    }
+
+    fn tool_start(f: &Fixture, cx: &mut TestAppContext, id: &str, paths: &[&str]) {
+        let event = RouterEvent::ToolStart {
+            tool_call_id: id.to_string(),
+            tool_name: "edit".to_string(),
+            args_preview: String::new(),
+            paths: paths.iter().map(|p| p.to_string()).collect(),
+        };
+        f.window
+            .update(cx, |panel, _, cx| panel.on_event(event, cx))
+            .unwrap();
+    }
+
+    fn tool_end(f: &Fixture, cx: &mut TestAppContext, id: &str) {
+        let event = RouterEvent::ToolEnd {
+            tool_call_id: id.to_string(),
+            tool_name: "edit".to_string(),
+            result_summary: String::new(),
+            is_error: false,
+        };
+        f.window
+            .update(cx, |panel, _, cx| panel.on_event(event, cx))
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    async fn omp_writes(f: &Fixture, path: &str, text: &str) {
+        f.fs.save(
+            std::path::Path::new(path),
+            &text.into(),
+            text::LineEnding::Unix,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// `(path, status, tool calls)` per hunk, files in review order.
+    fn hunks(f: &Fixture, cx: &mut TestAppContext) -> Vec<(String, HunkStatus, Vec<String>)> {
+        f.window
+            .update(cx, |panel, _, cx| {
+                panel.review.rebuild(cx);
+                panel
+                    .review
+                    .files()
+                    .iter()
+                    .flat_map(|file| {
+                        let path = panel.review.path(file, cx).display().to_string();
+                        file.hunks()
+                            .iter()
+                            .map(move |h| (path.clone(), h.status, h.tool_call_ids.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap()
+    }
+
+    #[gpui::test]
+    async fn an_omp_write_to_an_open_buffer_is_one_pending_hunk(cx: &mut TestAppContext) {
+        let (f, buffer) = fixture(cx).await;
+        tool_start(&f, cx, "c1", &["notes.txt"]);
+        omp_writes(&f, "/ws/notes.txt", "alpha\nBETA\ngamma\n").await;
+        tool_end(&f, cx, "c1");
+        assert_eq!(
+            hunks(&f, cx),
+            vec![(
+                "ws/notes.txt".to_string(),
+                HunkStatus::Pending,
+                vec!["c1".to_string()]
+            )]
+        );
+        assert_eq!(
+            buffer.read_with(cx, |b, _| b.text()),
+            "alpha\nBETA\ngamma\n"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_file_omp_writes_that_is_not_open_is_opened_and_reviewed(cx: &mut TestAppContext) {
+        let (f, _buffer) = fixture(cx).await;
+        tool_start(&f, cx, "c1", &["other.txt"]);
+        cx.run_until_parked();
+        omp_writes(&f, "/ws/other.txt", "ONE\ntwo\n").await;
+        tool_end(&f, cx, "c1");
+        assert_eq!(
+            hunks(&f, cx),
+            vec![(
+                "ws/other.txt".to_string(),
+                HunkStatus::Pending,
+                vec!["c1".to_string()]
+            )]
+        );
+        let (old, new) = f
+            .window
+            .update(cx, |panel, _, _| {
+                let h = &panel.review.files()[0].hunks()[0];
+                (h.old_text.clone(), h.new_text.clone())
+            })
+            .unwrap();
+        assert_eq!((old.as_str(), new.as_str()), ("one\n", "ONE\n"));
+        let open = f.project.read_with(cx, |p, cx| p.opened_buffers(cx).len());
+        assert_eq!(open, 2, "other.txt is open now");
+    }
+
+    #[gpui::test]
+    async fn a_tool_end_before_the_open_finishes_still_imports(cx: &mut TestAppContext) {
+        let (f, _buffer) = fixture(cx).await;
+        tool_start(&f, cx, "c1", &["other.txt"]);
+        omp_writes(&f, "/ws/other.txt", "ONE\ntwo\n").await;
+        tool_end(&f, cx, "c1");
+        let got = hunks(&f, cx);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].0, "ws/other.txt");
+    }
+
+    #[gpui::test]
+    async fn a_refused_import_shows_the_file_stale(cx: &mut TestAppContext) {
+        let (f, buffer) = fixture(cx).await;
+        buffer.update(cx, |b, cx| b.edit([(0..0, "USER ")], None, cx));
+        tool_start(&f, cx, "c1", &["notes.txt"]);
+        omp_writes(&f, "/ws/notes.txt", "alpha\nBETA\ngamma\n").await;
+        tool_end(&f, cx, "c1");
+        let reason = f
+            .window
+            .update(cx, |panel, _, _| {
+                panel.review.files()[0].stale_import().map(str::to_string)
+            })
+            .unwrap();
+        assert!(
+            reason.as_ref().is_some_and(|r| r.contains("c1")),
+            "{reason:?}"
+        );
+        assert_eq!(
+            buffer.read_with(cx, |b, _| b.text()),
+            "USER alpha\nbeta\ngamma\n"
+        );
+    }
+
+    fn click(vcx: &mut VisualTestContext, selector: &str) {
+        let selector: &'static str = Box::leak(selector.to_string().into_boxed_str());
+        let bounds = vcx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} is not on screen"));
+        vcx.simulate_click(bounds.center(), Modifiers::none());
+        vcx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn reject_and_accept_buttons_resolve_hunks(cx: &mut TestAppContext) {
+        let (f, buffer) = fixture(cx).await;
+        tool_start(&f, cx, "c1", &["notes.txt"]);
+        omp_writes(&f, "/ws/notes.txt", "ALPHA\nbeta\nGAMMA\n").await;
+        tool_end(&f, cx, "c1");
+        let mut vcx = VisualTestContext::from_window(f.window.into(), cx);
+        click(&mut vcx, "cedian-review-toggle");
+        assert!(
+            vcx.debug_bounds("cedian-review").is_some(),
+            "the view is open"
+        );
+        click(&mut vcx, "cedian-reject-ws/notes.txt-0");
+        assert_eq!(
+            buffer.read_with(&vcx, |b, _| b.text()),
+            "alpha\nbeta\nGAMMA\n",
+            "reject put the baseline line back"
+        );
+        click(&mut vcx, "cedian-accept-ws/notes.txt-0");
+        let statuses: Vec<HunkStatus> = hunks(&f, &mut vcx).into_iter().map(|h| h.1).collect();
+        assert_eq!(statuses, vec![HunkStatus::Accepted]);
+        assert!(
+            vcx.debug_bounds("cedian-accept-ws/notes.txt-0").is_none(),
+            "a resolved hunk has no buttons"
+        );
+        buffer.update(&mut vcx, |b, cx| {
+            b.undo(cx);
+            assert_eq!(
+                b.text(),
+                "ALPHA\nbeta\nGAMMA\n",
+                "one undo restores the reject"
+            );
+        });
+    }
+
     #[gpui::test]
     #[ignore]
     async fn live_panel_streams_and_imports_one_undoable_omp_edit(cx: &mut TestAppContext) {
@@ -1137,8 +1668,18 @@ mod tests {
                     (
                         panel.turn.clone(),
                         texts(panel),
-                        panel.imported.len(),
-                        panel.stale,
+                        panel
+                            .review
+                            .files()
+                            .iter()
+                            .map(|f| f.agent_txns().len())
+                            .sum::<usize>(),
+                        panel
+                            .review
+                            .files()
+                            .iter()
+                            .filter(|f| f.stale_import().is_some())
+                            .count(),
                     )
                 })
                 .unwrap()
@@ -1170,7 +1711,9 @@ mod tests {
         assert_eq!(imported, 1, "exactly one agent transaction");
         assert_eq!(stale, 0);
         let call_id = window
-            .update(cx, |panel, _, _| panel.imported[0].tool_call_id.clone())
+            .update(cx, |panel, _, _| {
+                panel.review.files()[0].agent_txns()[0].tool_call_id.clone()
+            })
             .unwrap();
         assert!(!call_id.is_empty(), "keyed by tool_call_id");
 

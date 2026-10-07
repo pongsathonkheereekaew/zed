@@ -139,6 +139,7 @@ impl Thread {
                 tool_call_id,
                 tool_name,
                 args_preview,
+                ..
             } => {
                 let index = self.events.len();
                 self.events.push(ThreadEvent::Tool {
@@ -337,6 +338,7 @@ mod tests {
             tool_call_id: "c1".to_string(),
             tool_name: "read".to_string(),
             args_preview: "src/main.rs".to_string(),
+            paths: Vec::new(),
         });
         t.apply(&RouterEvent::ToolEnd {
             tool_call_id: "c1".to_string(),
@@ -361,6 +363,7 @@ mod tests {
             tool_call_id: "c1".to_string(),
             tool_name: "bash".to_string(),
             args_preview: "sleep 1".to_string(),
+            paths: Vec::new(),
         });
         t.on_disconnect(&["c1".to_string()]);
         assert!(t.streaming_text("m1").is_none());
@@ -379,6 +382,7 @@ mod tests {
             tool_call_id: "c1".to_string(),
             tool_name: "bash".to_string(),
             args_preview: "sleep 9".to_string(),
+            paths: Vec::new(),
         });
         t.apply(&RouterEvent::Disconnected);
         assert!(matches!(
@@ -397,6 +401,7 @@ mod tests {
             tool_call_id: "c9".to_string(),
             tool_name: "bash".to_string(),
             args_preview: "exit 1".to_string(),
+            paths: Vec::new(),
         });
         t.apply(&RouterEvent::ToolEnd {
             tool_call_id: "c9".to_string(),

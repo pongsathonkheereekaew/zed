@@ -68,6 +68,7 @@ impl AuditLog {
                 tool_call_id,
                 tool_name,
                 args_preview,
+                ..
             } => {
                 let mut item = json!({"kind": "tool", "event": "start", "tool": tool_name, "tool_call_id": tool_call_id});
                 // A reviewer's row says what it touched, not only which tool
@@ -210,6 +211,7 @@ mod tests {
             tool_call_id: "c1".into(),
             tool_name: "bash".into(),
             args_preview: "touch probe".into(),
+            paths: Vec::new(),
         };
         let end = RouterEvent::ToolEnd {
             tool_call_id: "c1".into(),
@@ -247,6 +249,7 @@ mod tests {
             tool_call_id: id.into(),
             tool_name: "read".into(),
             args_preview: "notes.txt".into(),
+            paths: Vec::new(),
         };
         let mut implementer = AuditLog::open(&dir, Approvals::Cedian(Default::default())).unwrap();
         implementer.record(&start("c1")).unwrap();
@@ -273,6 +276,7 @@ mod tests {
             tool_call_id: "c1".into(),
             tool_name: "write".into(),
             args_preview: "xd://cedian_apply_edit".into(),
+            paths: Vec::new(),
         })
         .unwrap();
         log.dialog(&cedian_omp::DialogRecord {

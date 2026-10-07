@@ -429,10 +429,13 @@ fn summarize_result(name: &str, result: Option<&serde_json::Value>) -> String {
     match name {
         "bash" | "eval" => {
             // OMP 18.6 ends the output with a blank-separated `Wall time:` line.
-            let output: Vec<&str> = joined
-                .lines()
-                .filter(|l| !l.trim().is_empty() && !l.starts_with("Wall time: "))
-                .collect();
+            let mut output: Vec<&str> = joined.lines().collect();
+            if output.last().is_some_and(|l| l.starts_with("Wall time: ")) {
+                output.pop();
+            }
+            while output.last().is_some_and(|l| l.trim().is_empty()) {
+                output.pop();
+            }
             match output.as_slice() {
                 [] => String::new(),
                 [only] => only.chars().take(100).collect(),
@@ -627,5 +630,12 @@ mod tests {
         let single = serde_json::json!({"content": [{"type": "text", "text": "hello"}]});
         assert_eq!(summarize_result("read", Some(&single)), "hello");
         assert!(summarize_result("bash", None).is_empty());
+    }
+
+    #[test]
+    fn bash_summary_counts_blank_lines_and_skips_only_the_wall_time() {
+        let out =
+            serde_json::json!({"content": [{"type": "text", "text": "a\n\nb\n\nWall time: 0.1s"}]});
+        assert_eq!(summarize_result("bash", Some(&out)), "3 lines, last: b");
     }
 }

@@ -58,6 +58,7 @@ fn main() {
     unsafe {
         std::env::set_var("CEDIAN_CONFIG", root.join("cedian.toml"));
         std::env::set_var("CEDIAN_STATE_DIR", root.join("state"));
+        std::env::set_var("HOME", root.join("home"));
         std::env::set_var("CEDIAN_OMP_BINARY", std::env::current_exe().unwrap());
     }
     print!("test turn_lifecycle ... ");

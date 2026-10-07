@@ -44,6 +44,7 @@ fn main() {
     unsafe {
         std::env::set_var("CEDIAN_CONFIG", root.join("cedian.toml"));
         std::env::set_var("CEDIAN_STATE_DIR", root.join("state"));
+        std::env::set_var("HOME", root.join("home"));
         std::env::set_var("CEDIAN_OMP_BINARY", std::env::current_exe().unwrap());
     }
     print!("test app_shell_launch_crash_restart ... ");
@@ -123,6 +124,12 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
 
     // Restart: a fresh OMP adopts the same session.
     cedian_fake_omp::install_replay(&session_dir, Path::new(RESUME)).unwrap();
+    // The session file the dead OMP wrote, which the resume names.
+    std::fs::write(
+        session_dir.join(format!("2026-10-07T00-34-21-681Z_{session_id}.jsonl")),
+        "",
+    )
+    .unwrap();
     window
         .update(cx, |panel, window, cx| panel.restart(window, cx))
         .unwrap();

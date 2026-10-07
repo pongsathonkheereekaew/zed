@@ -50,6 +50,9 @@ fn main() {
     unsafe {
         std::env::set_var("CEDIAN_CONFIG", root.join("cedian.toml"));
         std::env::set_var("CEDIAN_STATE_DIR", root.join("state"));
+        if !record {
+            std::env::set_var("HOME", root.join("home"));
+        }
         std::env::set_var("CEDIAN_OMP_BINARY", std::env::current_exe().unwrap());
     }
     print!("test live_approval_replays_in_the_app ... ");

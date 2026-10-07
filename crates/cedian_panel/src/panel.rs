@@ -1,13 +1,16 @@
-//! The cedian dock panel (S9a T2/T4): one prompt box, the streamed OMP reply
-//! rendered from the headless `cedian_agent::Thread`, and agent-edit import.
+//! The cedian dock panel (S9a T2/T4, S9 U3): one prompt box, the streamed OMP
+//! reply rendered from the headless `cedian_agent::Thread`, and agent-edit
+//! import.
 //!
-//! OMP runs on its own OS thread (the runtime is blocking, never on the UI
-//! thread) and is spawned through the P1 spawn profile. Router events cross
-//! into GPUI over a channel; edit-class tool events drive [`crate::import`].
+//! The panel starts OMP when it opens on a folder ([`crate::omp_link`]): its
+//! own thread, the user's `cedian.toml`, the spawn profile. Events cross into
+//! GPUI over a channel; edit-class tool events drive [`crate::import`]. When
+//! OMP dies the panel says why and offers Restart; the IDE keeps running.
 
 use crate::import::{self, ImportOutcome, Mark};
+use crate::omp_link::{LaunchSpec, LinkEvent, OmpLink};
 use cedian_agent::Thread;
-use cedian_omp::{OmpBinary, OmpRuntime, RouterEvent, RuntimeConfig, SpawnPolicy};
+use cedian_omp::RouterEvent;
 use collections::HashMap;
 use editor::Editor;
 use futures::{StreamExt, channel::mpsc};
@@ -17,7 +20,7 @@ use gpui::{
 };
 use language::Buffer;
 use project::Project;
-use std::{path::PathBuf, time::Duration};
+use std::path::PathBuf;
 use text::TransactionId;
 use ui::{Button, Label, prelude::*};
 use workspace::{
@@ -53,12 +56,28 @@ pub struct ImportedEdit {
     pub transaction: TransactionId,
 }
 
+/// Where the panel's OMP stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Connection {
+    /// No folder open yet, so no OMP.
+    NotStarted,
+    Starting,
+    Ready {
+        session_id: String,
+        resumed: bool,
+        policy_note: Option<String>,
+    },
+    /// OMP failed to start or died. Prompts are refused until Restart.
+    Stopped(String),
+}
+
 pub struct CedianPanel {
     focus_handle: FocusHandle,
     project: Entity<Project>,
     input: Entity<Editor>,
     thread: Thread,
-    prompts: Option<std::sync::mpsc::Sender<String>>,
+    link: Option<OmpLink>,
+    connection: Connection,
     marks: HashMap<String, Vec<(Entity<Buffer>, Mark)>>,
     imported: Vec<ImportedEdit>,
     stale: usize,
@@ -79,24 +98,54 @@ impl CedianPanel {
         })
     }
 
-    fn new(project: Entity<Project>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(project: Entity<Project>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
             editor.set_placeholder_text("Ask OMP…", window, cx);
             editor
         });
-        Self {
+        let mut this = Self {
             focus_handle: cx.focus_handle(),
             project,
             input,
             thread: Thread::new(),
-            prompts: None,
+            link: None,
+            connection: Connection::NotStarted,
             marks: HashMap::default(),
             imported: Vec::new(),
             stale: 0,
             status: "idle".to_string(),
             _events: None,
+        };
+        if this.workspace_root(cx).is_some() {
+            this.start(cx);
         }
+        this
+    }
+
+    pub fn connection(&self) -> &Connection {
+        &self.connection
+    }
+
+    /// The turn status line: `idle`, `streaming`, or `error: …`.
+    pub fn status(&self) -> &str {
+        &self.status
+    }
+
+    /// Put `text` in the prompt box, as typing would.
+    pub fn set_prompt(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.input
+            .update(cx, |editor, cx| editor.set_text(text, window, cx));
+    }
+
+    /// Send the prompt box, as the Send button does.
+    pub fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.send(window, cx);
+    }
+
+    /// OMP's process id while it runs.
+    pub fn omp_pid(&self) -> Option<u32> {
+        self.link.as_ref().and_then(OmpLink::pid)
     }
 
     /// Agent edits imported so far (newest last).
@@ -109,74 +158,70 @@ impl CedianPanel {
         Some(worktree.read(cx).abs_path().to_path_buf())
     }
 
-    /// Start OMP on first use: runtime thread + event bridge.
-    fn ensure_runtime(&mut self, cx: &mut Context<Self>) -> anyhow::Result<()> {
-        if self.prompts.is_some() {
-            return Ok(());
-        }
-        let cwd = self
-            .workspace_root(cx)
-            .ok_or_else(|| anyhow::anyhow!("open a folder first"))?;
-        let binary = match std::env::var("CEDIAN_OMP_BINARY") {
-            Ok(path) => OmpBinary::Bundled(PathBuf::from(path)),
-            Err(_) => OmpBinary::Path("omp".to_string()),
+    /// Start (or restart) OMP for the open folder.
+    fn start(&mut self, cx: &mut Context<Self>) {
+        self.link = None;
+        let Some(root) = self.workspace_root(cx) else {
+            self.connection = Connection::Stopped("open a folder first".to_string());
+            return;
         };
-        let config = RuntimeConfig {
-            binary,
-            session_dir: std::env::temp_dir().join("cedian-app-sessions"),
-            cwd,
-            ask_dialog: true,
-            prompt_timeout: Duration::from_secs(600),
-            policy: SpawnPolicy::default(),
+        let spec = match LaunchSpec::resolve(&root) {
+            Ok(spec) => spec,
+            Err(e) => {
+                self.connection = Connection::Stopped(e);
+                cx.notify();
+                return;
+            }
         };
-        let (prompt_tx, prompt_rx) = std::sync::mpsc::channel::<String>();
-        let (event_tx, mut event_rx) = mpsc::unbounded::<RouterEvent>();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
-
-        std::thread::Builder::new()
-            .name("cedian-omp".to_string())
-            .spawn(move || {
-                let mut runtime = match OmpRuntime::spawn(config) {
-                    Ok(rt) => rt,
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(e.to_string()));
-                        return;
-                    }
-                };
-                let router = runtime.router();
-                let (_sub, events) = router.subscribe();
-                std::thread::spawn(move || {
-                    for event in events {
-                        if event_tx.unbounded_send(event).is_err() {
-                            break;
-                        }
-                    }
-                });
-                let _ = ready_tx.send(Ok(()));
-                for prompt in prompt_rx {
-                    if let Err(e) = runtime.prompt(&prompt, vec![]) {
-                        log::error!("cedian: OMP turn failed: {e}");
-                    }
-                }
-                let _ = runtime.shutdown();
-            })?;
-        ready_rx
-            .recv()
-            .map_err(|_| anyhow::anyhow!("OMP thread died"))?
-            .map_err(|e| anyhow::anyhow!(e))?;
-
+        let (event_tx, mut event_rx) = mpsc::unbounded::<LinkEvent>();
+        self.link = Some(OmpLink::start(spec, event_tx));
+        self.connection = Connection::Starting;
         self._events = Some(cx.spawn(async move |this, cx| {
             while let Some(event) = event_rx.next().await {
                 if this
-                    .update(cx, |this, cx| this.on_event(event, cx))
+                    .update(cx, |this, cx| this.on_link_event(event, cx))
                     .is_err()
                 {
                     break;
                 }
             }
         }));
-        self.prompts = Some(prompt_tx);
-        Ok(())
+        cx.notify();
+    }
+
+    /// The Restart button: a fresh OMP on the same session.
+    pub fn restart(&mut self, cx: &mut Context<Self>) {
+        self.start(cx);
+    }
+
+    fn on_link_event(&mut self, event: LinkEvent, cx: &mut Context<Self>) {
+        match event {
+            LinkEvent::Ready {
+                session_id,
+                resumed,
+                policy_note,
+            } => {
+                self.connection = Connection::Ready {
+                    session_id,
+                    resumed,
+                    policy_note,
+                };
+            }
+            LinkEvent::Failed(reason) => self.stop(reason),
+            LinkEvent::Event(RouterEvent::Disconnected) => {
+                self.thread.apply(&RouterEvent::Disconnected);
+                self.stop("OMP stopped: its process exited".to_string());
+            }
+            LinkEvent::Event(event) => return self.on_event(event, cx),
+        }
+        cx.notify();
+    }
+
+    fn stop(&mut self, reason: String) {
+        self.link = None;
+        self.marks.clear();
+        self.status = "idle".to_string();
+        self.connection = Connection::Stopped(reason);
     }
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -184,16 +229,21 @@ impl CedianPanel {
         if text.trim().is_empty() {
             return;
         }
-        if let Err(e) = self.ensure_runtime(cx) {
+        if self.connection == Connection::NotStarted {
+            self.start(cx);
+        }
+        let sent = match (&self.connection, &self.link) {
+            (Connection::Stopped(reason), _) => Err(format!("{reason}; restart OMP")),
+            (_, Some(link)) => link.send(text.clone()),
+            (_, None) => Err("OMP is not running; restart it".to_string()),
+        };
+        if let Err(e) = sent {
             self.status = format!("error: {e}");
             cx.notify();
             return;
         }
         self.input.update(cx, |editor, cx| editor.clear(window, cx));
         self.thread.push_user(&text);
-        if let Some(prompts) = &self.prompts {
-            let _ = prompts.send(text);
-        }
         self.status = "streaming".to_string();
         cx.notify();
     }
@@ -289,8 +339,28 @@ impl Render for CedianPanel {
                     .color(Color::Muted)
                     .into_any_element()
             }));
+        let connection = match &self.connection {
+            Connection::NotStarted => "OMP not started".to_string(),
+            Connection::Starting => "starting OMP…".to_string(),
+            Connection::Ready {
+                session_id,
+                resumed,
+                policy_note,
+            } => format!(
+                "OMP ready, session {} ({}){}",
+                session_id.get(..8).unwrap_or(session_id),
+                if *resumed { "resumed" } else { "new" },
+                policy_note
+                    .as_deref()
+                    .map(|n| format!(" · {n}"))
+                    .unwrap_or_default()
+            ),
+            Connection::Stopped(reason) => reason.clone(),
+        };
+        let stopped = matches!(self.connection, Connection::Stopped(_));
         let footer = format!(
-            "{} · imported {} agent edit(s){}",
+            "{} · {} · imported {} agent edit(s){}",
+            connection,
             self.status,
             self.imported.len(),
             if self.stale > 0 {
@@ -323,9 +393,19 @@ impl Render for CedianPanel {
                     ),
             )
             .child(
-                Label::new(footer)
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
+                h_flex()
+                    .gap_2()
+                    .child(Label::new(footer).size(LabelSize::Small).color(if stopped {
+                        Color::Error
+                    } else {
+                        Color::Muted
+                    }))
+                    .when(stopped, |row| {
+                        row.child(
+                            Button::new("cedian-restart", "Restart OMP")
+                                .on_click(cx.listener(|this, _, _, cx| this.restart(cx))),
+                        )
+                    }),
             )
     }
 }
@@ -379,7 +459,7 @@ mod tests {
     use super::*;
     use gpui::TestAppContext;
     use settings::SettingsStore;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     fn init(cx: &mut TestAppContext) {
         cx.update(|cx| {

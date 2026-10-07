@@ -20,6 +20,7 @@ anyhow.workspace = true
 cedian_agent = { path = "../cedian_agent" }
 cedian_agent_ui = { path = "../cedian_agent_ui" }
 cedian_omp = { path = "../cedian_omp" }
+cedian_shell = { path = "../cedian_shell" }
 cedian_workspace = { path = "../cedian_workspace" }
 clock.workspace = true
 collections.workspace = true
@@ -34,6 +35,7 @@ ui.workspace = true
 workspace.workspace = true
 
 [dev-dependencies]
+cedian_fake_omp = { path = "../cedian_fake_omp" }
 fs = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 language = { workspace = true, features = ["test-support"] }
@@ -43,3 +45,7 @@ settings = { workspace = true, features = ["test-support"] }
 theme.workspace = true
 theme_settings.workspace = true
 workspace = { workspace = true, features = ["test-support"] }
+
+[[test]]
+name = "app_shell"
+harness = false

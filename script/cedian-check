@@ -9,7 +9,6 @@ export CARGO_PROFILE_DEV_DEBUG=${CARGO_PROFILE_DEV_DEBUG:-line-tables-only}
 crates=(omp-rpc)
 for dir in crates/cedian_*; do
   name=$(basename "$dir")
-  [ "$name" = cedian_panel ] && continue # GPUI: built with the app
   crates+=("$name")
 done
 pkgs=()

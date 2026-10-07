@@ -2,7 +2,8 @@
 //! through the cedian headless crates, and the agent-edit import.
 
 pub mod import;
+pub mod omp_link;
 pub mod panel;
 pub mod version;
 
-pub use panel::{CedianPanel, ImportedEdit, ToggleFocus, init};
+pub use panel::{CedianPanel, Connection, ImportedEdit, ToggleFocus, init};

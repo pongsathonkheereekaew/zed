@@ -308,9 +308,12 @@ impl OmpRuntime {
         }
     }
 
-    /// Start a fresh session, optionally under a parent. Returns `true` when
-    /// the switch happened (`cancelled: false`).
-    pub fn new_session(&mut self, parent: Option<String>, task: &str) -> Result<bool, OmpError> {
+    /// Start a fresh session, optionally under a parent.
+    pub fn new_session(
+        &mut self,
+        parent: Option<String>,
+        task: &str,
+    ) -> Result<NewSession, OmpError> {
         let result = self
             .client()
             .call(&NewSessionCommand {
@@ -318,19 +321,22 @@ impl OmpRuntime {
             })
             .map_err(OmpError::from)?;
         if result.cancelled {
-            return Ok(false);
+            return Ok(NewSession::Declined);
         }
-        let state: SessionState = self
-            .client()
-            .call(&GetStateCommand {})
-            .map_err(OmpError::from)?;
+        let state: SessionState = match self.client().call(&GetStateCommand {}) {
+            Ok(state) => state,
+            Err(e) => {
+                self.session = None;
+                return Ok(NewSession::Unknown(OmpError::from(e)));
+            }
+        };
         self.session = Some(SessionBinding::new(
             self.config.cwd.clone(),
             self.config.session_dir.clone(),
-            state.session_id,
+            state.session_id.clone(),
             task.to_string(),
         ));
-        Ok(true)
+        Ok(NewSession::Started(state))
     }
 
     /// Switch the session model (`provider/id` pair, both required upstream).
@@ -383,6 +389,16 @@ impl OmpRuntime {
         }
         result
     }
+}
+
+/// What [`OmpRuntime::new_session`] did.
+#[derive(Debug)]
+pub enum NewSession {
+    Started(SessionState),
+    /// OMP kept the current session.
+    Declined,
+    /// OMP switched, but which session it is now on could not be read.
+    Unknown(OmpError),
 }
 
 /// Mid-turn control over a live session; see [`OmpRuntime::control`].

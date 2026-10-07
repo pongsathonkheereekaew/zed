@@ -11,18 +11,30 @@
 //! not move it). A process that resumed but has not written yet holds
 //! neither, so it goes unseen.
 
-use std::path::{Path, PathBuf};
+//!
+//! OMP is a Bun program, and Bun opens files close-on-exec and spawns
+//! children with every other descriptor closed, so OMP's own children (its
+//! bash tool) never hold these files: only another process does.
 
-/// The session's files another driver would hold.
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// How long `lsof` may take before the check counts as failed.
+const LSOF_DEADLINE: Duration = Duration::from_secs(5);
+
+/// The session's files another driver would hold: the owner lease (when
+/// OMP's state root is known) and the session file (when OMP named it).
 pub fn session_files(
-    state_root: &Path,
+    state_root: Option<&Path>,
     session_id: &str,
     session_file: Option<&Path>,
 ) -> Vec<PathBuf> {
-    let lease = state_root
-        .join("run/session-owners")
-        .join(format!("{session_id}.lock"));
-    std::iter::once(lease)
+    state_root
+        .map(|root| {
+            root.join("run/session-owners")
+                .join(format!("{session_id}.lock"))
+        })
+        .into_iter()
         .chain(session_file.map(Path::to_path_buf))
         .collect()
 }
@@ -40,38 +52,89 @@ pub fn other_drivers(holders: &[u32], own: u32) -> Vec<u32> {
     others
 }
 
+fn lsof() -> &'static Path {
+    Path::new(
+        ["/usr/sbin/lsof", "/usr/bin/lsof"]
+            .into_iter()
+            .find(|p| Path::new(p).exists())
+            .unwrap_or("lsof"),
+    )
+}
+
 /// Process ids holding any of `files` open, by `lsof`. Files that do not
 /// exist are held by nobody.
 pub fn holders(files: &[PathBuf]) -> Result<Vec<u32>, String> {
+    holders_with(lsof(), files, LSOF_DEADLINE)
+}
+
+/// [`holders`] with the `lsof` to run and how long it may take.
+pub fn holders_with(
+    lsof: &Path,
+    files: &[PathBuf],
+    deadline: Duration,
+) -> Result<Vec<u32>, String> {
     let files: Vec<&PathBuf> = files.iter().filter(|f| f.exists()).collect();
     if files.is_empty() {
         return Ok(Vec::new());
     }
-    let lsof = ["/usr/sbin/lsof", "/usr/bin/lsof"]
-        .into_iter()
-        .find(|p| Path::new(p).exists())
-        .unwrap_or("lsof");
-    let out = std::process::Command::new(lsof)
+    let mut child = std::process::Command::new(lsof)
         .arg("-t")
         .args(&files)
-        .output()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| format!("cannot run lsof: {e}"))?;
-    // lsof exits 1, silently, when no process has any of the files open.
-    if !out.status.success() && out.stdout.is_empty() && !out.stderr.is_empty() {
-        return Err(format!(
-            "lsof failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+    let until = Instant::now() + deadline;
+    while child
+        .try_wait()
+        .map_err(|e| format!("lsof: {e}"))?
+        .is_none()
+    {
+        if Instant::now() >= until {
+            child.kill().ok();
+            child.wait().ok();
+            return Err(format!(
+                "lsof did not finish in {} s",
+                deadline.as_secs_f32()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
-    Ok(String::from_utf8_lossy(&out.stdout)
+    let out = child.wait_with_output().map_err(|e| format!("lsof: {e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let pids: Vec<u32> = stdout
         .lines()
         .filter_map(|l| l.trim().parse().ok())
-        .collect())
+        .collect();
+    if out.status.success() || !pids.is_empty() {
+        return Ok(pids);
+    }
+    // lsof exits 1 when no process has any of the files open, silent or
+    // with only warnings (an unreachable mount, say).
+    let only_warnings = stderr
+        .lines()
+        .all(|l| l.trim().is_empty() || l.contains("WARNING"));
+    if out.status.code() == Some(1) && stdout.trim().is_empty() && only_warnings {
+        return Ok(Vec::new());
+    }
+    Err(format!("lsof failed ({}): {}", out.status, stderr.trim()))
 }
 
 /// `Ok(pids)` of the other drivers of the session (empty when cedian may
-/// drive it), or why it could not be checked.
-pub fn other_drivers_of(files: &[PathBuf], own: u32) -> Result<Vec<u32>, String> {
+/// drive it), or why it could not be checked: `own` (the app's OMP) is
+/// unknown, `lsof` failed, or `must_see` is set and none of `files` exists
+/// (a resumed session has at least one).
+pub fn other_drivers_of(
+    files: &[PathBuf],
+    own: Option<u32>,
+    must_see: bool,
+) -> Result<Vec<u32>, String> {
+    let own = own.ok_or("OMP's process id is unknown")?;
+    if must_see && !files.iter().any(|f| f.exists()) {
+        return Err("none of the session's files could be found".to_string());
+    }
     holders(files).map(|pids| other_drivers(&pids, own))
 }
 
@@ -85,15 +148,133 @@ mod tests {
         assert!(other_drivers(&[7], 7).is_empty());
     }
 
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("cedian-lsof-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("s.jsonl"), "").unwrap();
+        dir
+    }
+
+    /// A stand-in `lsof` running `script`.
+    fn fake_lsof(dir: &Path, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join("lsof");
+        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[test]
+    fn lsof_reports_nobody_only_by_a_quiet_exit_1() {
+        let dir = scratch("exits");
+        let files = [dir.join("s.jsonl")];
+        let run =
+            |script: &str| holders_with(&fake_lsof(&dir, script), &files, Duration::from_secs(5));
+        assert_eq!(run("exit 1"), Ok(vec![]));
+        assert_eq!(
+            run("echo 'lsof: WARNING: cannot stat() nfs file system /net' >&2; exit 1"),
+            Ok(vec![])
+        );
+        assert_eq!(run("echo 42; exit 0"), Ok(vec![42]));
+        assert_eq!(run("echo 42; exit 1"), Ok(vec![42]));
+        for script in ["exit 2", "echo 'lsof: status error on x' >&2; exit 1"] {
+            assert!(run(script).is_err(), "{script}");
+        }
+        let slow = holders_with(
+            &fake_lsof(&dir, "exec sleep 10"),
+            &files,
+            Duration::from_millis(200),
+        );
+        assert!(slow.is_err(), "{slow:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_check_that_cannot_see_fails_closed() {
+        let dir = scratch("blind");
+        let missing = [dir.join("gone.jsonl")];
+        assert!(
+            other_drivers_of(&missing, Some(1), true).is_err(),
+            "resumed, nothing to check"
+        );
+        assert_eq!(
+            other_drivers_of(&missing, Some(1), false),
+            Ok(vec![]),
+            "new, not written yet"
+        );
+        let present = [dir.join("s.jsonl")];
+        assert!(
+            other_drivers_of(&present, None, true).is_err(),
+            "own pid unknown"
+        );
+        assert!(
+            session_files(None, "s", None).is_empty(),
+            "no HOME, no file named"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// OMP's children (its bash tool) do not inherit the session files: run
+    /// OMP's own Bun runtime (`BUN_BE_BUN=1`, no model call), open a file the
+    /// way OMP does, spawn a child both ways OMP does, and list the holders.
+    /// `cargo test -p cedian_omp -- --ignored live_omp_children`
+    #[test]
+    #[ignore]
+    fn live_omp_children_do_not_hold_the_session_files() {
+        let dir = scratch("children");
+        let file = dir.join("s.jsonl");
+        let script = dir.join("probe.js");
+        std::fs::write(
+            &script,
+            r#"const fs = require("fs");
+fs.openSync(process.argv[2], "a");
+const a = require("child_process").spawn("/bin/sleep", ["5"]);
+const b = Bun.spawn(["/bin/sh", "-c", "sleep 5"]);
+setTimeout(() => { console.log(`${process.pid} ${a.pid} ${b.pid}`); }, 300);
+setTimeout(() => { a.kill(); b.kill(); process.exit(0); }, 3000);"#,
+        )
+        .unwrap();
+        let omp = crate::resolve_on_path("omp", std::env::var("PATH").ok().as_deref()).unwrap();
+        let mut probe = std::process::Command::new(omp)
+            .env("BUN_BE_BUN", "1")
+            .arg("run")
+            .arg(&script)
+            .arg(&file)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(probe.stdout.take().unwrap()),
+            &mut line,
+        )
+        .unwrap();
+        let pids: Vec<u32> = line
+            .split_whitespace()
+            .map(|p| p.parse().unwrap())
+            .collect();
+        let held = holders(&[file]).unwrap();
+        probe.wait().ok();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(pids.len(), 3, "{line}");
+        assert_eq!(
+            held,
+            [pids[0]],
+            "only OMP itself, not its children {:?}",
+            &pids[1..]
+        );
+    }
+
     #[test]
     fn a_process_holding_the_session_file_is_another_driver() {
         let dir = std::env::temp_dir().join(format!("cedian-driver-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("s.jsonl");
         std::fs::write(&file, "").unwrap();
-        let files = session_files(&dir, "s", Some(&file));
+        let files = session_files(Some(&dir), "s", Some(&file));
         assert!(
-            other_drivers_of(&files, 1).unwrap().is_empty(),
+            other_drivers_of(&files, Some(1), true).unwrap().is_empty(),
             "nobody yet"
         );
         let mut holder = std::process::Command::new("/bin/sh")
@@ -104,14 +285,14 @@ mod tests {
             .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let found = loop {
-            let found = other_drivers_of(&files, 1).unwrap();
+            let found = other_drivers_of(&files, Some(1), true).unwrap();
             if !found.is_empty() || std::time::Instant::now() > deadline {
                 break found;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
         assert_eq!(
-            other_drivers_of(&files, holder.id()).unwrap(),
+            other_drivers_of(&files, Some(holder.id()), true).unwrap(),
             Vec::<u32>::new(),
             "its own OMP"
         );

@@ -11,10 +11,8 @@
 {"dir":"out","frame":{"command":"new_session","data":{"cancelled":false},"id":"req_5","success":true,"type":"response"}}
 {"dir":"in","frame":{"id":"req_6","type":"get_state"}}
 {"dir":"out","frame":{"command":"get_state","id":"req_6","success":true,"type":"response","data":{"sessionId":"0b1d0000-0000-7000-8000-000000000002","sessionFile":"${CEDIAN_SESSION_DIR}/fresh.jsonl"}}}
-{"dir":"in","frame":{"id":"req_7","type":"get_state"}}
-{"dir":"out","frame":{"command":"get_state","id":"req_7","success":true,"type":"response","data":{"sessionId":"0b1d0000-0000-7000-8000-000000000002","sessionFile":"${CEDIAN_SESSION_DIR}/fresh.jsonl"}}}
-{"dir":"in","frame":{"id":"req_8","message":"hello","type":"prompt"}}
-{"dir":"out","frame":{"command":"prompt","id":"req_8","success":true,"type":"response"}}
+{"dir":"in","frame":{"id":"req_7","message":"hello","type":"prompt"}}
+{"dir":"out","frame":{"command":"prompt","id":"req_7","success":true,"type":"response"}}
 {"dir":"out","frame":{"type":"agent_start"}}
-{"dir":"out","frame":{"agentInvoked":true,"id":"req_8","sessionSettled":true,"status":"completed","type":"prompt_result"}}
+{"dir":"out","frame":{"agentInvoked":true,"id":"req_7","sessionSettled":true,"status":"completed","type":"prompt_result"}}
 {"dir":"out","frame":{"type":"session_settled"}}

@@ -12,8 +12,8 @@
 //! or is stopped is recorded as `abstain` (§63 lease, ADR-0013).
 
 use cedian_omp::{
-    DialogRecord, OmpBinary, OmpRuntime, RouterEvent, RuntimeConfig, RuntimeControl, Sessions,
-    SpawnPolicy, UserAnswer,
+    DialogRecord, NewSession, OmpBinary, OmpRuntime, RouterEvent, RuntimeConfig, RuntimeControl,
+    Sessions, SpawnPolicy, UserAnswer,
 };
 use cedian_shell::audit::AuditLog;
 use cedian_shell::{Policy, RunKind};
@@ -362,8 +362,8 @@ fn run(
             return;
         }
     };
-    let own = runtime.pid().unwrap_or(0);
-    pid.store(own, Ordering::Relaxed);
+    let own = runtime.pid();
+    pid.store(own.unwrap_or(0), Ordering::Relaxed);
     let _ = gate.control.set(runtime.control());
     let (_sub, router_events) = runtime.router().subscribe();
     let forward = events.clone();
@@ -395,11 +395,11 @@ fn run(
     let state = spec.omp_state;
     let taken = |session: &Session| -> Option<LinkEvent> {
         let files = cedian_omp::driver::session_files(
-            state.as_deref().unwrap_or(Path::new("/nonexistent")),
+            state.as_deref(),
             &session.id,
             session.file.as_deref().map(Path::new),
         );
-        let reason = match cedian_omp::driver::other_drivers_of(&files, own) {
+        let reason = match cedian_omp::driver::other_drivers_of(&files, own, session.resumed) {
             Ok(others) if others.is_empty() => return None,
             Ok(others) => format!(
                 "another process drives this session (pid {})",
@@ -445,25 +445,28 @@ fn run(
                 let _ = events.unbounded_send(taken(&session).unwrap_or_else(|| ready(&session)));
             }
             Command::NewSession => {
-                let fresh = runtime
-                    .new_session(None, "app")
-                    .and_then(|_| runtime.get_state());
-                match fresh {
-                    Ok(state) => {
+                let refused = |reason: String| LinkEvent::Taken {
+                    session_id: session.id.clone(),
+                    reason,
+                };
+                let event = match runtime.new_session(None, "app") {
+                    Ok(NewSession::Started(state)) => {
                         session = Session {
                             id: state.session_id,
                             file: state.session_file,
                             resumed: false,
                         };
-                        let _ = events.unbounded_send(ready(&session));
+                        ready(&session)
                     }
-                    Err(e) => {
-                        let _ = events.unbounded_send(LinkEvent::Taken {
-                            session_id: session.id.clone(),
-                            reason: format!("a new session did not start: {e}"),
-                        });
+                    Ok(NewSession::Unknown(e)) => LinkEvent::Failed(format!(
+                        "OMP started a new session but did not say which: {e}"
+                    )),
+                    Ok(NewSession::Declined) => {
+                        refused("OMP declined to start a new session".to_string())
                     }
-                }
+                    Err(e) => refused(format!("a new session did not start: {e}")),
+                };
+                let _ = events.unbounded_send(event);
             }
         }
     }

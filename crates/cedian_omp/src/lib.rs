@@ -29,7 +29,8 @@ pub use event_router::{
 };
 pub use omp_config::{Layer, OmpConfig, Setting, WriteOutcome};
 pub use runtime::{
-    OmpBinary, OmpRuntime, RuntimeConfig, RuntimeControl, RuntimeState, image_content, last_text,
+    NewSession, OmpBinary, OmpRuntime, RuntimeConfig, RuntimeControl, RuntimeState, image_content,
+    last_text,
 };
 pub use session::{
     ResumeState, SNAPSHOT_VERSION, SessionBinding, SnapshotVersionMismatch, validate_binding,

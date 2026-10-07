@@ -9,6 +9,7 @@ edition = "2021"
 # the trait shape already mirrors plan §12 so the swap is mechanical.
 
 [dependencies]
+clock.workspace = true
 cedian_lsp = { path = "../cedian_lsp" }
 cedian_omp = { path = "../cedian_omp" }
 omp-rpc = { path = "../../vendor/omp-rpc" }

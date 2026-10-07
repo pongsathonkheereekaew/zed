@@ -10,6 +10,7 @@ edition = "2021"
 # text; Zed multibuffer binding swaps in with the fork.
 
 [dependencies]
+clock.workspace = true
 cedian_agent = { path = "../cedian_agent" }
 cedian_omp = { path = "../cedian_omp" }
 cedian_workspace = { path = "../cedian_workspace" }

@@ -1,22 +1,49 @@
 //! In-memory buffer store: versioned text + transactions + undo.
 //!
-//! Headless stand-in for Zed `text::Buffer` + `History`. Versions are a
-//! monotonic `u64` per buffer here; the Zed binding replaces [`Version`] with
-//! `clock::Global` without changing call shapes (plan §12: `buffer_version` +
-//! `apply_edit(path, expected, edit)`).
+//! Headless stand-in for Zed `text::Buffer` + `History` (ROADMAP row G). A
+//! buffer's version is a `clock::Global`, the same type a Zed buffer
+//! reports, advanced by a local Lamport clock once per applied edit (plan
+//! §12: `buffer_version` + `apply_edit(path, expected, edit)`).
 //!
 //! Transaction discipline mirrors `History::{start,end,push}`: `apply_edit`
-//! checks `expected_version` (optimistic concurrency — concurrent edits fail
-//! closed, never silently merge), pushes the inverse for undo, bumps the
-//! version exactly once per applied edit.
+//! checks `expected` (optimistic concurrency — concurrent edits fail closed,
+//! never silently merge), pushes the inverse for undo, bumps the version
+//! exactly once per applied edit.
 
+use clock::{Global, Lamport, ReplicaId};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Buffer version. `u64` headless; `clock::Global` under Zed (same order +
-/// equality semantics the trait needs).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct Version(pub u64);
+/// The wire form of a buffer version (the host tool's `expected_version`):
+/// `0` for a buffer no edit has touched, otherwise `replica.seq` pairs joined
+/// by commas. Opaque to OMP: it reads one from `cedian://` and sends it back.
+pub fn version_token(version: &Global) -> String {
+    let pairs: Vec<String> = version
+        .iter()
+        .map(|t| format!("{}.{}", t.replica_id.as_u16(), t.value))
+        .collect();
+    if pairs.is_empty() {
+        "0".to_string()
+    } else {
+        pairs.join(",")
+    }
+}
+
+/// The version a token stands for; `None` for a malformed token.
+pub fn parse_version_token(token: &str) -> Option<Global> {
+    if token == "0" {
+        return Some(Global::new());
+    }
+    let mut version = Global::new();
+    for pair in token.split(',') {
+        let (replica, seq) = pair.split_once('.')?;
+        version.observe(Lamport {
+            replica_id: ReplicaId::new(replica.parse().ok()?),
+            value: seq.parse().ok()?,
+        });
+    }
+    Some(version)
+}
 
 /// One text replacement: byte range → new text. Ranges are validated against
 /// the current buffer; out-of-bounds or misordered ranges fail closed.
@@ -34,7 +61,7 @@ pub struct TextEdit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyEditResult {
     /// Version after the edit.
-    pub new_version: Version,
+    pub new_version: Global,
     /// Whether the buffer differs from the last save.
     pub dirty: bool,
 }
@@ -43,7 +70,7 @@ pub struct ApplyEditResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BufferError {
     /// Expected version ≠ current (concurrent edit — re-read and retry).
-    VersionMismatch { expected: Version, current: Version },
+    VersionMismatch { expected: Global, current: Global },
     /// Range outside the buffer or `end < start`.
     BadRange {
         start: usize,
@@ -60,8 +87,9 @@ impl std::fmt::Display for BufferError {
             Self::VersionMismatch { expected, current } => {
                 write!(
                     f,
-                    "buffer changed under edit (expected v{}, now v{})",
-                    expected.0, current.0
+                    "buffer changed under edit (expected version {}, now {})",
+                    version_token(expected),
+                    version_token(current)
                 )
             }
             Self::BadRange { start, end, len } => {
@@ -77,8 +105,9 @@ impl std::error::Error for BufferError {}
 #[derive(Debug, Clone)]
 struct Buffer {
     text: String,
-    version: Version,
-    saved_version: Version,
+    clock: Lamport,
+    version: Global,
+    saved_version: Global,
     /// Inverse edits for undo, newest last. One entry per applied edit.
     undo: Vec<InverseEdit>,
 }
@@ -107,8 +136,9 @@ impl BufferStore {
     pub fn open(&mut self, path: &Path, text: &str) {
         self.buffers.entry(path.to_path_buf()).or_insert(Buffer {
             text: text.to_string(),
-            version: Version(0),
-            saved_version: Version(0),
+            clock: Lamport::new(ReplicaId::LOCAL),
+            version: Global::new(),
+            saved_version: Global::new(),
             undo: Vec::new(),
         });
     }
@@ -130,20 +160,22 @@ impl BufferStore {
             return false;
         }
         buf.text = text.to_string();
-        buf.version = Version(buf.version.0 + 1);
-        buf.saved_version = buf.version;
+        buf.bump();
+        buf.saved_version = buf.version.clone();
         buf.undo.clear();
         true
     }
 
     /// Current text + version. Fails when the buffer was never opened.
-    pub fn read(&self, path: &Path) -> Option<(String, Version)> {
-        self.buffers.get(path).map(|b| (b.text.clone(), b.version))
+    pub fn read(&self, path: &Path) -> Option<(String, Global)> {
+        self.buffers
+            .get(path)
+            .map(|b| (b.text.clone(), b.version.clone()))
     }
 
     /// Current version (for `expected_version` reads).
-    pub fn version(&self, path: &Path) -> Option<Version> {
-        self.buffers.get(path).map(|b| b.version)
+    pub fn version(&self, path: &Path) -> Option<Global> {
+        self.buffers.get(path).map(|b| b.version.clone())
     }
 
     /// Open buffer paths (for `cedian://open-editors`).
@@ -164,7 +196,7 @@ impl BufferStore {
     pub fn apply_edit(
         &mut self,
         path: &Path,
-        expected: Version,
+        expected: Global,
         edit: &TextEdit,
     ) -> Result<ApplyEditResult, BufferError> {
         let buf = self.buffers.get_mut(path).ok_or(BufferError::BadRange {
@@ -175,7 +207,7 @@ impl BufferStore {
         if buf.version != expected {
             return Err(BufferError::VersionMismatch {
                 expected,
-                current: buf.version,
+                current: buf.version.clone(),
             });
         }
         check_range(&buf.text, edit)?;
@@ -187,27 +219,27 @@ impl BufferStore {
             end: edit.start + edit.replacement.len(),
             original,
         });
-        buf.version = Version(buf.version.0 + 1);
+        buf.bump();
         Ok(ApplyEditResult {
-            new_version: buf.version,
+            new_version: buf.version.clone(),
             dirty: buf.version != buf.saved_version,
         })
     }
 
     /// Undo the newest edit on one buffer. No-op on a clean stack.
     /// Returns the restored version, or `None` when nothing was undone.
-    pub fn undo(&mut self, path: &Path) -> Option<Version> {
+    pub fn undo(&mut self, path: &Path) -> Option<Global> {
         let buf = self.buffers.get_mut(path)?;
         let inv = buf.undo.pop()?;
         buf.text.replace_range(inv.start..inv.end, &inv.original);
-        buf.version = Version(buf.version.0 + 1);
-        Some(buf.version)
+        buf.bump();
+        Some(buf.version.clone())
     }
 
     /// Mark saved at the current version (Agent Sync: before turn start).
     pub fn mark_saved(&mut self, path: &Path) {
         if let Some(buf) = self.buffers.get_mut(path) {
-            buf.saved_version = buf.version;
+            buf.saved_version = buf.version.clone();
         }
     }
 
@@ -218,6 +250,12 @@ impl BufferStore {
             .filter(|(_, b)| b.version != b.saved_version)
             .map(|(p, _)| p.clone())
             .collect()
+    }
+}
+
+impl Buffer {
+    fn bump(&mut self) {
+        self.version.observe(self.clock.tick());
     }
 }
 
@@ -242,19 +280,43 @@ fn check_range(text: &str, edit: &TextEdit) -> Result<(), BufferError> {
 mod tests {
     use super::*;
 
+    /// The version after `n` local edits.
+    fn v(n: u32) -> Global {
+        let mut g = Global::new();
+        if n > 0 {
+            g.observe(Lamport {
+                replica_id: ReplicaId::LOCAL,
+                value: n,
+            });
+        }
+        g
+    }
+
+    #[test]
+    fn version_token_round_trips_and_refuses_garbage() {
+        assert_eq!(version_token(&v(0)), "0");
+        assert_eq!(parse_version_token("0"), Some(v(0)));
+        let token = version_token(&v(3));
+        assert_eq!(token, "0.3");
+        assert_eq!(parse_version_token(&token), Some(v(3)));
+        for bad in ["", "3", "0.x", "0.3,", "a.b", "1"] {
+            assert_eq!(parse_version_token(bad), None, "{bad:?}");
+        }
+    }
+
     #[test]
     fn reload_takes_disk_text_unless_dirty() {
         let mut store = BufferStore::new();
         let p = Path::new("/a");
         assert!(store.reload(p, "one\n"));
         assert!(store.reload(p, "two\n"));
-        assert_eq!(store.read(p), Some(("two\n".to_string(), Version(1))));
+        assert_eq!(store.read(p), Some(("two\n".to_string(), v(1))));
         assert!(store.reload(p, "two\n"), "same text: no new version");
-        assert_eq!(store.version(p), Some(Version(1)));
+        assert_eq!(store.version(p), Some(v(1)));
         store
             .apply_edit(
                 p,
-                Version(1),
+                v(1),
                 &TextEdit {
                     start: 0,
                     end: 3,
@@ -278,7 +340,7 @@ mod tests {
         let r = s
             .apply_edit(
                 Path::new("/a.rs"),
-                Version(0),
+                v(0),
                 &TextEdit {
                     start: 6,
                     end: 11,
@@ -286,7 +348,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(r.new_version, Version(1));
+        assert_eq!(r.new_version, v(1));
         assert!(r.dirty);
         assert_eq!(s.read(Path::new("/a.rs")).unwrap().0, "hello cedian");
     }
@@ -296,7 +358,7 @@ mod tests {
         let mut s = store();
         s.apply_edit(
             Path::new("/a.rs"),
-            Version(0),
+            v(0),
             &TextEdit {
                 start: 0,
                 end: 5,
@@ -307,7 +369,7 @@ mod tests {
         let err = s
             .apply_edit(
                 Path::new("/a.rs"),
-                Version(0),
+                v(0),
                 &TextEdit {
                     start: 0,
                     end: 3,
@@ -318,8 +380,8 @@ mod tests {
         assert_eq!(
             err,
             BufferError::VersionMismatch {
-                expected: Version(0),
-                current: Version(1)
+                expected: v(0),
+                current: v(1)
             }
         );
         // Failed edit changed nothing.
@@ -331,7 +393,7 @@ mod tests {
         let mut s = store();
         s.apply_edit(
             Path::new("/a.rs"),
-            Version(0),
+            v(0),
             &TextEdit {
                 start: 0,
                 end: 5,
@@ -352,7 +414,7 @@ mod tests {
         assert!(
             s.apply_edit(
                 Path::new("/a.rs"),
-                Version(0),
+                v(0),
                 &TextEdit {
                     start: 5,
                     end: 99,
@@ -366,7 +428,7 @@ mod tests {
         assert_eq!(
             s2.apply_edit(
                 Path::new("/u.rs"),
-                Version(0),
+                v(0),
                 &TextEdit {
                     start: 1,
                     end: 2,
@@ -383,7 +445,7 @@ mod tests {
         let mut s = store();
         s.apply_edit(
             Path::new("/a.rs"),
-            Version(0),
+            v(0),
             &TextEdit {
                 start: 0,
                 end: 5,

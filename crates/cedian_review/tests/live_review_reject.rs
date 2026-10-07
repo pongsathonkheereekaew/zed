@@ -8,7 +8,7 @@
 
 use cedian_omp::{OmpBinary, OmpRuntime, RuntimeConfig};
 use cedian_review::{AgentEdit, Baseline, HunkStatus, ProvenanceStore, ReviewTracker};
-use cedian_workspace::{HostTools, Version, WorkspaceHost};
+use cedian_workspace::{HostTools, WorkspaceHost};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -91,13 +91,13 @@ fn live_review_reject() {
     assert_eq!(diff.statuses[0], HunkStatus::Pending);
 
     // Reject → inverse patch → baseline text back, version bumped.
-    let v_before: Version = host.buffer_version(path).unwrap();
+    let v_before = host.buffer_version(path).unwrap();
     tracker.reject_hunk(path, 0, host.as_ref()).unwrap();
     assert_eq!(
         host.read_buffer(path).as_deref(),
         Some("alpha\nbeta\ngamma\n")
     );
-    assert!(host.buffer_version(path).unwrap() > v_before);
+    assert!(host.buffer_version(path).unwrap().changed_since(&v_before));
 
     rt.shutdown().expect("shutdown");
 }

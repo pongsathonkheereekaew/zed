@@ -1,10 +1,9 @@
-//! Task baseline: `path → Version` snapshot at task start (plan §16).
+//! Task baseline: `path → clock::Global` snapshot at task start (plan §16).
 //!
 //! Review compares `baseline → current`, never git HEAD — user manual changes
-//! before task start are excluded by construction. Versions are headless `u64`
-//! now, `clock::Global` under Zed (same trait shape).
+//! before task start are excluded by construction.
 
-use cedian_workspace::Version;
+use clock::Global;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -28,7 +27,7 @@ impl std::error::Error for BaselineError {}
 /// Task-start version snapshot.
 #[derive(Debug, Default, Clone)]
 pub struct Baseline {
-    versions: HashMap<PathBuf, Version>,
+    versions: HashMap<PathBuf, Global>,
 }
 
 impl Baseline {
@@ -38,15 +37,15 @@ impl Baseline {
     }
 
     /// Snapshot one buffer's current version as its baseline.
-    pub fn snapshot(&mut self, path: &Path, version: Version) {
+    pub fn snapshot(&mut self, path: &Path, version: Global) {
         self.versions.insert(path.to_path_buf(), version);
     }
 
     /// Baseline version for a path, if recorded.
-    pub fn version(&self, path: &Path) -> Result<Version, BaselineError> {
+    pub fn version(&self, path: &Path) -> Result<Global, BaselineError> {
         self.versions
             .get(path)
-            .copied()
+            .cloned()
             .ok_or_else(|| BaselineError::NotBaselined {
                 path: path.to_path_buf(),
             })
@@ -65,8 +64,8 @@ mod tests {
     #[test]
     fn snapshot_and_lookup() {
         let mut b = Baseline::new();
-        b.snapshot(Path::new("/a.rs"), Version(3));
-        assert_eq!(b.version(Path::new("/a.rs")).unwrap(), Version(3));
+        b.snapshot(Path::new("/a.rs"), Global::new());
+        assert_eq!(b.version(Path::new("/a.rs")).unwrap(), Global::new());
         assert!(matches!(
             b.version(Path::new("/b.rs")),
             Err(BaselineError::NotBaselined { .. })

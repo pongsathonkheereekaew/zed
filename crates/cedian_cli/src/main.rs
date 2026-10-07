@@ -1005,9 +1005,9 @@ fn cmd_reject(workdir: &Path, path: &Path, hunk: usize) -> Result<(), String> {
     }
     save_statuses(workdir, store, &tracker)?;
     println!(
-        "rejected {} hunk {hunk} (inverse patch → v{})",
+        "rejected {} hunk {hunk} (inverse patch → version {})",
         path.display(),
-        v.0
+        cedian_workspace::version_token(&v)
     );
     Ok(())
 }
@@ -1685,11 +1685,6 @@ impl CardGlyph for cedian_agent_ui::ToolCard {
         }
     }
 }
-
-/// Re-export for tests.
-use cedian_workspace::Version as _Version;
-#[allow(unused)]
-fn _keep_version(_: _Version) {}
 
 #[cfg(test)]
 mod tests {

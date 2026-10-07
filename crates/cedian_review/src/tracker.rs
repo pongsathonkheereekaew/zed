@@ -17,7 +17,8 @@
 //! the owner calls `request_rebuild` + `rebuild_due`; GPUI ticks it per frame.
 
 use crate::{AgentEdit, Baseline, FileDiff, Hunk, HunkStatus, line_diff};
-use cedian_workspace::{TextEdit, Version, WorkspaceHost};
+use cedian_workspace::{TextEdit, WorkspaceHost};
+use clock::Global;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -278,7 +279,7 @@ impl ReviewTracker {
         path: &Path,
         index: usize,
         host: &dyn WorkspaceHost,
-    ) -> Result<Version, TrackerError> {
+    ) -> Result<Global, TrackerError> {
         let (status, key) = self.hunk(path, index)?;
         match status {
             HunkStatus::Interrupted | HunkStatus::Stale => {
@@ -444,6 +445,18 @@ fn line_range_offsets(text: &str, start: usize, count: usize) -> (usize, usize) 
 mod tests {
     use super::*;
 
+    /// The version after `n` local edits.
+    fn v(n: u32) -> clock::Global {
+        let mut g = clock::Global::new();
+        if n > 0 {
+            g.observe(clock::Lamport {
+                replica_id: clock::ReplicaId::LOCAL,
+                value: n,
+            });
+        }
+        g
+    }
+
     /// Record what the agent just wrote (§17 snapshot at tool end).
     fn agent_wrote(tracker: &mut ReviewTracker, store: &cedian_workspace::HostTools) {
         tracker.attribute(&[AgentEdit {
@@ -557,7 +570,7 @@ mod tests {
         let store = cedian_workspace::HostTools::new(Path::new("/"));
         store.open(Path::new("/a.rs"), "one\ntwo");
         let mut baseline = Baseline::new();
-        baseline.snapshot(Path::new("/a.rs"), Version(0));
+        baseline.snapshot(Path::new("/a.rs"), v(0));
         let texts = HashMap::from([(PathBuf::from("/a.rs"), "one\ntwo".to_string())]);
         let mut tracker = ReviewTracker::new("task-1", baseline, texts);
         edit(&store, 4, 7, "TWO");
@@ -571,7 +584,7 @@ mod tests {
         let store = cedian_workspace::HostTools::new(Path::new("/"));
         store.open(Path::new("/a.rs"), "one\ntwo\nthree\n");
         let mut baseline = Baseline::new();
-        baseline.snapshot(Path::new("/a.rs"), Version(0));
+        baseline.snapshot(Path::new("/a.rs"), v(0));
         let mut texts = HashMap::new();
         texts.insert(PathBuf::from("/a.rs"), "one\ntwo\nthree\n".to_string());
         (store, ReviewTracker::new("task-1", baseline, texts))
@@ -583,7 +596,7 @@ mod tests {
         store
             .apply_edit(
                 Path::new("/a.rs"),
-                Version(0),
+                v(0),
                 &TextEdit {
                     start: 4,
                     end: 7,
@@ -607,7 +620,7 @@ mod tests {
         store
             .apply_edit(
                 Path::new("/a.rs"),
-                Version(0),
+                v(0),
                 &TextEdit {
                     start: 4,
                     end: 7,
@@ -629,7 +642,7 @@ mod tests {
         store2
             .apply_edit(
                 Path::new("/a.rs"),
-                Version(0),
+                v(0),
                 &TextEdit {
                     start: 4,
                     end: 7,
@@ -656,7 +669,7 @@ mod tests {
         store
             .apply_edit(
                 Path::new("/a.rs"),
-                Version(0),
+                v(0),
                 &TextEdit {
                     start: 0,
                     end: 3,
@@ -667,7 +680,7 @@ mod tests {
         store
             .apply_edit(
                 Path::new("/a.rs"),
-                Version(1),
+                v(1),
                 &TextEdit {
                     start: 8,
                     end: 11,
@@ -693,7 +706,7 @@ mod tests {
         store
             .apply_edit(
                 Path::new("/a.rs"),
-                Version(0),
+                v(0),
                 &TextEdit {
                     start: 4,
                     end: 7,
@@ -728,7 +741,7 @@ mod tests {
         store
             .apply_edit(
                 Path::new("/a.rs"),
-                Version(0),
+                v(0),
                 &TextEdit {
                     start: 4,
                     end: 7,

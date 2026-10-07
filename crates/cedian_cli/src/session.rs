@@ -9,7 +9,6 @@
 //! `cedian review reset` deletes it to start a new task.
 
 use cedian_review::{AgentEdit, Baseline, ProvenanceStore, StatusRecord};
-use cedian_workspace::Version;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -147,7 +146,7 @@ impl ReviewStore {
         let mut texts = HashMap::new();
         for (key, text) in &self.baseline {
             let key = PathBuf::from(key);
-            baseline.snapshot(&key, Version(0));
+            baseline.snapshot(&key, clock::Global::new());
             texts.insert(key, text.clone());
         }
         (baseline, texts)

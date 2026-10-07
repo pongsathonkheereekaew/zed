@@ -35,7 +35,8 @@ fn live_host_edit() {
     let host = HostTools::shared(Path::new("/"));
     // Deterministic buffer: the model edits this exact text.
     host.open(Path::new("/note.txt"), "version one");
-    assert_eq!(host.buffer_version(Path::new("/note.txt")).unwrap().0, 0);
+    let v0 = host.buffer_version(Path::new("/note.txt")).unwrap();
+    assert_eq!(cedian_workspace::version_token(&v0), "0");
 
     let mut rt = OmpRuntime::spawn(dev_config("edit")).expect("spawn");
     rt.set_host_tools(vec![host.apply_edit_tool()])
@@ -64,7 +65,11 @@ fn live_host_edit() {
         host.read_buffer(Path::new("/note.txt")).as_deref(),
         Some("version two")
     );
-    assert_eq!(host.buffer_version(Path::new("/note.txt")).unwrap().0, 1);
+    assert!(
+        host.buffer_version(Path::new("/note.txt"))
+            .unwrap()
+            .changed_since(&v0)
+    );
 
     // Native undo restores (new version — undo is a change, not a rewind).
     let v = host.undo(Path::new("/note.txt")).unwrap();
@@ -72,7 +77,7 @@ fn live_host_edit() {
         host.read_buffer(Path::new("/note.txt")).as_deref(),
         Some("version one")
     );
-    assert_eq!(v.0, 2);
+    assert_eq!(cedian_workspace::version_token(&v), "0.2");
 
     rt.shutdown().expect("shutdown");
 }

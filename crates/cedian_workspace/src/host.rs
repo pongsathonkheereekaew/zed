@@ -8,7 +8,10 @@
 //! Threading: the store lives behind `parking_lot::Mutex`; host-tool handler
 //! threads (vendored client) lock briefly per call — no await, no UI thread.
 
-use crate::buffer::{ApplyEditResult, BufferError, BufferStore, TextEdit, Version};
+use crate::buffer::{
+    ApplyEditResult, BufferError, BufferStore, TextEdit, parse_version_token, version_token,
+};
+use clock::Global;
 use omp_rpc::{HostTool, HostUri};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -57,20 +60,38 @@ pub trait WorkspaceHost: Send + Sync {
     /// Current selection as `(path, start, end)` byte offsets, if any.
     fn selection(&self) -> Option<(PathBuf, usize, usize)>;
     /// Current buffer version (optimistic-concurrency token).
-    fn buffer_version(&self, path: &Path) -> Option<Version>;
+    fn buffer_version(&self, path: &Path) -> Option<Global>;
     /// Apply one edit transactionally. Version mismatch fails closed.
     fn apply_edit(
         &self,
         path: &Path,
-        expected: Version,
+        expected: Global,
         edit: &TextEdit,
     ) -> Result<ApplyEditResult, BufferError>;
     /// Undo the newest edit on one buffer (no-op when clean).
-    fn undo(&self, path: &Path) -> Option<Version>;
+    fn undo(&self, path: &Path) -> Option<Global>;
     /// Read buffer text (agents see buffers, not just the filesystem — §13).
     fn read_buffer(&self, path: &Path) -> Option<String>;
     /// Published diagnostics for one buffer (fork: real LSP state).
     fn diagnostics(&self, path: &Path) -> Vec<Diagnostic>;
+}
+
+/// The version an `expected_version` argument names. A number is read as
+/// its decimal text, so a recorded call that sent `0` still names the
+/// untouched buffer; anything that is not a version token refuses the edit.
+fn expected_version(arg: Option<&Value>) -> Result<Global, omp_rpc::HostToolError> {
+    let token = match arg {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        _ => String::new(),
+    };
+    parse_version_token(&token).ok_or_else(|| {
+        format!(
+            "expected_version {token:?} is not a version token; read the buffer's current \
+             version from cedian:// and retry"
+        )
+        .into()
+    })
 }
 
 /// Headless host: in-memory buffers + caller-set editor chrome + published
@@ -226,14 +247,15 @@ impl HostTools {
 
     /// Build the `cedian_apply_edit` host tool: the OMP-side route calls this
     /// for cedian-relevant paths (plan §10: host tools, never `cedian_edit`).
-    /// Args: `{path, expected_version, start, end, replacement}`.
+    /// Args: `{path, expected_version, start, end, replacement}`;
+    /// `expected_version` is the token `cedian://` reports for the buffer.
     pub fn apply_edit_tool(self: &Arc<Self>) -> HostTool {
         let host = Arc::clone(self);
         let params: Map<String, Value> = serde_json::json!({
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
-                "expected_version": {"type": "integer"},
+                "expected_version": {"type": "string", "description": "the buffer's version token as cedian:// reports it (\"0\" for a buffer no edit has touched)"},
                 "start": {"type": "integer"},
                 "end": {"type": "integer"},
                 "replacement": {"type": "string"}
@@ -266,15 +288,13 @@ impl HostTools {
                         .unwrap_or("")
                         .to_string(),
                 };
-                let expected = Version(
-                    args.get("expected_version")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
-                );
+                let expected = expected_version(args.get("expected_version"))?;
                 match host.apply_edit(&key, expected, &edit) {
-                    Ok(result) => {
-                        Ok(format!("applied, now at version {}", result.new_version.0).into())
-                    }
+                    Ok(result) => Ok(format!(
+                        "applied, now at version {}",
+                        version_token(&result.new_version)
+                    )
+                    .into()),
                     Err(e) => Err(e.to_string().into()),
                 }
             },
@@ -460,20 +480,20 @@ impl WorkspaceHost for HostTools {
         self.selection.lock().clone()
     }
 
-    fn buffer_version(&self, path: &Path) -> Option<Version> {
+    fn buffer_version(&self, path: &Path) -> Option<Global> {
         self.store.lock().version(path)
     }
 
     fn apply_edit(
         &self,
         path: &Path,
-        expected: Version,
+        expected: Global,
         edit: &TextEdit,
     ) -> Result<ApplyEditResult, BufferError> {
         self.store.lock().apply_edit(path, expected, edit)
     }
 
-    fn undo(&self, path: &Path) -> Option<Version> {
+    fn undo(&self, path: &Path) -> Option<Global> {
         self.store.lock().undo(path)
     }
 
@@ -495,12 +515,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn expected_version_takes_a_token_and_refuses_the_rest() {
+        let ok = |v: Value| expected_version(Some(&v)).unwrap();
+        assert_eq!(ok(serde_json::json!("0")), Global::new());
+        assert_eq!(ok(serde_json::json!(0)), Global::new());
+        let mut one = Global::new();
+        one.observe(clock::Lamport {
+            replica_id: clock::ReplicaId::LOCAL,
+            value: 1,
+        });
+        assert_eq!(ok(serde_json::json!("0.1")), one);
+        for bad in [
+            serde_json::json!(1),
+            serde_json::json!("1"),
+            serde_json::json!("x"),
+        ] {
+            let e = expected_version(Some(&bad)).unwrap_err().to_string();
+            assert!(e.contains("not a version token"), "{bad}: {e}");
+        }
+        assert!(expected_version(None).is_err());
+    }
+
+    #[test]
     fn sync_saves_dirty() {
         let h = HostTools::new(Path::new("/"));
         h.open(Path::new("/a.rs"), "hi");
         h.apply_edit(
             Path::new("/a.rs"),
-            Version(0),
+            Global::new(),
             &TextEdit {
                 start: 0,
                 end: 2,

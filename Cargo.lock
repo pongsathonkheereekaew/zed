@@ -2835,6 +2835,7 @@ dependencies = [
  "cedian_worker",
  "cedian_workflow",
  "cedian_workspace",
+ "clock",
  "omp-rpc",
  "serde",
  "serde_json",
@@ -2920,6 +2921,7 @@ dependencies = [
  "cedian_agent",
  "cedian_omp",
  "cedian_workspace",
+ "clock",
  "serde",
  "serde_json",
 ]
@@ -2961,6 +2963,7 @@ version = "0.1.0"
 dependencies = [
  "cedian_lsp",
  "cedian_omp",
+ "clock",
  "omp-rpc",
  "parking_lot",
  "serde",

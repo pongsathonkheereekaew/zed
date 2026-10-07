@@ -422,7 +422,9 @@ fn s3_review_scenario(record: bool) {
     if record {
         std::fs::copy(sessions.join(cedian_fake_omp::RECORDED_FILE), S3_FIXTURE).unwrap();
         std::fs::copy(
-            reviewer.join(cedian_fake_omp::RECORDED_FILE),
+            reviewer
+                .join("run/session")
+                .join(cedian_fake_omp::RECORDED_FILE),
             S3_REVIEWER_FIXTURE,
         )
         .unwrap();
@@ -576,7 +578,9 @@ fn s3_same_model_scenario(record: bool) {
         )
         .unwrap();
         std::fs::copy(
-            reviewer.join(cedian_fake_omp::RECORDED_FILE),
+            reviewer
+                .join("run/session")
+                .join(cedian_fake_omp::RECORDED_FILE),
             S3_SAME_REVIEWER_FIXTURE,
         )
         .unwrap();
@@ -772,7 +776,9 @@ fn shell_scenario(record: bool) {
     );
     if record_reviewer {
         std::fs::copy(
-            reviewer.join(cedian_fake_omp::RECORDED_FILE),
+            reviewer
+                .join("run/session")
+                .join(cedian_fake_omp::RECORDED_FILE),
             SHELL_REVIEWER_FIXTURE,
         )
         .unwrap();

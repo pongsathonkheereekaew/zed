@@ -124,7 +124,16 @@ const REVIEWER_DENY: &[&str] = &[
     "task",
     "vibe_spawn",
     "vibe_send",
+    // On whatever `--tools` says: OMP always loads these.
+    "manage_skill",
+    "learn",
 ];
+
+/// The reviewer's whole built-in tool set (ADR-0043): `--tools` turns every
+/// other built-in off, and the flags after it keep a workspace from adding
+/// extensions, skills or language servers.
+const REVIEWER_TOOLS: &str = "read,grep,glob,bash";
+const REVIEWER_FLAGS: &[&str] = &["--no-extensions", "--no-skills", "--no-lsp"];
 
 /// The policy half of the profile, mapped from cedian settings by the caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,8 +155,9 @@ pub struct SpawnPolicy {
     pub config_allows: BTreeSet<String>,
     /// `--model` for this child; `None` leaves OMP's own routing.
     pub model: Option<String>,
-    /// A Seatbelt profile file: the child runs under `sandbox-exec -f` it.
-    pub sandbox_profile: Option<PathBuf>,
+    /// Run under `sandbox-exec -f` the layout's profile, with the overlay
+    /// beside it and the child's temp and state roots inside its run dir.
+    pub sandbox: Option<crate::sandbox::ReviewerLayout>,
 }
 
 impl Default for SpawnPolicy {
@@ -159,7 +169,7 @@ impl Default for SpawnPolicy {
             host_tools: BTreeSet::new(),
             config_allows: BTreeSet::new(),
             model: None,
-            sandbox_profile: None,
+            sandbox: None,
         }
     }
 }
@@ -243,7 +253,7 @@ impl SpawnPolicy {
         let approval = Value::Object(self.approval_record()?);
         let bash = json!({"patterns": patterns, "allowCompoundCommands": false});
         Ok(match self.approvals {
-            Approvals::Cedian(_) | Approvals::Reviewer => json!({
+            Approvals::Cedian(_) => json!({
                 // Until ADR-0008's atomic landing (driver + Seatbelt + bypass test).
                 "computer": {"enabled": false},
                 "tools": {
@@ -251,6 +261,16 @@ impl SpawnPolicy {
                     "approval": approval,
                 },
                 "bash": bash,
+            }),
+            Approvals::Reviewer => json!({
+                "computer": {"enabled": false},
+                "tools": {
+                    "approvalMode": self.approvals.mode().map(ApprovalMode::as_str),
+                    "approval": approval,
+                },
+                "bash": bash,
+                // A workspace's `.mcp.json` would add tools (ADR-0043).
+                "mcp": {"enableProjectConfig": false},
             }),
             Approvals::Omp if patterns.is_empty() => json!({"tools": {"approval": approval}}),
             Approvals::Omp => json!({"tools": {"approval": approval}, "bash": bash}),
@@ -356,11 +376,14 @@ impl SpawnProfile {
         let cwd = check_path("cwd", &self.cwd)?;
         // Validate the overlay before anything is spawned (fail closed).
         self.policy.overlay()?;
-        let overlay_path = self.session_dir.join(OVERLAY_FILE);
+        let overlay_path = match &self.policy.sandbox {
+            Some(layout) => layout.dir.join(OVERLAY_FILE),
+            None => self.session_dir.join(OVERLAY_FILE),
+        };
         let overlay = check_path("overlay", &overlay_path)?;
         let mut argv: Vec<String> = Vec::new();
-        if let Some(sbpl) = &self.policy.sandbox_profile {
-            let sbpl = check_path("sandbox_profile", sbpl)?;
+        if let Some(layout) = &self.policy.sandbox {
+            let sbpl = check_path("sandbox_profile", &layout.profile())?;
             argv.extend([
                 crate::sandbox::SANDBOX_EXEC.to_string(),
                 "-f".to_string(),
@@ -381,6 +404,10 @@ impl SpawnProfile {
         );
         if let Some(mode) = self.policy.approvals.mode() {
             argv.extend(["--approval-mode".to_string(), mode.as_str().to_string()]);
+        }
+        if self.policy.approvals == Approvals::Reviewer {
+            argv.extend(["--tools".to_string(), REVIEWER_TOOLS.to_string()]);
+            argv.extend(REVIEWER_FLAGS.iter().map(|f| (*f).to_string()));
         }
         if let Some(model) = &self.policy.model {
             if model.is_empty()
@@ -403,9 +430,16 @@ impl SpawnProfile {
             "{binary}:{session_dir}:{cwd}:{}",
             self.policy.approvals.label()
         );
+        let mut env = scrub_env(parent_env);
+        if let Some(layout) = &self.policy.sandbox {
+            for (name, value) in layout.env() {
+                env.retain(|(n, _)| *n != name);
+                env.push((name, value));
+            }
+        }
         Ok(SpawnPlan {
             argv,
-            env: scrub_env(parent_env),
+            env,
             dedupe_key,
             overlay_path,
         })
@@ -456,6 +490,15 @@ pub fn omp_config_get(
         .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|e| OmpError::Spawn(format!("omp config get: {e}")))?;
+    // Drain stdout while waiting: a record larger than the pipe buffer
+    // would otherwise block the child until the timeout.
+    let reader = child.stdout.take().map(|mut stdout| {
+        std::thread::spawn(move || {
+            let mut out = String::new();
+            let _ = stdout.read_to_string(&mut out);
+            out
+        })
+    });
     let deadline = std::time::Instant::now() + timeout;
     let status = loop {
         if let Some(status) = child
@@ -474,10 +517,7 @@ pub fn omp_config_get(
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     };
-    let mut out = String::new();
-    if let Some(mut stdout) = child.stdout.take() {
-        let _ = stdout.read_to_string(&mut out);
-    }
+    let out = reader.and_then(|r| r.join().ok()).unwrap_or_default();
     if !status.success() {
         return Err(OmpError::Spawn(format!("omp config get {key}: {status}")));
     }
@@ -706,9 +746,15 @@ mod tests {
             "task",
             "vibe_spawn",
             "vibe_send",
+            "manage_skill",
+            "learn",
         ] {
             assert_eq!(approval[tool], "deny", "{tool} is denied to a reviewer");
         }
+        assert_eq!(
+            overlay["mcp"]["enableProjectConfig"], false,
+            "a workspace's MCP servers add no reviewer tools"
+        );
         assert_eq!(
             approval["bash"], "prompt",
             "bash runs only by an allow pattern"
@@ -726,8 +772,18 @@ mod tests {
         let mut p = profile();
         p.policy = reviewer();
         p.policy.model = Some("opencode-go/glm-5.3".to_string());
-        p.policy.sandbox_profile = Some(PathBuf::from("/tmp/t1/reviewer.sbpl"));
-        let plan = p.plan(Vec::new()).unwrap();
+        p.policy.sandbox = Some(crate::sandbox::ReviewerLayout {
+            dir: PathBuf::from("/tmp/t1"),
+        });
+        let plan = p
+            .plan([
+                (
+                    "TMPDIR".to_string(),
+                    "/private/var/folders/x/T/".to_string(),
+                ),
+                ("HOME".to_string(), "/Users/u".to_string()),
+            ])
+            .unwrap();
         assert_eq!(
             plan.argv[..4],
             [
@@ -743,7 +799,23 @@ mod tests {
         };
         assert_eq!(after("--approval-mode"), "always-ask");
         assert_eq!(after("--model"), "opencode-go/glm-5.3");
+        assert_eq!(after("--tools"), "read,grep,glob,bash");
+        for flag in ["--no-extensions", "--no-skills", "--no-lsp"] {
+            assert!(plan.argv.iter().any(|a| a == flag), "{flag}");
+        }
         assert!(plan.dedupe_key.ends_with(":reviewer"));
+        assert_eq!(
+            plan.overlay_path,
+            PathBuf::from("/tmp/t1/cedian-overlay.yml"),
+            "the overlay sits outside the reviewer's writable run dir"
+        );
+        let env: BTreeMap<_, _> = plan.env.into_iter().collect();
+        assert_eq!(
+            env["TMPDIR"], "/tmp/t1/run/tmp",
+            "never the shared temp dir"
+        );
+        assert_eq!(env["XDG_STATE_HOME"], "/tmp/t1/run/state");
+        assert_eq!(env["HOME"], "/Users/u");
     }
 
     #[test]

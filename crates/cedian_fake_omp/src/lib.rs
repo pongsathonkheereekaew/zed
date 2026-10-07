@@ -1,10 +1,13 @@
 //! `cedian_fake_omp`: hermetic stand-in for `omp --mode rpc-ui` (§86, P2).
 //!
-//! One binary, two modes, chosen by marker files inside `--session-dir` (the
-//! spawn profile scrubs the environment, so env vars cannot carry the mode):
+//! One binary, two modes, chosen by marker files inside `--session-dir`, or
+//! beside the `--config` overlay when the session dir is recreated per run
+//! (the reviewer, ADR-0043). The spawn profile scrubs the environment, so env
+//! vars cannot carry the mode:
 //!
 //! - `fake-omp.record` exists → **record**: proxy to the real OMP binary named
-//!   in that file, tee every stdout/stdin line into `fake-omp.recorded.jsonl`.
+//!   in that file, tee every stdout/stdin line into `fake-omp.recorded.jsonl`
+//!   in the session dir (the one directory a sandboxed reviewer can write).
 //! - `fake-omp.replay.jsonl` exists → **replay**: emit the recorded server
 //!   frames, consume the host's frames in order, fail loudly on divergence.
 //!
@@ -42,7 +45,13 @@ pub fn run(args: &[String]) -> i32 {
         return 2;
     };
     let placeholders = Placeholders::new(&session_dir, &cwd, std::env::var("HOME").ok());
-    let marker = session_dir.join(RECORD_MARKER);
+    let overlay_dir = flag(args, "--config").and_then(|c| c.parent().map(Path::to_path_buf));
+    let marker_dir = [Some(session_dir.clone()), overlay_dir]
+        .into_iter()
+        .flatten()
+        .find(|d| d.join(RECORD_MARKER).is_file() || d.join(REPLAY_FILE).is_file())
+        .unwrap_or_else(|| session_dir.clone());
+    let marker = marker_dir.join(RECORD_MARKER);
     if let Ok(real) = std::fs::read_to_string(&marker) {
         let real = PathBuf::from(real.trim());
         return record::run(
@@ -53,7 +62,7 @@ pub fn run(args: &[String]) -> i32 {
             &placeholders,
         );
     }
-    let fixture = session_dir.join(REPLAY_FILE);
+    let fixture = marker_dir.join(REPLAY_FILE);
     if fixture.is_file() {
         return replay::run(&fixture, &cwd, &placeholders);
     }

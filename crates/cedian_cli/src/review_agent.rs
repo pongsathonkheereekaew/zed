@@ -6,7 +6,7 @@
 //! refuses for it go to the same audit log.
 
 use crate::review_findings::{self, REVIEW_FINDING_TOOL};
-use cedian_omp::sandbox::{REVIEWER_PROFILE_FILE, ReviewerSandbox, resolve_allow_list};
+use cedian_omp::sandbox::{ReviewerLayout, ReviewerSandbox, credential_paths, resolve_allow_list};
 use cedian_omp::{
     Approvals, BashRule, OmpBinary, OmpRuntime, RuntimeConfig, SpawnPolicy, ToolPolicy,
 };
@@ -20,11 +20,15 @@ use std::time::Duration;
 
 pub const REVIEW_REQUEST_TOOL: &str = "cedian_review_request";
 
-/// The reviewer's session directory: fixed per implementer session, so a
-/// replay can install the reviewer's recorded turn there.
+/// The reviewer's directory: fixed per implementer session, so a replay can
+/// install the reviewer's recorded turn there. Canonical, because Seatbelt
+/// matches resolved paths and a symlink must not hide the workspace.
 pub fn reviewer_dir(session_dir: &Path, workdir: &Path) -> Result<PathBuf, String> {
     let dir = session_dir.join("reviewer");
-    if dir.starts_with(workdir) {
+    std::fs::create_dir_all(&dir).map_err(|e| format!("reviewer dir: {e}"))?;
+    let dir = std::fs::canonicalize(&dir).map_err(|e| format!("reviewer dir: {e}"))?;
+    let workdir = std::fs::canonicalize(workdir).map_err(|e| format!("workspace: {e}"))?;
+    if dir.starts_with(&workdir) {
         return Err(format!(
             "the reviewer session dir {} is inside the workspace, which the reviewer \
              sandbox cannot write; set CEDIAN_SESSION_DIR outside it",
@@ -68,15 +72,17 @@ pub fn render_diff(diffs: &[FileDiff], baseline: &HashMap<PathBuf, String>) -> S
     out
 }
 
-/// Each allow-listed command becomes an `allow` pattern; anything else
-/// `bash` runs falls to `prompt`, which headless refuses.
+/// Each allow-listed command `c` becomes the patterns `c` and `c *`, so
+/// `ls` never admits `lsof` (ADR-0043); anything else `bash` runs falls to
+/// `prompt`, which headless refuses.
 pub fn allow_patterns(allow_list: &[String]) -> Vec<BashRule> {
     allow_list
         .iter()
         .map(|c| c.trim())
         .filter(|c| !c.is_empty())
-        .map(|c| BashRule {
-            pattern: format!("{c}*"),
+        .flat_map(|c| [c.to_string(), format!("{c} *")])
+        .map(|pattern| BashRule {
+            pattern,
             approval: ToolPolicy::Allow,
         })
         .collect()
@@ -172,9 +178,12 @@ pub fn run_review(
     let mut editors = store.models.clone();
     editors.extend(requester.implementer_models.iter().cloned());
 
-    let dir = reviewer_dir(session_dir, workdir)?;
-    let _ = std::fs::remove_dir_all(dir.join("sessions"));
-    std::fs::create_dir_all(&dir).map_err(|e| format!("reviewer dir: {e}"))?;
+    let layout = ReviewerLayout {
+        dir: reviewer_dir(session_dir, workdir)?,
+    };
+    layout
+        .reset()
+        .map_err(|e| format!("reviewer run dir: {e}"))?;
     let binary =
         std::fs::canonicalize(crate::omp_binary_path()?).map_err(|e| format!("omp binary: {e}"))?;
     let (exec_allow, mut notes) = resolve_allow_list(
@@ -182,7 +191,8 @@ pub fn run_review(
         std::env::var("PATH").ok().as_deref(),
     );
     // ADR-0039 decision 3: read the role from a directory cedian owns, so a
-    // workspace's .omp/config.yml cannot choose who reviews it.
+    // workspace's .omp/config.yml cannot choose who reviews it. The reviewer
+    // cannot write it either: its profile allows only its run dir.
     let roles_dir = session_dir.join("roles");
     std::fs::create_dir_all(&roles_dir).map_err(|e| format!("roles dir: {e}"))?;
     let role = &settings.review_role.0;
@@ -208,26 +218,28 @@ pub fn run_review(
     let profile = ReviewerSandbox {
         omp_binary: binary.clone(),
         workspace: workdir.to_path_buf(),
-        session_dir: dir.clone(),
-        omp_run_dir: home.join(".omp/run/daemons"),
+        run_dir: layout.run(),
+        read_deny: credential_paths(&home),
         exec_allow,
     }
     .profile()?;
-    let profile_path = dir.join(REVIEWER_PROFILE_FILE);
-    std::fs::write(&profile_path, profile).map_err(|e| format!("reviewer profile: {e}"))?;
+    std::fs::write(layout.profile(), profile).map_err(|e| format!("reviewer profile: {e}"))?;
+    // Opened before the reviewer runs: a log that cannot be written stops
+    // the review instead of leaving its tool calls unrecorded.
+    let mut audit = crate::audit::AuditLog::open(workdir, Approvals::Reviewer)?;
 
     let mut policy = SpawnPolicy {
         approvals: Approvals::Reviewer,
         bash_patterns: allow_patterns(&settings.reviewer_allow_list),
         config_allows: crate::omp_config_allows(workdir)?,
         model,
-        sandbox_profile: Some(profile_path),
+        sandbox: Some(layout.clone()),
         ..SpawnPolicy::default()
     };
     policy.host_tools.insert(REVIEW_FINDING_TOOL.to_string());
     let mut rt = OmpRuntime::spawn(RuntimeConfig {
         binary: OmpBinary::Bundled(binary),
-        session_dir: dir,
+        session_dir: layout.session(),
         cwd: workdir.to_path_buf(),
         ask_dialog: true,
         prompt_timeout: Duration::from_secs(600),
@@ -244,17 +256,19 @@ pub fn run_review(
     let before = review_findings::load(workdir)?.findings.len();
     let turn = rt.prompt(&prompt(&diff, focus), vec![]);
 
-    let mut audit = crate::audit::AuditLog::open(workdir, Approvals::Reviewer)?;
+    let mut recorded = Ok(());
     for event in events.try_iter() {
-        audit.record(&event)?;
+        recorded = recorded.and_then(|()| audit.record(&event));
     }
     router.unsubscribe(sub);
     for refusal in rt.take_refused_ui_requests() {
-        audit.refusal(&refusal)?;
+        recorded = recorded.and_then(|()| audit.refusal(&refusal));
         notes.push(format!("refused for the reviewer: {}", refusal.label));
     }
     let reviewer_models = router.answered_models();
+    // Shut down before any `?`: an error must not leave the reviewer running.
     let _ = rt.shutdown();
+    recorded?;
     turn.map_err(|e| format!("reviewer turn: {e}"))?;
 
     let independent = independent(&reviewer_models, &editors);
@@ -281,9 +295,11 @@ pub fn run_review(
         or_unknown(&reviewer_models),
         found.len()
     );
+    // The reviewer's words are quoted data for the implementer, never
+    // instructions (ADR-0043): each message is one line, bounded at record.
     for f in &found {
         reply.push_str(&format!(
-            "\n- {} {:?} {} hunk {}: {}",
+            "\n- {} {:?} {} hunk {}, reviewer wrote: {:?}",
             f.id, f.finding.severity, f.finding.path, f.hunk, f.finding.message
         ));
     }
@@ -445,20 +461,28 @@ mod tests {
     }
 
     #[test]
-    fn allow_list_becomes_allow_patterns() {
+    fn allow_list_becomes_exact_allow_patterns() {
         let rules = allow_patterns(&["git diff".to_string(), " ".to_string(), "ls".to_string()]);
         let patterns: Vec<&str> = rules.iter().map(|r| r.pattern.as_str()).collect();
-        assert_eq!(patterns, ["git diff*", "ls*"]);
+        assert_eq!(patterns, ["git diff", "git diff *", "ls", "ls *"]);
         assert!(rules.iter().all(|r| r.approval == ToolPolicy::Allow));
     }
 
     #[test]
-    fn reviewer_session_must_sit_outside_the_workspace() {
-        let ws = Path::new("/private/tmp/ws");
-        assert!(reviewer_dir(Path::new("/private/tmp/ws/.cedian/s"), ws).is_err());
+    fn reviewer_dir_must_resolve_outside_the_workspace() {
+        let root = std::env::temp_dir().join(format!("cedian-revdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ws = root.join("ws");
+        std::fs::create_dir_all(ws.join(".state")).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+        assert!(reviewer_dir(&ws.join(".state"), &ws).is_err());
+        // A path outside the workspace that resolves inside it.
+        std::os::unix::fs::symlink(ws.join(".state"), root.join("link")).unwrap();
+        assert!(reviewer_dir(&root.join("link"), &ws).is_err());
         assert_eq!(
-            reviewer_dir(Path::new("/private/tmp/sessions"), ws).unwrap(),
-            Path::new("/private/tmp/sessions/reviewer")
+            reviewer_dir(&root.join("sessions"), &ws).unwrap(),
+            root.join("sessions/reviewer")
         );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

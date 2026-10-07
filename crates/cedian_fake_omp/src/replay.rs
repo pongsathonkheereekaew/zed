@@ -75,9 +75,6 @@ pub(crate) fn run(fixture: &Path, cwd: &Path, placeholders: &Placeholders) -> i3
                     );
                     return crate::EXIT_DIVERGED;
                 }
-                // A dialog's answer is the host's decision, so it must match
-                // exactly: a replay that denies what the recording approved
-                // has diverged.
                 if got_type == Some("extension_ui_response") {
                     let expected = placeholders.expand_value(&record.frame);
                     if got != expected {

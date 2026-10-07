@@ -113,7 +113,7 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
         .update(cx, |panel, window, cx| {
             panel.set_prompt("still there?", window, cx);
             panel.submit(window, cx);
-            panel.status().to_string()
+            panel.notice().unwrap_or_default().to_string()
         })
         .unwrap();
     assert!(

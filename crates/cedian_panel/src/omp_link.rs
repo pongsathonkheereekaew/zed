@@ -19,10 +19,10 @@ use cedian_shell::audit::AuditLog;
 use cedian_shell::{Policy, RunKind};
 use collections::HashMap;
 use futures::channel::mpsc::UnboundedSender;
-use omp_rpc::{ExtensionUiRequest, ImageContent};
+use omp_rpc::{ExtensionUiRequest, ExtensionUiResponse, ImageContent};
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock, mpsc};
 use std::time::Duration;
 
@@ -90,12 +90,23 @@ impl LaunchSpec {
     }
 }
 
-/// A running OMP. Dropping it shuts OMP down (no `Disconnected` follows) and
-/// records the dialogs it left open.
+/// A running OMP. Dropping it closes the dialogs OMP still waits on (a
+/// cancel reply and an `abstain` row each), aborts a running turn so the
+/// old process ends promptly, and shuts OMP down (no `Disconnected` follows).
 pub struct OmpLink {
     prompts: mpsc::Sender<Prompt>,
     pid: Arc<AtomicU32>,
     gate: Arc<Gate>,
+}
+
+/// Why [`OmpLink::answer`] failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnswerError {
+    /// OMP did not get the answer; the dialog stays open.
+    NotSent(String),
+    /// OMP got the answer, so the dialog is closed, but its audit row could
+    /// not be written: the turn must fail (ADR-0035).
+    Unaudited(String),
 }
 
 /// Shared by the panel (answers), the event thread (tool rows, dialogs
@@ -103,7 +114,16 @@ pub struct OmpLink {
 #[derive(Default)]
 struct Gate {
     control: OnceLock<RuntimeControl>,
+    /// Set while OMP runs a prompt.
+    turn: AtomicBool,
     state: Mutex<GateState>,
+}
+
+impl Gate {
+    fn send(&self, reply: ExtensionUiResponse) -> Result<(), String> {
+        let control = self.control.get().ok_or("OMP is not running")?;
+        control.respond(reply).map_err(|e| e.to_string())
+    }
 }
 
 #[derive(Default)]
@@ -114,8 +134,7 @@ struct GateState {
 }
 
 impl GateState {
-    fn record(&mut self, mut record: DialogRecord) -> Result<(), String> {
-        record.at_ms = now_ms();
+    fn record(&mut self, record: DialogRecord) -> Result<(), String> {
         match &mut self.audit {
             Some(audit) => audit.dialog(&record),
             None => Err("the audit log is not open".to_string()),
@@ -130,7 +149,6 @@ impl GateState {
             .try_for_each(|record| self.record(record))
     }
 
-    /// Track and audit one event before the panel sees it.
     fn observe(&mut self, event: &RouterEvent) -> Result<(), String> {
         match event {
             RouterEvent::UiRequest(ExtensionUiRequest::Cancel(cancel)) => {
@@ -153,6 +171,48 @@ impl GateState {
                 None => Ok(()),
             },
         }
+    }
+
+    fn answer(
+        &mut self,
+        request_id: &str,
+        answer: UserAnswer,
+        send: impl FnOnce(ExtensionUiResponse) -> Result<(), String>,
+    ) -> Result<(), AnswerError> {
+        let request = self.open.get(request_id).ok_or_else(|| {
+            AnswerError::NotSent("OMP no longer waits on that dialog".to_string())
+        })?;
+        let (reply, record) = cedian_omp::user_answer(request, answer).ok_or_else(|| {
+            AnswerError::NotSent("that answer does not fit the dialog".to_string())
+        })?;
+        send(reply).map_err(AnswerError::NotSent)?;
+        self.open.remove(request_id);
+        self.record(record).map_err(AnswerError::Unaudited)
+    }
+
+    /// Close dialog `request_id` (every open one when `None`) for OMP: a
+    /// cancel reply, then its `abstain` row. A reply that fails to go out
+    /// still leaves the row: nobody answered. Returns whether any was open.
+    fn abandon(
+        &mut self,
+        request_id: Option<&str>,
+        timed_out: bool,
+        send: impl Fn(ExtensionUiResponse) -> Result<(), String>,
+    ) -> Result<bool, String> {
+        let requests: Vec<_> = match request_id {
+            Some(id) => self.open.remove(id).into_iter().collect(),
+            None => self.open.drain().map(|(_, request)| request).collect(),
+        };
+        let any = !requests.is_empty();
+        for request in &requests {
+            if let Some((reply, record)) = cedian_omp::abandoned(request, timed_out) {
+                if let Err(e) = send(reply) {
+                    log::warn!("cedian: OMP did not get the dialog's cancel: {e}");
+                }
+                self.record(record)?;
+            }
+        }
+        Ok(any)
     }
 }
 
@@ -192,34 +252,47 @@ impl OmpLink {
     }
 
     /// Send a person's answer to dialog `request_id` and record it.
-    pub fn answer(&self, request_id: &str, answer: UserAnswer) -> Result<(), String> {
-        let control = self.control().ok_or("OMP is not running")?;
-        let mut state = self.gate.state.lock();
-        let request = state
-            .open
-            .get(request_id)
-            .ok_or("OMP no longer waits on that dialog")?;
-        let (reply, record) = cedian_omp::user_answer(request, answer)
-            .ok_or("that answer does not fit the dialog")?;
-        control.respond(reply).map_err(|e| e.to_string())?;
-        state.open.remove(request_id);
-        state.record(record)
+    pub fn answer(&self, request_id: &str, answer: UserAnswer) -> Result<(), AnswerError> {
+        self.gate
+            .state
+            .lock()
+            .answer(request_id, answer, |reply| self.gate.send(reply))
+    }
+
+    /// Stop: close every dialog OMP waits on. The caller aborts the turn.
+    pub fn close_dialogs(&self) -> Result<(), String> {
+        self.gate
+            .state
+            .lock()
+            .abandon(None, false, |reply| self.gate.send(reply))
+            .map(|_| ())
+    }
+
+    /// The §63 lease on dialog `request_id` ran out: OMP gets a timed-out
+    /// cancel. `Ok(false)` when it was already closed.
+    pub fn expire(&self, request_id: &str) -> Result<bool, String> {
+        self.gate
+            .state
+            .lock()
+            .abandon(Some(request_id), true, |reply| self.gate.send(reply))
     }
 }
 
 impl Drop for OmpLink {
     fn drop(&mut self) {
-        if let Err(e) = self.gate.state.lock().abstain_all() {
+        if let Err(e) = self.close_dialogs() {
             log::error!("cedian: {e}");
         }
+        if self.gate.turn.load(Ordering::Relaxed)
+            && let Some(control) = self.control()
+        {
+            std::thread::spawn(move || {
+                if let Err(e) = control.abort() {
+                    log::warn!("cedian: abort on shutdown: {e}");
+                }
+            });
+        }
     }
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 fn run(
@@ -286,9 +359,11 @@ fn run(
         }
     }
     for prompt in prompts {
+        gate.turn.store(true, Ordering::Relaxed);
         if let Err(e) = runtime.prompt(&prompt.text, prompt.images) {
             log::error!("cedian: OMP turn failed: {e}");
         }
+        gate.turn.store(false, Ordering::Relaxed);
     }
     let _ = runtime.shutdown();
 }
@@ -297,6 +372,135 @@ fn run(
 mod tests {
     use super::*;
     use futures::StreamExt as _;
+    use omp_rpc::wire::CancelUiResponse;
+
+    fn approval(id: &str) -> RouterEvent {
+        RouterEvent::UiRequest(
+            ExtensionUiRequest::from_value(serde_json::json!({
+                "type": "extension_ui_request", "method": "select", "id": id,
+                "title": "Allow tool: bash\nCommand: ls", "options": ["Approve", "Deny"]
+            }))
+            .unwrap(),
+        )
+    }
+
+    fn gate(dir: &Path) -> GateState {
+        GateState {
+            audit: Some(AuditLog::open(dir, SpawnPolicy::default().approvals).unwrap()),
+            open: HashMap::default(),
+        }
+    }
+
+    fn rows(dir: &Path) -> Vec<(String, String)> {
+        std::fs::read_to_string(dir.join(cedian_shell::audit::AUDIT_FILE))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["item"].clone())
+            .filter(|item| item["kind"] == "gate")
+            .map(|item| {
+                (
+                    item["decision"].as_str().unwrap().to_string(),
+                    item["answered_by"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("cedian-gate-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn abstain() -> (String, String) {
+        ("abstain".to_string(), "cedian".to_string())
+    }
+
+    #[test]
+    fn omp_withdrawing_a_dialog_is_one_abstain_row() {
+        let dir = temp("cancel");
+        let mut gate = gate(&dir);
+        gate.observe(&approval("d1")).unwrap();
+        let cancel = RouterEvent::UiRequest(
+            ExtensionUiRequest::from_value(serde_json::json!({
+                "type": "extension_ui_request", "method": "cancel", "id": "c1", "targetId": "d1"
+            }))
+            .unwrap(),
+        );
+        gate.observe(&cancel).unwrap();
+        gate.observe(&cancel).unwrap();
+        assert!(gate.open.is_empty());
+        assert_eq!(rows(&dir), [abstain()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn omp_dying_with_a_dialog_open_is_one_abstain_row() {
+        let dir = temp("disconnect");
+        let mut gate = gate(&dir);
+        gate.observe(&approval("d1")).unwrap();
+        gate.observe(&RouterEvent::Disconnected).unwrap();
+        gate.observe(&RouterEvent::Disconnected).unwrap();
+        assert!(gate.open.is_empty());
+        assert_eq!(rows(&dir), [abstain()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_answer_omp_got_but_the_audit_lost_closes_the_dialog_and_fails_the_turn() {
+        let mut gate = GateState::default();
+        gate.observe(&approval("d1")).unwrap();
+        let sent = std::cell::RefCell::new(Vec::new());
+        let result = gate.answer("d1", UserAnswer::Choice("Approve".into()), |reply| {
+            sent.borrow_mut().push(reply);
+            Ok(())
+        });
+        assert!(
+            matches!(result, Err(AnswerError::Unaudited(_))),
+            "{result:?}"
+        );
+        assert_eq!(sent.borrow().len(), 1, "OMP got the answer");
+        assert!(gate.open.is_empty(), "nothing left to answer twice");
+    }
+
+    #[test]
+    fn an_answer_omp_did_not_get_keeps_the_dialog_open() {
+        let dir = temp("unsent");
+        let mut gate = gate(&dir);
+        gate.observe(&approval("d1")).unwrap();
+        let result = gate.answer("d1", UserAnswer::Choice("Approve".into()), |_| {
+            Err("pipe closed".to_string())
+        });
+        assert_eq!(result, Err(AnswerError::NotSent("pipe closed".to_string())));
+        assert!(gate.open.contains_key("d1"));
+        assert!(rows(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_dialog_cedian_closes_gets_a_cancel_and_an_abstain_row() {
+        let dir = temp("abandon");
+        let mut gate = gate(&dir);
+        gate.observe(&approval("d1")).unwrap();
+        let sent = std::cell::RefCell::new(Vec::new());
+        let send = |reply| {
+            sent.borrow_mut().push(reply);
+            Ok(())
+        };
+        assert_eq!(gate.abandon(Some("d1"), true, send), Ok(true));
+        assert_eq!(gate.abandon(Some("d1"), true, send), Ok(false));
+        assert_eq!(
+            *sent.borrow(),
+            [ExtensionUiResponse::CancelUiResponse(CancelUiResponse {
+                id: "d1".into(),
+                cancelled: omp_rpc::wire::LitTrue,
+                timed_out: Some(true),
+            })]
+        );
+        assert_eq!(rows(&dir), [abstain()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn ready(
         events: &mut futures::channel::mpsc::UnboundedReceiver<LinkEvent>,

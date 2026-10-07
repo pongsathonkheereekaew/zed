@@ -9,4 +9,4 @@ pub mod panel;
 pub mod version;
 
 pub use omp_settings::OmpSettings;
-pub use panel::{CedianPanel, Connection, ImportedEdit, ToggleFocus, init};
+pub use panel::{CedianPanel, Connection, DIALOG_TIMEOUT, ImportedEdit, ToggleFocus, Turn, init};

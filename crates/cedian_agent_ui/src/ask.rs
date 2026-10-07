@@ -114,15 +114,20 @@ impl AskDialog {
     /// Answer the dialog: validates every question in order, flips to
     /// `Answered`. Returns the ordered answers for the wire response.
     pub fn answer(&mut self) -> Result<Vec<AskAnswer>, AskError> {
+        let answers = self.answers()?;
+        self.state = AskState::Answered;
+        Ok(answers)
+    }
+
+    /// The answers [`Self::answer`] would send, without answering.
+    pub fn answers(&self) -> Result<Vec<AskAnswer>, AskError> {
         if self.state != AskState::Pending {
             return Err(AskError::NotPending);
         }
-        let mut answers = Vec::with_capacity(self.questions.len());
-        for q in &self.questions {
-            answers.push(q.validate()?);
-        }
-        self.state = AskState::Answered;
-        Ok(answers)
+        self.questions
+            .iter()
+            .map(AskQuestionModel::validate)
+            .collect()
     }
 
     /// Lease expiry: timeout or disconnect → `Abstained`. Always allowed from

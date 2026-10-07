@@ -147,12 +147,7 @@ impl AuditLog {
         if self.reviewer {
             item["actor"] = json!("reviewer");
         }
-        let timestamp_ms = at_ms.unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0)
-        });
+        let timestamp_ms = at_ms.unwrap_or_else(cedian_omp::now_ms);
         // Hold the lock across the write so ordinals land in file order.
         let mut next = NEXT_ORDINAL.lock().unwrap_or_else(|e| e.into_inner());
         let ordinal = next

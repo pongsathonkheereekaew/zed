@@ -13,7 +13,7 @@ The one home for **per-feature OMP coverage** ([ADR-0034](https://github.com/pon
 | Command(s) | cedian surface | Status |
 |---|---|---|
 | `negotiate_protocol` | runtime handshake (v2) | headless |
-| `prompt`, `abort` | composer send (images pasted into the composer go as `images`) / Stop button while a turn streams; an audit write failure aborts the turn (S9 U4) | native |
+| `prompt`, `abort` | composer send (images pasted into the composer go as `images`) / Stop button while a turn streams (Stop first cancels any open dialog, audited `abstain`); an audit write failure aborts the turn once (S9 U4) | native |
 | `steer` | steer while a turn runs | headless |
 | `follow_up`, `abort_and_prompt`, `abort_and_restore_queue` | composer queue actions | planned S9 |
 | `remove_queued_message`, `promote_queued_message` | queued-message chips | planned S9 |
@@ -87,7 +87,7 @@ Frames OMP sends besides the agent events above.
 
 | Request(s) | cedian surface | Status |
 |---|---|---|
-| `select`, `confirm`, `input`, `editor`, `ask`, `cancel` | native dialogs ([§63](https://github.com/pongsathonkheereekaew/cedian/blob/main/docs/ARCHITECTURE.md)): the app panel shows each open dialog (one button per `select` option, Yes/No, a text box, `ask` questions with options and free text, Dismiss on all) and answers it; `audit.jsonl` gets a gate row `answered_by: user`; OMP's `cancel` removes the dialog | native (S9 U4); headless runs answer fail-closed |
+| `select`, `confirm`, `input`, `editor`, `ask`, `cancel` | native dialogs ([§63](https://github.com/pongsathonkheereekaew/cedian/blob/main/docs/ARCHITECTURE.md)): the app panel shows each open dialog (one button per `select` option, Yes/No, a text box, `ask` questions with options and free text, Dismiss on all) and answers it; `audit.jsonl` gets a gate row `answered_by: user`; OMP's `cancel` removes the dialog; a dialog unanswered for 5 minutes, or open at Stop or restart, gets a cancel reply (`timedOut` on expiry) and an `abstain` row by cedian (§63) | native (S9 U4); headless runs answer fail-closed |
 | `notify` | toast | planned S9 |
 | `setStatus`, `setWidget`, `setTitle` | status line, panel widget, window title | planned S9 |
 | `set_editor_text` | composer text | planned S9 |

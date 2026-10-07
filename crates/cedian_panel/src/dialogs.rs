@@ -6,7 +6,7 @@
 use cedian_agent_ui::{AskDialog, AskError};
 use cedian_omp::UserAnswer;
 use editor::Editor;
-use gpui::{App, AppContext as _, Entity, Window};
+use gpui::{App, AppContext as _, Entity, Task, Window};
 use omp_rpc::{AskAnswer, ExtensionUiRequest};
 
 pub struct OpenDialog {
@@ -19,6 +19,8 @@ pub struct OpenDialog {
     text: Option<Entity<Editor>>,
     /// Why the last answer did not go through.
     pub error: Option<String>,
+    /// The §63 lease: when it fires, cedian closes the dialog.
+    pub expiry: Option<Task<()>>,
 }
 
 impl OpenDialog {
@@ -58,6 +60,7 @@ impl OpenDialog {
             custom,
             text,
             error: None,
+            expiry: None,
         })
     }
 
@@ -99,19 +102,18 @@ impl OpenDialog {
 
     /// The answer the Submit button sends: the typed text of an `input` or
     /// `editor`, or every `ask` answer checked against its question.
-    pub fn submission(&self, cx: &App) -> Result<UserAnswer, String> {
+    pub fn submission(&mut self, cx: &App) -> Result<UserAnswer, String> {
         if let Some(text) = &self.text {
             return Ok(UserAnswer::Text(text.read(cx).text(cx)));
         }
-        // A copy, so an answer OMP never received can be corrected and sent again.
-        let mut ask = self.ask.clone().ok_or("this dialog has no Submit")?;
+        let ask = self.ask.as_mut().ok_or("this dialog has no Submit")?;
         for (question, editor) in self.custom.iter().enumerate() {
             let id = ask.questions()[question].id.clone();
             if let Some(q) = ask.question_mut(&id) {
                 q.custom_input = editor.read(cx).text(cx);
             }
         }
-        let answers = ask.answer().map_err(|e| {
+        let answers = ask.answers().map_err(|e| {
             match e {
                 AskError::TooManySelections => "pick one option",
                 AskError::UnknownOption => "pick one of the listed options",

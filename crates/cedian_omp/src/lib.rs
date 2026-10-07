@@ -19,7 +19,8 @@ pub mod session;
 pub mod spawn_profile;
 
 pub use dialog::{
-    Answerer, DialogRecord, GateDecision, UserAnswer, abstained, headless_answer, user_answer,
+    Answerer, DialogRecord, GateDecision, UserAnswer, abandoned, abstained, headless_answer,
+    now_ms, user_answer,
 };
 pub use errors::OmpError;
 pub use event_router::{

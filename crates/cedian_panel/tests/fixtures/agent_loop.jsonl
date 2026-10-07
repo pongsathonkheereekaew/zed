@@ -34,3 +34,36 @@
 {"dir":"out","frame":{"command":"abort","id":"req_9","success":true,"type":"response"}}
 {"dir":"out","frame":{"agentInvoked":true,"id":"req_8","sessionSettled":true,"status":"aborted","type":"prompt_result"}}
 {"dir":"out","frame":{"type":"session_settled"}}
+{"dir":"in","frame":{"id":"req_10","message":"Ask me what you need","type":"prompt"}}
+{"dir":"out","frame":{"command":"prompt","id":"req_10","success":true,"type":"response"}}
+{"dir":"out","frame":{"type":"agent_start"}}
+{"dir":"out","frame":{"id":"u4-confirm","method":"confirm","title":"Allow tool: eval","message":"run python","type":"extension_ui_request"}}
+{"dir":"in","frame":{"id":"u4-confirm","type":"extension_ui_response","confirmed":true}}
+{"dir":"out","frame":{"id":"u4-input","method":"input","title":"Branch name?","placeholder":"main","type":"extension_ui_request"}}
+{"dir":"in","frame":{"id":"u4-input","type":"extension_ui_response","value":"cedian-pasted"}}
+{"dir":"out","frame":{"id":"u4-editor","method":"editor","title":"Commit message","prefill":"fix: dialogs","type":"extension_ui_request"}}
+{"dir":"in","frame":{"id":"u4-editor","type":"extension_ui_response","value":"fix: dialogs"}}
+{"dir":"out","frame":{"id":"u4-ask","method":"ask","questions":[{"id":"db","question":"Which database?","options":[{"label":"Postgres"},{"label":"SQLite"}],"multi":false},{"id":"name","question":"Project name?","options":[],"multi":false}],"type":"extension_ui_request"}}
+{"dir":"in","frame":{"id":"u4-ask","type":"extension_ui_response","answers":[{"id":"db","selectedOptions":["SQLite"]},{"id":"name","selectedOptions":[],"customInput":"cedian"}]}}
+{"dir":"out","frame":{"agentInvoked":true,"id":"req_10","sessionSettled":true,"status":"completed","type":"prompt_result"}}
+{"dir":"out","frame":{"type":"session_settled"}}
+{"dir":"in","frame":{"id":"req_11","message":"Run sleep 60","type":"prompt"}}
+{"dir":"out","frame":{"command":"prompt","id":"req_11","success":true,"type":"response"}}
+{"dir":"out","frame":{"type":"agent_start"}}
+{"dir":"out","frame":{"args":{"command":"sleep 60"},"toolCallId":"call_u4_stop","toolName":"bash","type":"tool_execution_start"}}
+{"dir":"out","frame":{"id":"u4-stop","method":"select","options":["Approve","Deny"],"title":"Allow tool: bash\nCommand: sleep 60","type":"extension_ui_request"}}
+{"dir":"in","frame":{"id":"u4-stop","type":"extension_ui_response","cancelled":true}}
+{"dir":"in","frame":{"id":"req_12","type":"abort"}}
+{"dir":"out","frame":{"command":"abort","id":"req_12","success":true,"type":"response"}}
+{"dir":"out","frame":{"isError":true,"result":{"content":[{"text":"Tool call denied by user: bash","type":"text"}],"details":{}},"toolCallId":"call_u4_stop","toolName":"bash","type":"tool_execution_end"}}
+{"dir":"out","frame":{"agentInvoked":true,"id":"req_11","sessionSettled":true,"status":"aborted","type":"prompt_result"}}
+{"dir":"out","frame":{"type":"session_settled"}}
+{"dir":"in","frame":{"id":"req_13","message":"Run make","type":"prompt"}}
+{"dir":"out","frame":{"command":"prompt","id":"req_13","success":true,"type":"response"}}
+{"dir":"out","frame":{"type":"agent_start"}}
+{"dir":"out","frame":{"args":{"command":"make"},"toolCallId":"call_u4_timeout","toolName":"bash","type":"tool_execution_start"}}
+{"dir":"out","frame":{"id":"u4-timeout","method":"select","options":["Approve","Deny"],"title":"Allow tool: bash\nCommand: make","type":"extension_ui_request"}}
+{"dir":"in","frame":{"id":"u4-timeout","type":"extension_ui_response","cancelled":true,"timedOut":true}}
+{"dir":"out","frame":{"isError":true,"result":{"content":[{"text":"Tool call denied by user: bash","type":"text"}],"details":{}},"toolCallId":"call_u4_timeout","toolName":"bash","type":"tool_execution_end"}}
+{"dir":"out","frame":{"agentInvoked":true,"id":"req_13","sessionSettled":true,"status":"completed","type":"prompt_result"}}
+{"dir":"out","frame":{"type":"session_settled"}}

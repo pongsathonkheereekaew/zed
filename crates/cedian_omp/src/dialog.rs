@@ -54,7 +54,7 @@ impl Answerer {
 }
 
 /// One dialog's outcome. `tool` is read from an OMP approval title
-/// (`Allow tool: <name>`); `at_ms` is stamped when the reply was sent.
+/// (`Allow tool: <name>`); `at_ms` is when the outcome was decided.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DialogRecord {
     pub label: String,
@@ -165,6 +165,32 @@ pub fn abstained(request: &ExtensionUiRequest) -> Option<DialogRecord> {
     Some(record(title, GateDecision::Abstain, Answerer::Cedian))
 }
 
+/// cedian closing a dialog OMP still waits on (Stop, restart, the §63
+/// five-minute lease): a cancel reply, recorded as `abstain` by cedian.
+pub fn abandoned(
+    request: &ExtensionUiRequest,
+    timed_out: bool,
+) -> Option<(ExtensionUiResponse, DialogRecord)> {
+    let (id, title) = dialog(request)?;
+    let reply = ExtensionUiResponse::CancelUiResponse(CancelUiResponse {
+        id: id.to_string(),
+        cancelled: LitTrue,
+        timed_out: timed_out.then_some(true),
+    });
+    Some((
+        reply,
+        record(title, GateDecision::Abstain, Answerer::Cedian),
+    ))
+}
+
+/// Milliseconds since the Unix epoch.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Id and title of a request that expects a reply.
 pub fn dialog(request: &ExtensionUiRequest) -> Option<(&str, &str)> {
     match request {
@@ -195,7 +221,7 @@ fn record(title: &str, decision: GateDecision, answered_by: Answerer) -> DialogR
             .map(|t| t.trim().to_string()),
         decision,
         answered_by,
-        at_ms: 0,
+        at_ms: now_ms(),
     }
 }
 

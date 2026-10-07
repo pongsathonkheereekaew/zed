@@ -1,6 +1,6 @@
 //! S9 U4: one prompt at a time, and every way a prompt ends reaches the
-//! panel. The real panel, OMP played by fake-omp replaying three fixtures,
-//! one per OMP process (`turn_lifecycle_{1,2,3}.jsonl`):
+//! panel. The real panel, OMP played by fake-omp replaying four fixtures,
+//! one per OMP process (`turn_lifecycle_{1,2,3,4}.jsonl`):
 //!
 //! 1. Stop while the prompt is still queued: it never reaches OMP (the
 //!    fixture's first prompt is "one", and replay checks the text);
@@ -11,11 +11,21 @@
 //!    abort (a second would meet the next recorded prompt and end the
 //!    replay);
 //! 5. Restart with a prompt still queued: the old OMP never sends it (the
-//!    fixture would write `old-omp-got-four`);
-//! 6. Restart while the old OMP is slow to exit and still holds the session
-//!    file: the new OMP waits for it and opens the session, not Taken.
+//!    fixture would write `old-omp-got-four`), though it was alive and held
+//!    the prompt in its queue at the restart;
+//! 6. Stop, then Restart while the old OMP is slow to exit and still holds
+//!    the session file: one abort, and the new OMP waits for the old and
+//!    opens the session, not Taken;
+//! 7. Restart while the old OMP never answers the abort and a process it
+//!    started holds the session file: the old OMP's group is killed and the
+//!    new OMP opens the session, not Taken.
 //!
 //! Harness off: invoked with `--mode` (or `config`) this binary is fake-omp.
+
+#![allow(
+    clippy::disallowed_methods,
+    reason = "probing a real OS process id; no async spawn helper applies"
+)]
 
 use cedian_omp::UserAnswer;
 use cedian_panel::{CedianPanel, Connection, Turn};
@@ -155,12 +165,16 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
 
     // 5. Restart with a prompt queued behind a driver check.
     install(2);
-    window
+    let old = window
         .update(cx, |panel, window, cx| {
             panel.retry_session(cx);
             panel.set_prompt("four", window, cx);
             panel.submit(window, cx);
+            assert!(panel.prompt_queued(), "the old OMP holds four in its queue");
+            let old = panel.omp_pid().unwrap();
+            assert!(alive(old), "the old OMP runs");
             panel.restart(window, cx);
+            old
         })
         .unwrap();
     wait(cx, &window, "the restarted OMP", ready);
@@ -169,24 +183,62 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
         "the old OMP sent the queued prompt"
     );
 
-    // 6. Restart while the old OMP winds down holding the session file.
+    assert!(!alive(old), "the old OMP ended");
+
+    // 6. Stop, then Restart while the old OMP winds down holding the
+    // session file: one abort (fixture 2 records a second as a file).
     submit(cx, &window, "slow");
     wait(cx, &window, "the slow turn", |p| {
         p.turn() == &Turn::Streaming
     });
     install(3);
     window
-        .update(cx, |panel, window, cx| panel.restart(window, cx))
+        .update(cx, |panel, window, cx| {
+            panel.stop_turn(cx);
+            panel.restart(window, cx);
+        })
         .unwrap();
     wait(cx, &window, "the session after the slow OMP", |p| {
         !matches!(p.connection(), Connection::Starting)
     });
     assert_ready(cx, &window);
+    assert!(
+        !ws.join("old-omp-got-two-aborts").exists(),
+        "Stop then Restart sent a second abort"
+    );
     submit(cx, &window, "five");
     wait(cx, &window, "turn five", |p| {
         p.turn() == &Turn::Idle && p.notice().is_none()
     });
     assert_ready(cx, &window);
+
+    // 7. Restart while the old OMP never answers the abort and a process
+    // it started holds the session file: past the wait, its whole group is
+    // killed and the new OMP opens the session.
+    submit(cx, &window, "hang");
+    wait(cx, &window, "the hanging turn", |p| {
+        p.turn() == &Turn::Streaming
+    });
+    install(4);
+    cedian_panel::omp_link::set_previous_exit(Duration::from_millis(500));
+    window
+        .update(cx, |panel, window, cx| panel.restart(window, cx))
+        .unwrap();
+    wait(cx, &window, "the session after the hung OMP", |p| {
+        !matches!(p.connection(), Connection::Starting)
+    });
+    assert_ready(cx, &window);
+}
+
+/// Whether `pid` runs: a zombie, dead but not yet reaped, does not.
+fn alive(pid: u32) -> bool {
+    std::process::Command::new("/bin/ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .is_ok_and(|out| {
+            let stat = String::from_utf8_lossy(&out.stdout);
+            out.status.success() && !stat.trim().is_empty() && !stat.trim().starts_with('Z')
+        })
 }
 
 fn ready(p: &CedianPanel) -> bool {

@@ -22,8 +22,8 @@ use futures::channel::mpsc::UnboundedSender;
 use omp_rpc::{ExtensionUiRequest, ExtensionUiResponse, ImageContent};
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock, mpsc};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 /// What the OMP thread tells the panel.
@@ -49,6 +49,9 @@ pub enum LinkEvent {
     Taken { session_id: String, reason: String },
     /// The prompt was stopped before OMP got it.
     PromptCancelled,
+    /// OMP ran the prompt, it was stopped, and the call ended in an error
+    /// instead of a result.
+    PromptStopped(String),
     /// OMP did not run the prompt: it refused it, or the call failed.
     PromptFailed(String),
     /// Stop's abort did not reach OMP.
@@ -128,8 +131,17 @@ struct Previous {
 }
 
 /// How long a restart waits for the previous OMP to let go of the session
-/// before it kills it.
-const PREVIOUS_EXIT: Duration = Duration::from_secs(10);
+/// before it kills it, in milliseconds.
+static PREVIOUS_EXIT_MS: AtomicU64 = AtomicU64::new(10_000);
+
+/// How long the killed previous OMP's thread may take to wind down.
+const KILLED_EXIT: Duration = Duration::from_secs(3);
+
+/// Shorten how long a restart waits before killing the previous OMP.
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_previous_exit(limit: Duration) {
+    PREVIOUS_EXIT_MS.store(limit.as_millis() as u64, Ordering::Relaxed);
+}
 
 /// Why [`OmpLink::answer`] failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,7 +156,9 @@ pub enum AnswerError {
 /// Shared by the panel (answers), the event thread (tool rows, dialogs
 /// opening and closing) and the OMP thread (control, once spawned).
 struct Gate {
-    control: OnceLock<RuntimeControl>,
+    /// Taken back before OMP shuts down: a clone left here would keep its
+    /// client, and so the process, alive.
+    control: Mutex<Option<RuntimeControl>>,
     turn: Mutex<TurnState>,
     state: Mutex<GateState>,
     events: UnboundedSender<LinkEvent>,
@@ -176,16 +190,16 @@ enum Phase {
 
 impl Gate {
     fn send(&self, reply: ExtensionUiResponse) -> Result<(), String> {
-        let control = self.control.get().ok_or("OMP is not running")?;
+        let control = self.control.lock().clone().ok_or("OMP is not running")?;
         control.respond(reply).map_err(|e| e.to_string())
     }
 
     /// Cancel the current prompt; with `close`, every later one too.
     fn cancel(&self, close: bool) {
         let mut turn = self.turn.lock();
-        turn.cancelled = true;
+        let first = !std::mem::replace(&mut turn.cancelled, true);
         turn.closed |= close;
-        if turn.phase == Phase::Started {
+        if first && turn.phase == Phase::Started {
             self.abort();
         }
     }
@@ -202,7 +216,7 @@ impl Gate {
     }
 
     fn abort(&self) {
-        let Some(control) = self.control.get().cloned() else {
+        let Some(control) = self.control.lock().clone() else {
             return;
         };
         let events = self.events.clone();
@@ -324,7 +338,7 @@ impl OmpLink {
         let (commands, command_rx) = mpsc::channel::<Command>();
         let pid = Arc::new(AtomicU32::new(0));
         let gate = Arc::new(Gate {
-            control: OnceLock::new(),
+            control: Mutex::default(),
             turn: Mutex::default(),
             state: Mutex::default(),
             events: events.clone(),
@@ -359,6 +373,12 @@ impl OmpLink {
     /// aborted if it does.
     pub fn cancel(&self) {
         self.gate.cancel(false);
+    }
+
+    /// Whether the current prompt waits in the queue or the driver check.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn prompt_queued(&self) -> bool {
+        self.gate.turn.lock().phase == Phase::Queued
     }
 
     /// Whether OMP still waits on dialog `request_id`.
@@ -396,7 +416,7 @@ impl OmpLink {
     /// Mid-turn control (abort, steer), once OMP has started. Its calls
     /// block until OMP answers: run them off the UI thread.
     pub fn control(&self) -> Option<RuntimeControl> {
-        self.gate.control.get().cloned()
+        self.gate.control.lock().clone()
     }
 
     /// Send a person's answer to dialog `request_id` and record it.
@@ -469,7 +489,7 @@ fn run(
     };
     let own = runtime.pid();
     pid.store(own.unwrap_or(0), Ordering::Relaxed);
-    let _ = gate.control.set(runtime.control());
+    *gate.control.lock() = Some(runtime.control());
     let (_sub, router_events) = runtime.router().subscribe();
     let forward = events.clone();
     let forward_gate = Arc::clone(&gate);
@@ -499,7 +519,7 @@ fn run(
             let _ = events.unbounded_send(LinkEvent::Failed(format!(
                 "OMP's session did not open: {e}"
             )));
-            let _ = runtime.shutdown();
+            shutdown(runtime, &gate, own);
             return;
         }
     };
@@ -561,16 +581,17 @@ fn run(
                     turn.phase = Phase::Sent;
                 }
                 let result = runtime.prompt(&prompt.text, prompt.images);
-                let cancelled = {
+                let (cancelled, started) = {
                     let mut turn = gate.turn.lock();
+                    let started = turn.phase == Phase::Started;
                     idle(&mut turn);
-                    turn.cancelled
+                    (turn.cancelled, started)
                 };
                 if let Err(e) = result {
-                    let _ = events.unbounded_send(if cancelled {
-                        LinkEvent::PromptCancelled
-                    } else {
-                        LinkEvent::PromptFailed(e.to_string())
+                    let _ = events.unbounded_send(match (cancelled, started) {
+                        (true, true) => LinkEvent::PromptStopped(e.to_string()),
+                        (true, false) => LinkEvent::PromptCancelled,
+                        (false, _) => LinkEvent::PromptFailed(e.to_string()),
                     });
                 }
             }
@@ -603,23 +624,47 @@ fn run(
             }
         }
     }
-    let _ = runtime.shutdown();
+    shutdown(runtime, &gate, own);
+}
+
+/// Shut OMP down; if a control call still holds its client, kill it, so
+/// this thread ending means the process no longer holds the session.
+fn shutdown(runtime: OmpRuntime, gate: &Gate, own: Option<u32>) {
+    gate.control.lock().take();
+    if let Err(e) = runtime.shutdown() {
+        log::warn!("cedian: OMP did not shut down ({e}); killing it");
+        if let Some(pid) = own {
+            cedian_omp::driver::kill_group(pid);
+        }
+    }
 }
 
 /// Wait for the previous link's OMP to end, so it no longer holds the
-/// session; it is ours, so one that does not end in time is killed.
+/// session; it is ours, so one that does not end in time is killed with its
+/// whole process group, and its thread gets a little longer to wind down.
 fn wait_for(previous: Previous) {
-    let deadline = std::time::Instant::now() + PREVIOUS_EXIT;
-    while !previous.thread.is_finished() {
+    let limit = Duration::from_millis(PREVIOUS_EXIT_MS.load(Ordering::Relaxed));
+    if finished_within(&previous.thread, limit) {
+        return;
+    }
+    log::warn!("cedian: the previous OMP did not exit; killing it");
+    if let Some(pid) = previous.pid {
+        cedian_omp::driver::kill_group(pid);
+    }
+    if !finished_within(&previous.thread, KILLED_EXIT) {
+        log::error!("cedian: the previous OMP's thread did not end after the kill");
+    }
+}
+
+fn finished_within(thread: &std::thread::JoinHandle<()>, limit: Duration) -> bool {
+    let deadline = std::time::Instant::now() + limit;
+    while !thread.is_finished() {
         if std::time::Instant::now() >= deadline {
-            log::warn!("cedian: the previous OMP did not exit; killing it");
-            if let Some(pid) = previous.pid {
-                cedian_omp::driver::kill(pid);
-            }
-            return;
+            return false;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+    true
 }
 
 struct Session {

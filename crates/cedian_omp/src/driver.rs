@@ -10,11 +10,14 @@
 //! <sessionId>.lock` (the state root is `~/.omp`; `PI_CODING_AGENT_DIR` does
 //! not move it). A process that resumed but has not written yet holds
 //! neither, so it goes unseen.
-
 //!
 //! OMP is a Bun program, and Bun opens files close-on-exec and spawns
 //! children with every other descriptor closed, so OMP's own children (its
 //! bash tool) never hold these files: only another process does.
+//!
+//! One deliberate fail-open: `lsof` exiting 1 with nothing on stdout and only
+//! warnings on stderr (an unreachable mount, say) counts as nobody holding
+//! the files, since that is how it reports "no holder" next to such a mount.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -85,6 +88,17 @@ pub fn holders_with(
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("cannot run lsof: {e}"))?;
+    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut out);
+            }
+            out
+        })
+    };
+    let stdout = drain(child.stdout.take().map(|p| Box::new(p) as _));
+    let stderr = drain(child.stderr.take().map(|p| Box::new(p) as _));
     let until = Instant::now() + deadline;
     while child
         .try_wait()
@@ -101,14 +115,14 @@ pub fn holders_with(
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    let out = child.wait_with_output().map_err(|e| format!("lsof: {e}"))?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let status = child.wait().map_err(|e| format!("lsof: {e}"))?;
+    let stdout = String::from_utf8_lossy(&stdout.join().unwrap_or_default()).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr.join().unwrap_or_default()).into_owned();
     let pids: Vec<u32> = stdout
         .lines()
         .filter_map(|l| l.trim().parse().ok())
         .collect();
-    if out.status.success() || !pids.is_empty() {
+    if !pids.is_empty() || (status.success() && stdout.trim().is_empty()) {
         return Ok(pids);
     }
     // lsof exits 1 when no process has any of the files open, silent or
@@ -116,16 +130,22 @@ pub fn holders_with(
     let only_warnings = stderr
         .lines()
         .all(|l| l.trim().is_empty() || l.contains("WARNING"));
-    if out.status.code() == Some(1) && stdout.trim().is_empty() && only_warnings {
+    if status.code() == Some(1) && stdout.trim().is_empty() && only_warnings {
         return Ok(Vec::new());
     }
-    Err(format!("lsof failed ({}): {}", out.status, stderr.trim()))
+    Err(format!(
+        "lsof failed ({status}): {}{}",
+        stderr.trim(),
+        stdout.trim()
+    ))
 }
 
-/// SIGKILL `pid`, a driver of the app's own that did not exit.
-pub fn kill(pid: u32) {
+/// SIGKILL the process group led by `pid`, a driver of the app's own that
+/// did not exit (OMP is spawned as a group leader, so this reaches every
+/// process it started).
+pub fn kill_group(pid: u32) {
     let _ = std::process::Command::new("/bin/kill")
-        .args(["-KILL", &pid.to_string()])
+        .args(["-KILL", "--", &format!("-{pid}")])
         .stdin(std::process::Stdio::null())
         .status();
 }
@@ -186,9 +206,15 @@ mod tests {
         );
         assert_eq!(run("echo 42; exit 0"), Ok(vec![42]));
         assert_eq!(run("echo 42; exit 1"), Ok(vec![42]));
-        for script in ["exit 2", "echo 'lsof: status error on x' >&2; exit 1"] {
+        for script in [
+            "exit 2",
+            "echo garbage; exit 0",
+            "echo 'lsof: status error on x' >&2; exit 1",
+        ] {
             assert!(run(script).is_err(), "{script}");
         }
+        let many = run("seq 1 100000; exit 0").map(|pids| pids.len());
+        assert_eq!(many, Ok(100000), "a long list is read while lsof runs");
         let slow = holders_with(
             &fake_lsof(&dir, "exec sleep 10"),
             &files,

@@ -99,6 +99,9 @@ pub enum Connection {
     /// No folder open yet, so no OMP.
     NotStarted,
     Starting,
+    /// Retry asked OMP's thread to check the session for another driver
+    /// again; `Ready` or `Taken` follows.
+    Checking,
     Ready {
         session_id: String,
         resumed: bool,
@@ -246,6 +249,12 @@ impl CedianPanel {
         self.link.as_ref().and_then(OmpLink::pid)
     }
 
+    /// Whether the link holds the current prompt in its queue, not yet sent.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn prompt_queued(&self) -> bool {
+        self.link.as_ref().is_some_and(OmpLink::prompt_queued)
+    }
+
     /// Make the link's audit rows fail from now on.
     #[cfg(any(test, feature = "test-support"))]
     pub fn break_audit(&self) {
@@ -317,7 +326,7 @@ impl CedianPanel {
     /// The Retry button of a taken session.
     pub fn retry_session(&mut self, cx: &mut Context<Self>) {
         match self.link.as_ref().map(OmpLink::retry) {
-            Some(Ok(())) => self.connection = Connection::Starting,
+            Some(Ok(())) => self.connection = Connection::Checking,
             Some(Err(e)) => self.notice = Some(e),
             None => {}
         }
@@ -361,11 +370,13 @@ impl CedianPanel {
             }
             LinkEvent::PromptCancelled => {
                 self.thread.withdraw_user();
-                self.turn = Turn::Idle;
+                self.end_turn(None);
+            }
+            LinkEvent::PromptStopped(e) => {
+                self.end_turn(Some(format!("turn stopped: {e}")));
             }
             LinkEvent::PromptFailed(e) => {
-                self.turn = Turn::Idle;
-                self.notice = Some(format!("OMP did not run the prompt: {e}"));
+                self.end_turn(Some(format!("OMP did not run the prompt: {e}")));
             }
             LinkEvent::AbortFailed(e) => {
                 if self.turn != Turn::Idle {
@@ -404,6 +415,16 @@ impl CedianPanel {
             LinkEvent::Event(event) => return self.on_event(event, cx),
         }
         cx.notify();
+    }
+
+    /// The prompt call ended without OMP settling: idle again, and a failed
+    /// turn keeps its reason over `notice`.
+    fn end_turn(&mut self, notice: Option<String>) {
+        if let Turn::Failed(reason) = std::mem::replace(&mut self.turn, Turn::Idle) {
+            self.notice = Some(format!("turn failed: {reason}"));
+        } else if notice.is_some() {
+            self.notice = notice;
+        }
     }
 
     fn stop(&mut self, reason: String) {
@@ -761,6 +782,9 @@ impl Render for CedianPanel {
         let connection = match &self.connection {
             Connection::NotStarted => "OMP not started".to_string(),
             Connection::Starting => "starting OMP…".to_string(),
+            Connection::Checking => {
+                "checking whether another process drives the session…".to_string()
+            }
             Connection::Ready {
                 session_id,
                 resumed,
@@ -1034,6 +1058,39 @@ mod tests {
                 panel.on_link_event(LinkEvent::Event(RouterEvent::Settled), window, cx);
                 assert_eq!(panel.turn, Turn::Idle);
                 assert_eq!(panel.notice(), Some("turn failed: audit: row 1"));
+            })
+            .unwrap();
+    }
+
+    /// A prompt call that ends in an error keeps what the person must know:
+    /// a failed turn's reason, and a prompt OMP ran stays in the thread.
+    #[gpui::test]
+    async fn a_prompt_ending_in_an_error_keeps_the_failure_and_what_ran(cx: &mut TestAppContext) {
+        init(cx);
+        let project = Project::test(fs::FakeFs::new(cx.executor()), [], cx).await;
+        let window = cx.add_window(|window, cx| CedianPanel::new(project.clone(), window, cx));
+        window
+            .update(cx, |panel, window, cx| {
+                let failed = |panel: &mut CedianPanel| {
+                    panel.turn = Turn::Failed("audit: row".to_string());
+                    panel.notice = None;
+                };
+                let expected = Some("turn failed: audit: row");
+
+                failed(panel);
+                panel.on_link_event(LinkEvent::PromptFailed("pipe".into()), window, cx);
+                assert_eq!((&panel.turn, panel.notice()), (&Turn::Idle, expected));
+
+                failed(panel);
+                panel.on_link_event(LinkEvent::PromptCancelled, window, cx);
+                assert_eq!((&panel.turn, panel.notice()), (&Turn::Idle, expected));
+
+                panel.thread.push_user("it ran");
+                panel.turn = Turn::Stopping;
+                panel.on_link_event(LinkEvent::PromptStopped("pipe".into()), window, cx);
+                assert_eq!(panel.turn, Turn::Idle);
+                assert_eq!(panel.notice(), Some("turn stopped: pipe"));
+                assert!(texts(panel).contains("it ran"), "{}", texts(panel));
             })
             .unwrap();
     }

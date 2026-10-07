@@ -139,7 +139,7 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
     click(&mut vcx, "cedian-retry");
     assert_eq!(
         window.update(cx, |p, _, _| p.connection().clone()).unwrap(),
-        Connection::Starting,
+        Connection::Checking,
         "Retry asked for a check"
     );
     wait(cx, &window, "Retry's check", |p| {

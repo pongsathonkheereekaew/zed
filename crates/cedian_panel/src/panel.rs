@@ -1633,6 +1633,26 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn the_revert_turn_button_puts_the_turn_back(cx: &mut TestAppContext) {
+        let (f, buffer) = fixture(cx).await;
+        tool_start(&f, cx, "c1", &["notes.txt"]);
+        omp_writes(&f, "/ws/notes.txt", "ALPHA\nbeta\ngamma\n").await;
+        tool_end(&f, cx, "c1");
+        let mut vcx = VisualTestContext::from_window(f.window.into(), cx);
+        click(&mut vcx, "cedian-review-toggle");
+        click(&mut vcx, "cedian-revert-turn");
+        assert_eq!(buffer.read_with(&vcx, |b, _| b.text()), ORIGINAL);
+        let notice = f
+            .window
+            .update(&mut vcx, |panel, _, _| panel.notice().map(str::to_string))
+            .unwrap();
+        assert_eq!(
+            notice.as_deref(),
+            Some("turn 1 reverted: 1 hunk(s) put back, 0 STALE kept")
+        );
+    }
+
+    #[gpui::test]
     #[ignore]
     async fn live_panel_streams_and_imports_one_undoable_omp_edit(cx: &mut TestAppContext) {
         cx.executor().allow_parking();

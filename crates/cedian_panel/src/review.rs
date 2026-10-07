@@ -195,7 +195,10 @@ impl FileReview {
             .iter()
             .map(|r| r.start.to_offset(&snapshot)..r.end.to_offset(&snapshot))
             .collect();
-        let agent: Vec<(String, Vec<Range<usize>>)> = self
+        // A call's edits are attributed by row: a pure deletion is an empty
+        // range that sits at a line start, which must not credit the call
+        // with the line above it.
+        let agent: Vec<(String, Vec<Range<u32>>)> = self
             .agent_txns
             .iter()
             .map(|t| {
@@ -203,6 +206,7 @@ impl FileReview {
                     t.tool_call_id.clone(),
                     buffer
                         .edited_ranges_for_transaction_id::<usize>(t.transaction)
+                        .map(|r| rows_of(&snapshot, &r))
                         .collect(),
                 )
             })
@@ -234,7 +238,10 @@ impl FileReview {
                 };
                 hunk.tool_call_ids = agent
                     .iter()
-                    .filter(|(_, ranges)| ranges.iter().any(|r| touches(&hunk.new, r)))
+                    .filter(|(_, rows)| {
+                        rows.iter()
+                            .any(|r| r.start < hunk.rows.end && hunk.rows.start < r.end)
+                    })
                     .map(|(id, _)| id.clone())
                     .collect();
                 let key = hunk.key(&self.baseline);
@@ -255,6 +262,18 @@ impl FileReview {
     }
 }
 
+/// The rows a range covers; a range ending at a line start stops before it.
+fn rows_of(snapshot: &text::BufferSnapshot, range: &Range<usize>) -> Range<u32> {
+    let start = snapshot.offset_to_point(range.start).row;
+    let end_point = snapshot.offset_to_point(range.end);
+    let end = if range.end > range.start && end_point.column == 0 {
+        end_point.row
+    } else {
+        end_point.row + 1
+    };
+    start..end.max(start + 1)
+}
+
 /// Two ranges touch when they overlap, or one is empty and sits inside or on
 /// an edge of the other (an insertion next to a hunk makes it stale: unsure
 /// means STALE, never an overwrite).
@@ -266,7 +285,9 @@ fn touches(a: &Range<usize>, b: &Range<usize>) -> bool {
     }
 }
 
-/// Widen edits to whole lines and merge the ones that then touch. The text
+/// Widen edits to whole lines and merge the ones that then overlap; edits on
+/// adjacent lines stay separate hunks, so two calls' lines are never one
+/// hunk. The text
 /// outside every edit is the same in both snapshots, so widening by the same
 /// distance on each side keeps `old` and `new` aligned.
 fn line_hunks(
@@ -298,7 +319,7 @@ fn line_hunks(
         let new_range = edit.new.start - back..edit.new.end + forward;
         let old_range = edit.old.start - back..(edit.old.end + forward).min(old.len());
         match out.last_mut() {
-            Some((o, n)) if new_range.start <= n.end => {
+            Some((o, n)) if new_range.start < n.end => {
                 n.end = n.end.max(new_range.end);
                 o.end = o.end.max(old_range.end);
             }
@@ -992,6 +1013,43 @@ mod tests {
         let accepted = cx.update(|cx| f.review.accept_all(cx));
         assert_eq!(accepted.len(), 1);
         assert_eq!(statuses(&f), vec![HunkStatus::Accepted, HunkStatus::Stale]);
+    }
+
+    /// S0 check 9: reverting a turn puts back what that turn's calls wrote,
+    /// keeps a hunk the user edited (STALE), is one native undo per buffer,
+    /// and an earlier turn can still be reverted afterwards.
+    #[gpui::test]
+    async fn revert_turn_skips_stale_and_is_undoable(cx: &mut TestAppContext) {
+        let mut f = setup(cx).await;
+        agent_writes(&mut f, "c1", "ALPHA\nbeta\ngamma\n", cx).await;
+        f.review.begin_turn();
+        agent_writes(&mut f, "c2", "ALPHA\nBETA\ngamma\ndelta\n", cx).await;
+        user_types(&f, 22..22, " by user", cx);
+        let event = cx.update(|cx| f.review.revert_turn(2, cx)).unwrap();
+        assert_eq!(
+            event,
+            ReviewEvent::TurnReverted {
+                turn: 2,
+                reverted: 1,
+                stale: 1
+            }
+        );
+        assert_eq!(
+            text(&f, cx),
+            "ALPHA\nbeta\ngamma\ndelta by user\n",
+            "turn 2's line 2 is back, the user's line 4 stays, turn 1's line 1 stays"
+        );
+        f.buffer.update(cx, |b, cx| {
+            b.undo(cx);
+            assert_eq!(
+                b.text(),
+                "ALPHA\nBETA\ngamma\ndelta by user\n",
+                "one undo redoes the revert"
+            );
+            b.redo(cx);
+        });
+        cx.update(|cx| f.review.revert_turn(1, cx)).unwrap();
+        assert_eq!(text(&f, cx), "alpha\nbeta\ngamma\ndelta by user\n");
     }
 
     #[gpui::test]

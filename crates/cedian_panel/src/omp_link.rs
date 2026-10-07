@@ -65,6 +65,10 @@ enum Command {
     Retry,
     /// Leave the session to its driver and start a fresh one.
     NewSession,
+    /// Park the thread until the sender is dropped, so a test can pin a
+    /// prompt in the queue across a Restart.
+    #[cfg(any(test, feature = "test-support"))]
+    Hold(mpsc::Receiver<()>),
 }
 
 /// One prompt from the composer.
@@ -375,6 +379,14 @@ impl OmpLink {
         self.gate.cancel(false);
     }
 
+    /// Park the OMP thread before the next command; dropping the sender
+    /// lets it go on.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hold(&self) -> Result<mpsc::Sender<()>, String> {
+        let (release, held) = mpsc::channel();
+        self.command(Command::Hold(held)).map(|()| release)
+    }
+
     /// Whether the current prompt waits in the queue or the driver check.
     #[cfg(any(test, feature = "test-support"))]
     pub fn prompt_queued(&self) -> bool {
@@ -621,6 +633,10 @@ fn run(
                     Err(e) => refused(format!("a new session did not start: {e}")),
                 };
                 let _ = events.unbounded_send(event);
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            Command::Hold(held) => {
+                let _ = held.recv();
             }
         }
     }

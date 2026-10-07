@@ -12,7 +12,8 @@
 //!    replay);
 //! 5. Restart with a prompt still queued: the old OMP never sends it (the
 //!    fixture would write `old-omp-got-four`), though it was alive and held
-//!    the prompt in its queue at the restart;
+//!    the prompt in its queue at the restart (its thread parked by the
+//!    test until the restart has closed the old link);
 //! 6. Stop, then Restart while the old OMP is slow to exit and still holds
 //!    the session file: one abort, and the new OMP waits for the old and
 //!    opens the session, not Taken;
@@ -164,17 +165,21 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
     });
     assert_ready(cx, &window);
 
-    // 5. Restart with a prompt queued behind a driver check.
+    // 5. Restart with a prompt queued behind a parked OMP thread. The
+    // thread is released only once Restart has dropped the old link, so
+    // the prompt is in the queue at the restart whatever the machine's
+    // speed (a driver check as the lever lost that race on CI).
     install(2);
     let old = window
         .update(cx, |panel, window, cx| {
-            panel.retry_session(cx);
+            let hold = panel.hold_omp();
             panel.set_prompt("four", window, cx);
             panel.submit(window, cx);
             assert!(panel.prompt_queued(), "the old OMP holds four in its queue");
             let old = panel.omp_pid().unwrap();
             assert!(alive(old), "the old OMP runs");
             panel.restart(window, cx);
+            drop(hold);
             old
         })
         .unwrap();

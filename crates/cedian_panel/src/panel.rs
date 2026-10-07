@@ -249,6 +249,12 @@ impl CedianPanel {
         self.link.as_ref().and_then(OmpLink::pid)
     }
 
+    /// Park OMP's thread until the sender is dropped.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hold_omp(&self) -> std::sync::mpsc::Sender<()> {
+        self.link.as_ref().expect("OMP runs").hold().unwrap()
+    }
+
     /// Whether the link holds the current prompt in its queue, not yet sent.
     #[cfg(any(test, feature = "test-support"))]
     pub fn prompt_queued(&self) -> bool {

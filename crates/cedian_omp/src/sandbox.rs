@@ -1,4 +1,4 @@
-//! The reviewer's Seatbelt profile (ARCHITECTURE §64 mechanism 2, ADR-0039).
+//! The reviewer's Seatbelt profile (ARCHITECTURE §64 mechanism 2, ADR-0041).
 //!
 //! Deny by default. A reviewer may read anything, reach the network, and
 //! write only its own state: the session directory, the temp directories

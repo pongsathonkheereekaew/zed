@@ -1,4 +1,4 @@
-//! `cedian_review_request` (S3 exit, ADR-0039): the implementing OMP turn
+//! `cedian_review_request` (S3 exit, ADR-0041): the implementing OMP turn
 //! asks for a review, and cedian runs the reviewer as its own OMP process:
 //! the reviewer spawn profile, under `sandbox-exec` with a generated profile,
 //! on the `[review] model`, in a fresh session, with `cedian_review_finding`

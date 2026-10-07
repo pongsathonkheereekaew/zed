@@ -1,4 +1,4 @@
-//! Reviewer findings (S3 exit, ADR-0039): `.cedian/findings.json` and the
+//! Reviewer findings (S3 exit, ADR-0041): `.cedian/findings.json` and the
 //! `cedian_review_finding` host tool a reviewer reports through. A finding
 //! binds to the unresolved hunk it names; one that names no hunk is refused,
 //! so the reviewer learns which hunks exist. Other snapshot versions fail

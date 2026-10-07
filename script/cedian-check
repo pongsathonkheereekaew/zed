@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Format, lint and test the cedian crates only (ADR-0040), so a check never
+# Format, lint and test the cedian crates only (ADR-0042), so a check never
 # builds all of Zed. `script/cedian-check check` stops after `cargo check`.
 set -euo pipefail
 cd "$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"

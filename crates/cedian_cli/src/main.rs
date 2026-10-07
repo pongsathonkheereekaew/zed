@@ -444,7 +444,7 @@ fn omp_binary_path() -> Result<PathBuf, String> {
     }
 }
 
-/// Tools OMP's merged config sets to `allow` in `workdir` (ADR-0039
+/// Tools OMP's merged config sets to `allow` in `workdir` (ADR-0041
 /// decision 2). Fails closed: without the record the default profile cannot
 /// pin them, so the spawn is refused.
 fn omp_config_allows(workdir: &Path) -> Result<std::collections::BTreeSet<String>, String> {

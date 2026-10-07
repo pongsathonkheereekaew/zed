@@ -89,7 +89,7 @@ pub enum Approvals {
     /// sets no mode, no prompt pins and no `computer` key. Only the
     /// interactive CLI may build this; reviewers and automations never do.
     Omp,
-    /// A reviewer (ADR-0039): `always-ask`, every write and exec-tier tool
+    /// A reviewer (ADR-0041): `always-ask`, every write and exec-tier tool
     /// denied except `bash`, which runs only through an allow pattern; a
     /// config `allow` cedian does not name is pinned to `deny`.
     Reviewer,
@@ -142,7 +142,7 @@ pub struct SpawnPolicy {
     pub host_tools: BTreeSet<String>,
     /// Tools the user's OMP config (global + project, as OMP merges them)
     /// sets to `allow`. The overlay cannot delete those keys, so the default
-    /// profile pins each one it does not already name (ADR-0039 decision 2).
+    /// profile pins each one it does not already name (ADR-0041 decision 2).
     pub config_allows: BTreeSet<String>,
     /// `--model` for this child; `None` leaves OMP's own routing.
     pub model: Option<String>,

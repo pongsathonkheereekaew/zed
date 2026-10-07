@@ -16,7 +16,7 @@ set -euo pipefail
 ROOT=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
 BENCH=$ROOT/script/cedian-bench
 # The tasks start from commits in the cedian docs repo, which keeps the code
-# history from before the move into the fork (ADR-0040). The binary under test
+# history from before the move into the fork (ADR-0042). The binary under test
 # is built here.
 TASKS=${BENCH_TASKS_REPO:-$HOME/cedian}
 WORK=${BENCH_WORK:-/tmp/cedian-bench}

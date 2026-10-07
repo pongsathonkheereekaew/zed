@@ -225,7 +225,7 @@ fn stale_scenario() {
     std::fs::create_dir_all(root.join("ws")).unwrap();
     let notes = root.join("ws/notes.txt");
     std::fs::write(&notes, ORIGINAL).unwrap();
-    // ADR-0039 decision 2: a project allow for a tool the overlay does not
+    // ADR-0041 decision 2: a project allow for a tool the overlay does not
     // name is pinned to `prompt`.
     std::fs::create_dir_all(root.join("ws/.omp")).unwrap();
     std::fs::write(
@@ -370,7 +370,7 @@ const S3_REVIEWER_FIXTURE: &str = concat!(
     "/tests/fixtures/s3_review_reviewer.jsonl"
 );
 
-/// S3 exit (ADR-0039): an OMP turn asks for a review; cedian runs the
+/// S3 exit (ADR-0041): an OMP turn asks for a review; cedian runs the
 /// reviewer as its own sandboxed OMP process on the `[review] model`; the
 /// reviewer reports a blocker on the turn's hunk through
 /// `cedian_review_finding`; the blocker refuses `cedian_complete`; a person

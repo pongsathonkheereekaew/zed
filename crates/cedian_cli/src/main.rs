@@ -17,7 +17,7 @@
 //!
 //! State lives in-process per invocation EXCEPT the OMP session (adopted via
 //! `--session-dir` + `open_session`), workspace files, and the review task in
-//! `.cedian/review.json` (baseline + AgentEdit records + resolutions, see
+//! `review.json` in the state dir (baseline + AgentEdit records + resolutions, see
 //! `session.rs`). `cedian review reset` starts a new review task.
 #![allow(
     clippy::disallowed_methods,
@@ -33,6 +33,7 @@ mod review_findings;
 mod session;
 mod shell;
 mod shell_lock;
+mod state;
 mod timing;
 mod verify_store;
 mod workflow_store;
@@ -331,7 +332,7 @@ fn current_state(workdir: &Path) -> cedian_workflow::CurrentState {
     )
 }
 
-/// `.cedian/workflow.json` as the channel's store.
+/// `workflow.json` in the state dir as the channel's store.
 struct DiskWorkflowStore(PathBuf);
 
 impl cedian_workflow::WorkflowStore for DiskWorkflowStore {
@@ -356,7 +357,7 @@ fn host_tools(
     workdir: &Path,
     settings: &cedian_shell::Settings,
     host: &std::sync::Arc<HostTools>,
-) -> Vec<omp_rpc::HostTool> {
+) -> Result<Vec<omp_rpc::HostTool>, String> {
     let router = rt.router();
     let resolve = move |tool: &str, needle: &str| {
         let calls = router.finished_tool_calls();
@@ -407,10 +408,13 @@ fn host_tools(
         move || current_state(&class_root),
     ));
     if names.contains(&cedian_worker::WORKTREE_REQUEST_TOOL) {
-        tools.push(cedian_worker::worktree_request_tool(workdir.to_path_buf()));
+        tools.push(cedian_worker::worktree_request_tool(
+            workdir.to_path_buf(),
+            state::dir(workdir)?,
+        ));
     }
     debug_assert_eq!(tools.len(), names.len());
-    tools
+    Ok(tools)
 }
 
 /// The opt-in badge (ADR-0035 decision 4): OMP's effective approval mode
@@ -523,7 +527,7 @@ fn spawn(
     .map_err(|e| e.to_string())?;
     // Nothing in the CLI can answer an OMP dialog: refuse at once (P5 gap).
     rt.deny_ui_requests();
-    rt.set_host_tools(host_tools(&rt, session_dir, workdir, settings, host))
+    rt.set_host_tools(host_tools(&rt, session_dir, workdir, settings, host)?)
         .map_err(|e| e.to_string())?;
     rt.set_host_uris(vec![host.cedian_uri_scheme()])
         .map_err(|e| e.to_string())?;
@@ -1323,7 +1327,7 @@ fn cmd_workflow(
 /// ```text
 /// cedian browser open <url>                             # fresh Chrome → navigate → save head
 /// cedian browser dom                                    # fresh Chrome on saved url → title, url, html
-/// cedian browser shot [--attach <gate>] [--note <text>] # PNG into .cedian/shots/ (+ gate evidence)
+/// cedian browser shot [--attach <gate>] [--note <text>] # PNG into the state dir's shots/ (+ gate evidence)
 /// cedian browser close                                  # clear head + sweep chrome-* profiles
 /// cedian browser status                                 # saved head or `no browser session`
 /// ```
@@ -1389,7 +1393,7 @@ fn cmd_browser(workdir: &Path, args: &[String]) -> Result<(), String> {
             let head = browser_store::load(workdir)?;
             let (proc, session, ws_url) = browser_store::spawn_fresh(workdir, &head.url)?;
             let shot = session
-                .screenshot(&workdir.join(".cedian").join("shots"))
+                .screenshot(&state::dir(workdir)?.join("shots"))
                 .map_err(|e| e.to_string())?;
             browser_store::save(
                 workdir,
@@ -1446,7 +1450,9 @@ fn cmd_browser(workdir: &Path, args: &[String]) -> Result<(), String> {
         Some("close") => {
             browser_store::clear(workdir);
             // Children died with their invocations; sweep leftover profiles.
-            if let Ok(entries) = std::fs::read_dir(workdir.join(".cedian")) {
+            if let Ok(entries) =
+                state::dir(workdir).and_then(|d| std::fs::read_dir(d).map_err(|e| e.to_string()))
+            {
                 for entry in entries.flatten() {
                     if entry.file_name().to_string_lossy().starts_with("chrome-") {
                         let _ = std::fs::remove_dir_all(entry.path());
@@ -1500,7 +1506,7 @@ fn worker_base(args: &[String], from: usize) -> Result<String, String> {
 /// ```
 ///
 /// `CEDIAN_WORKDIR` must be the repo root: the registry lives at
-/// `<repo>/.cedian/workers.json`, worktrees at `<repo>/.worktrees/<id>`.
+/// `workers.json` in its state dir (ADR-0044), worktrees at `<repo>/.worktrees/<id>`.
 /// Base defaults to `HEAD` unless `--base <branch>` is given. `steer`
 /// only records the note (status Running); the actual agent turn in the
 /// worktree is a follow-up invocation.
@@ -1512,14 +1518,15 @@ fn cmd_worker(workdir: &Path, args: &[String]) -> Result<(), String> {
             let kind = args.get(2).ok_or(usage)?;
             let title = args.get(3).ok_or(usage)?;
             let base = worker_base(args, 4)?;
-            let (mut reg, _) = cedian_worker::Registry::open(workdir).map_err(|e| e.to_string())?;
+            let (mut reg, _) =
+                cedian_worker::Registry::open(&state::dir(workdir)?).map_err(|e| e.to_string())?;
             let mut head = cedian_worker::spawn(workdir, id, &base).map_err(|e| e.to_string())?;
             head.status = cedian_worker::WorkerStatus::Running;
             head.task_title = title.clone();
             head.kind = kind.clone();
             let (worktree, branch) = (head.worktree.clone(), head.branch.clone());
             reg.insert(head).map_err(|e| e.to_string())?;
-            reg.save(workdir).map_err(|e| e.to_string())?;
+            reg.save(&state::dir(workdir)?).map_err(|e| e.to_string())?;
             println!("worker {id} → {worktree} (branch {branch})");
             Ok(())
         }
@@ -1527,7 +1534,8 @@ fn cmd_worker(workdir: &Path, args: &[String]) -> Result<(), String> {
             if args.len() > 1 {
                 return Err("usage: cedian worker list".to_string());
             }
-            let (reg, _) = cedian_worker::Registry::open(workdir).map_err(|e| e.to_string())?;
+            let (reg, _) =
+                cedian_worker::Registry::open(&state::dir(workdir)?).map_err(|e| e.to_string())?;
             let mut any = false;
             for head in reg.all() {
                 any = true;
@@ -1549,14 +1557,15 @@ fn cmd_worker(workdir: &Path, args: &[String]) -> Result<(), String> {
                 return Err(usage.to_string());
             }
             let note = args[2..].join(" ");
-            let (mut reg, _) = cedian_worker::Registry::open(workdir).map_err(|e| e.to_string())?;
+            let (mut reg, _) =
+                cedian_worker::Registry::open(&state::dir(workdir)?).map_err(|e| e.to_string())?;
             let head = reg
                 .get(id)
                 .cloned()
                 .ok_or_else(|| cedian_worker::WorkerError::NoSuch(id.clone()).to_string())?;
             reg.set_status(id, cedian_worker::WorkerStatus::Running, note.clone())
                 .map_err(|e| e.to_string())?;
-            reg.save(workdir).map_err(|e| e.to_string())?;
+            reg.save(&state::dir(workdir)?).map_err(|e| e.to_string())?;
             let wt = workdir.join(&head.worktree);
             println!("steer {id}: {note}");
             println!(
@@ -1570,7 +1579,8 @@ fn cmd_worker(workdir: &Path, args: &[String]) -> Result<(), String> {
                 .get(1)
                 .ok_or("usage: cedian worker preview <id> [--base <branch>]")?;
             let base = worker_base(args, 2)?;
-            let (reg, _) = cedian_worker::Registry::open(workdir).map_err(|e| e.to_string())?;
+            let (reg, _) =
+                cedian_worker::Registry::open(&state::dir(workdir)?).map_err(|e| e.to_string())?;
             let head = reg
                 .get(id)
                 .cloned()
@@ -1592,7 +1602,8 @@ fn cmd_worker(workdir: &Path, args: &[String]) -> Result<(), String> {
                 .get(1)
                 .ok_or("usage: cedian worker merge-back <id> [--base <branch>]")?;
             let base = worker_base(args, 2)?;
-            let (mut reg, _) = cedian_worker::Registry::open(workdir).map_err(|e| e.to_string())?;
+            let (mut reg, _) =
+                cedian_worker::Registry::open(&state::dir(workdir)?).map_err(|e| e.to_string())?;
             let head = reg
                 .get(id)
                 .cloned()
@@ -1601,7 +1612,7 @@ fn cmd_worker(workdir: &Path, args: &[String]) -> Result<(), String> {
                 Ok(()) => {
                     reg.set_status(id, cedian_worker::WorkerStatus::Done, String::new())
                         .map_err(|e| e.to_string())?;
-                    reg.save(workdir).map_err(|e| e.to_string())?;
+                    reg.save(&state::dir(workdir)?).map_err(|e| e.to_string())?;
                     println!("merged {} → {base}", head.branch);
                     Ok(())
                 }
@@ -1620,14 +1631,15 @@ fn cmd_worker(workdir: &Path, args: &[String]) -> Result<(), String> {
             if args.len() > 2 {
                 return Err("usage: cedian worker remove <id>".to_string());
             }
-            let (mut reg, _) = cedian_worker::Registry::open(workdir).map_err(|e| e.to_string())?;
+            let (mut reg, _) =
+                cedian_worker::Registry::open(&state::dir(workdir)?).map_err(|e| e.to_string())?;
             let head = reg
                 .get(id)
                 .cloned()
                 .ok_or_else(|| cedian_worker::WorkerError::NoSuch(id.clone()).to_string())?;
             cedian_worker::remove(workdir, &head).map_err(|e| e.to_string())?;
             reg.remove(id);
-            reg.save(workdir).map_err(|e| e.to_string())?;
+            reg.save(&state::dir(workdir)?).map_err(|e| e.to_string())?;
             println!("removed {id}");
             Ok(())
         }

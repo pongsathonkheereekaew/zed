@@ -178,7 +178,7 @@ run() {
   printf 'schema = 1\n[projects."%s"]\npolicy = "omp"\n' "$dir" > "$cfg"
   rm -f "$WORK/results/$id.timing.jsonl"
   start=$(python3 -c 'import time; print(int(time.time()*1000))')
-  out=$(CEDIAN_CONFIG=$cfg CEDIAN_WORKDIR=$dir CEDIAN_SESSION_DIR=$WORK/sessions/$id \
+  out=$(CEDIAN_CONFIG=$cfg CEDIAN_WORKDIR=$dir CEDIAN_SESSION_DIR=$WORK/sessions/$id CEDIAN_STATE_DIR=$WORK/state/$id \
         CEDIAN_TIMING=$WORK/results/$id.timing.jsonl \
         "$CARGO_TARGET_DIR/release/cedian" prompt "$PROMPT" 2>&1) || true
   end=$(python3 -c 'import time; print(int(time.time()*1000))')

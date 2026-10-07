@@ -93,7 +93,7 @@ pub struct ProfileRecord {
     pub instances: BTreeMap<String, InstanceHealth>,
 }
 
-/// Every profile's record (`.cedian/verify.json` in the CLI).
+/// Every profile's record (`verify.json` in the CLI state dir).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileLedger {
     pub profiles: BTreeMap<String, ProfileRecord>,

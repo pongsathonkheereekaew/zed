@@ -22,18 +22,18 @@ struct Stored<S> {
     state: S,
 }
 
-fn workflow_path(workdir: &Path) -> PathBuf {
-    workdir.join(".cedian").join("workflow.json")
+fn workflow_path(workdir: &Path) -> Result<PathBuf, String> {
+    Ok(crate::state::dir(workdir)?.join("workflow.json"))
 }
 
 /// Whether a workflow was ever started here.
 pub fn exists(workdir: &Path) -> bool {
-    workflow_path(workdir).exists()
+    workflow_path(workdir).is_ok_and(|p| p.exists())
 }
 
 /// Load the workflow, or fail with usage hint when none is running.
 pub fn load(workdir: &Path) -> Result<WorkflowState, String> {
-    let raw = std::fs::read_to_string(workflow_path(workdir))
+    let raw = std::fs::read_to_string(workflow_path(workdir)?)
         .map_err(|_| "no workflow: run `cedian workflow run <kind> <title>` first".to_string())?;
     let version: Stored<serde::de::IgnoredAny> =
         serde_json::from_str(&raw).map_err(|e| format!("corrupt workflow.json: {e}"))?;
@@ -49,21 +49,22 @@ pub fn load(workdir: &Path) -> Result<WorkflowState, String> {
     Ok(stored.state)
 }
 
-/// Save the workflow (creates `.cedian/` like the baseline store).
+/// Save the workflow into the workspace's state dir (ADR-0044).
 pub fn save(workdir: &Path, state: &WorkflowState) -> Result<(), String> {
-    std::fs::create_dir_all(workdir.join(".cedian")).map_err(|e| e.to_string())?;
     let raw = serde_json::to_string_pretty(&Stored {
         snapshot_version: WORKFLOW_SNAPSHOT_VERSION,
         state,
     })
     .map_err(|e| e.to_string())?;
-    std::fs::write(workflow_path(workdir), raw).map_err(|e| e.to_string())
+    std::fs::write(workflow_path(workdir)?, raw).map_err(|e| e.to_string())
 }
 
 /// Delete the workflow (fresh `run` overwrites anyway; explicit for tests).
 #[allow(unused)]
 pub fn clear(workdir: &Path) {
-    let _ = std::fs::remove_file(workflow_path(workdir));
+    if let Ok(path) = workflow_path(workdir) {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 #[cfg(test)]
@@ -74,6 +75,7 @@ mod tests {
     fn dir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("cedian-wf-store-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
         d
     }
 
@@ -91,7 +93,7 @@ mod tests {
         })
         .unwrap();
         save(&d, &state).unwrap();
-        let raw = std::fs::read_to_string(workflow_path(&d)).unwrap();
+        let raw = std::fs::read_to_string(workflow_path(&d).unwrap()).unwrap();
         assert!(raw.contains("\"snapshot_version\": 2"));
         assert_eq!(load(&d).unwrap().task.title, "t");
         let _ = std::fs::remove_dir_all(&d);
@@ -100,11 +102,10 @@ mod tests {
     #[test]
     fn unversioned_or_other_version_fails_closed() {
         let d = dir("stale");
-        std::fs::create_dir_all(d.join(".cedian")).unwrap();
-        std::fs::write(workflow_path(&d), "{}").unwrap();
+        std::fs::write(workflow_path(&d).unwrap(), "{}").unwrap();
         assert!(load(&d).unwrap_err().contains("too old (got v0"));
         // v1 = pre-ADR-0024 evidence (`ok: bool`, no code state).
-        std::fs::write(workflow_path(&d), r#"{"snapshot_version":1}"#).unwrap();
+        std::fs::write(workflow_path(&d).unwrap(), r#"{"snapshot_version":1}"#).unwrap();
         assert!(load(&d).unwrap_err().contains("too old (got v1"));
         let _ = std::fs::remove_dir_all(&d);
     }

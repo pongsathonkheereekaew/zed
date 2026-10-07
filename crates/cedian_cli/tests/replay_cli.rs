@@ -2,7 +2,7 @@
 //! `cedian prompt` (recorded OMP turn calling `cedian_apply_edit`) → tool card
 //! → buffer edit synced to disk → `cedian review` shows the task-attributed
 //! hunk → `cedian reject` restores the baseline — each step its own process,
-//! so the persisted `.cedian/review.json` is exercised too.
+//! so the persisted `review.json` (in the state dir, ADR-0044) is exercised too.
 //!
 //! `harness = false`: when the CLI spawns OMP, it spawns THIS test binary
 //! (`CEDIAN_OMP_BINARY`), which then acts as fake-omp.
@@ -128,9 +128,21 @@ fn cli(root: &Path) -> Command {
     cmd.env("CEDIAN_CONFIG", config)
         .env("CEDIAN_WORKDIR", root.join("ws"))
         .env("CEDIAN_SESSION_DIR", root.join("sessions"))
+        .env("CEDIAN_STATE_DIR", root.join("state"))
         .env("CEDIAN_OMP_BINARY", std::env::current_exe().unwrap())
         .env("CEDIAN_TIMING", root.join("timing.jsonl"));
     cmd
+}
+
+/// The workspace's state dir under the test's `CEDIAN_STATE_DIR` (one
+/// workspace per test root), or a path that does not exist yet.
+fn state_dir(root: &Path) -> PathBuf {
+    let workspaces = root.join("state/workspaces");
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(&workspaces)
+        .map(|it| it.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    assert!(dirs.len() <= 1, "one workspace per test root: {dirs:?}");
+    dirs.pop().unwrap_or_else(|| workspaces.join("none-yet"))
 }
 
 fn cedian(root: &Path, args: &[&str]) -> String {
@@ -191,7 +203,7 @@ fn scenario(record: bool) {
     // S2 fast lane (ADR-0026): a trivial edit with no floor gate lands with
     // no workflow at all — nothing started, nothing blocked.
     assert!(
-        !root.join("ws/.cedian/workflow.json").exists(),
+        !state_dir(&root).join("workflow.json").exists(),
         "fast lane: no workflow"
     );
     assert!(!out.contains("workflow"), "no workflow noise:\n{out}");
@@ -327,7 +339,7 @@ fn dismiss_scenario() {
         ],
     );
     std::fs::write(
-        root.join("ws/.cedian/findings.json"),
+        state_dir(&root).join("findings.json"),
         serde_json::json!({"snapshot_version": 1, "findings": [{
             "id": "f1", "hunk": 0, "hunk_text": "BETA", "dismissed": null,
             "finding": {"path": "/notes.txt", "start_line": 1, "line_count": 1,
@@ -452,9 +464,17 @@ fn s3_review_scenario(record: bool) {
         "workspace unwritable for the reviewer:\n{sbpl}"
     );
 
+    // ADR-0044: findings, audit and ledger live outside the workspace the
+    // implementer writes.
+    assert!(
+        !root.join("ws/.cedian").exists(),
+        "no cedian state inside the workspace"
+    );
+    assert!(state_dir(&root).join("audit.jsonl").is_file());
+
     // Its finding is a blocker bound to the turn's hunk.
     let findings: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(root.join("ws/.cedian/findings.json")).unwrap(),
+        &std::fs::read_to_string(state_dir(&root).join("findings.json")).unwrap(),
     )
     .unwrap();
     let blocker = findings["findings"]
@@ -469,7 +489,7 @@ fn s3_review_scenario(record: bool) {
 
     // The blocker refused completion.
     let workflow: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(root.join("ws/.cedian/workflow.json")).unwrap(),
+        &std::fs::read_to_string(state_dir(&root).join("workflow.json")).unwrap(),
     )
     .unwrap();
     let missing = workflow["last_completion"]["missing"].to_string();
@@ -601,7 +621,7 @@ fn s3_same_model_scenario(record: bool) {
         review["item"]["implementer_models"]
     );
     let workflow: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(root.join("ws/.cedian/workflow.json")).unwrap(),
+        &std::fs::read_to_string(state_dir(&root).join("workflow.json")).unwrap(),
     )
     .unwrap();
     let evidence = workflow["evidence"]
@@ -723,7 +743,7 @@ fn shell_scenario(record: bool) {
 
     wait_for("cedian shell —");
     assert!(
-        root.join("ws/.cedian/shell.lock").exists(),
+        state_dir(&root).join("shell.lock").exists(),
         "shell holds the lock"
     );
 
@@ -783,7 +803,7 @@ fn shell_scenario(record: bool) {
         )
         .unwrap();
     }
-    let findings = std::fs::read_to_string(root.join("ws/.cedian/findings.json")).unwrap();
+    let findings = std::fs::read_to_string(state_dir(&root).join("findings.json")).unwrap();
     assert!(
         findings.contains("\"path\": \"/notes.txt\""),
         "the shell's review attached a finding to the turn's hunk:\n{findings}"
@@ -793,7 +813,7 @@ fn shell_scenario(record: bool) {
     wait_for("cedian shell closed");
     assert!(shell.wait().unwrap().success());
     assert!(
-        !root.join("ws/.cedian/shell.lock").exists(),
+        !state_dir(&root).join("shell.lock").exists(),
         "lock released"
     );
 
@@ -862,7 +882,7 @@ fn channel_scenario(record: bool) {
     }
     assert!(out.contains("p5-done"), "assistant text rendered:\n{out}");
 
-    let raw = std::fs::read_to_string(root.join("ws/.cedian/workflow.json"))
+    let raw = std::fs::read_to_string(state_dir(&root).join("workflow.json"))
         .unwrap_or_else(|e| panic!("workflow started by the turn ({e}):\n{out}"));
     let state: serde_json::Value = serde_json::from_str(&raw).unwrap();
     let ev = &state["evidence"];
@@ -987,7 +1007,7 @@ fn worktree_scenario(record: bool) {
         root.join("ws/.worktrees/w1/notes.txt").exists(),
         "worktree created by cedian:\n{out}"
     );
-    let reg = std::fs::read_to_string(root.join("ws/.cedian/workers.json")).unwrap();
+    let reg = std::fs::read_to_string(state_dir(&root).join("workers.json")).unwrap();
     assert!(reg.contains("try casing fix"), "registry row:\n{reg}");
 }
 
@@ -1180,7 +1200,7 @@ fn s2_blocked_scenario(record: bool, floor: bool) {
         std::fs::copy(sessions.join(cedian_fake_omp::RECORDED_FILE), S2_FIXTURE).unwrap();
     }
 
-    let raw = std::fs::read_to_string(root.join("ws/.cedian/workflow.json"))
+    let raw = std::fs::read_to_string(state_dir(&root).join("workflow.json"))
         .unwrap_or_else(|e| panic!("the skill started a workflow ({e}):\n{out}"));
     let state: serde_json::Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(state["task"]["kind"], "bug_fix", "{raw}");
@@ -1263,7 +1283,7 @@ fn overlay(sessions: &Path) -> serde_json::Value {
 }
 
 fn corrections(root: &Path) -> Vec<serde_json::Value> {
-    std::fs::read_to_string(root.join("ws/.cedian/corrections.jsonl"))
+    std::fs::read_to_string(state_dir(root).join("corrections.jsonl"))
         .unwrap_or_default()
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
@@ -1271,7 +1291,7 @@ fn corrections(root: &Path) -> Vec<serde_json::Value> {
 }
 
 fn audit(root: &Path) -> Vec<serde_json::Value> {
-    std::fs::read_to_string(root.join("ws/.cedian/audit.jsonl"))
+    std::fs::read_to_string(state_dir(root).join("audit.jsonl"))
         .unwrap_or_default()
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
@@ -1483,7 +1503,7 @@ fn s2_profile_scenario(record: bool) {
         .unwrap();
     }
 
-    let raw = std::fs::read_to_string(ws.join(".cedian/workflow.json"))
+    let raw = std::fs::read_to_string(state_dir(&root).join("workflow.json"))
         .unwrap_or_else(|e| panic!("the turn started a workflow ({e}):\n{out}"));
     let state: serde_json::Value = serde_json::from_str(&raw).unwrap();
     let mut items: Vec<&serde_json::Value> = state["evidence"]
@@ -1520,9 +1540,10 @@ fn s2_profile_scenario(record: bool) {
     );
     assert_eq!(healed.0, "pass", "after Doctor passes again: {healed:?}");
 
-    let ledger: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(ws.join(".cedian/verify.json")).unwrap())
-            .unwrap();
+    let ledger: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(state_dir(&root).join("verify.json")).unwrap(),
+    )
+    .unwrap();
     assert!(
         ledger["profiles"]["verify-notes"]["proven_skill"].is_u64(),
         "profile proven end to end: {ledger}"

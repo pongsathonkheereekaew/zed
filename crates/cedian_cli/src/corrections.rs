@@ -1,5 +1,5 @@
 //! Correction ledger (ADR-0032, S3 exit). cedian appends one row to
-//! `.cedian/corrections.jsonl` when a person corrects the agent: a rejected
+//! `corrections.jsonl` in the state dir (ADR-0044) when a person corrects the agent: a rejected
 //! hunk, a reverted turn, a user edit over an agent hunk, a refused
 //! completion, an escalation past `max_continue`, a dismissed finding. The
 //! agent cannot write rows. OMP proposes classes over them through
@@ -15,8 +15,8 @@ use std::collections::BTreeSet;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-pub const CORRECTIONS_FILE: &str = ".cedian/corrections.jsonl";
-pub const CLASSES_FILE: &str = ".cedian/correction_classes.json";
+pub const CORRECTIONS_FILE: &str = "corrections.jsonl";
+pub const CLASSES_FILE: &str = "correction_classes.json";
 pub const CORRECTION_CLASS_TOOL: &str = "cedian_correction_class";
 pub const CLASSES_SNAPSHOT_VERSION: u32 = 1;
 
@@ -61,15 +61,18 @@ pub fn excerpt_hash(text: &str) -> String {
 }
 
 pub fn load(workdir: &Path) -> Result<Vec<Correction>, String> {
-    match std::fs::read_to_string(workdir.join(CORRECTIONS_FILE)) {
-        Ok(text) => text
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| serde_json::from_str(l).map_err(|e| format!("corrupt corrections.jsonl: {e}")))
-            .collect(),
+    match std::fs::read_to_string(crate::state::dir(workdir)?.join(CORRECTIONS_FILE)) {
+        Ok(text) => parse(&text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(format!("corrections.jsonl: {e}")),
     }
+}
+
+fn parse(text: &str) -> Result<Vec<Correction>, String> {
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).map_err(|e| format!("corrupt corrections.jsonl: {e}")))
+        .collect()
 }
 
 /// Append one row. A user edit over an agent hunk is noticed each time the
@@ -79,7 +82,21 @@ pub fn record(
     kind: CorrectionKind,
     event: Event,
 ) -> Result<Option<String>, String> {
-    let rows = load(workdir)?;
+    use std::io::Read as _;
+    // Numbering and the append happen under one lock, so two writers never
+    // take the same id.
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(crate::state::dir(workdir)?.join(CORRECTIONS_FILE))
+        .map_err(|e| format!("corrections.jsonl: {e}"))?;
+    file.lock()
+        .map_err(|e| format!("corrections.jsonl lock: {e}"))?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .map_err(|e| format!("corrections.jsonl: {e}"))?;
+    let rows = parse(&text)?;
     let hash = event.excerpt.as_deref().map(excerpt_hash);
     if kind == CorrectionKind::UserEditedAgentHunk
         && rows.iter().any(|r| {
@@ -106,12 +123,6 @@ pub fn record(
         model: None,
         excerpt_hash: hash,
     };
-    std::fs::create_dir_all(workdir.join(".cedian")).map_err(|e| e.to_string())?;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(workdir.join(CORRECTIONS_FILE))
-        .map_err(|e| format!("corrections.jsonl: {e}"))?;
     let line = serde_json::to_string(&row).map_err(|e| e.to_string())?;
     writeln!(file, "{line}").map_err(|e| format!("corrections.jsonl: {e}"))?;
     Ok(Some(row.id))
@@ -260,7 +271,7 @@ struct ClassStore {
 }
 
 fn save_class(workdir: &Path, class: CorrectionClass) -> Result<(), String> {
-    let path = workdir.join(CLASSES_FILE);
+    let path = crate::state::dir(workdir)?.join(CLASSES_FILE);
     let mut store: ClassStore = match std::fs::read_to_string(&path) {
         Ok(raw) => {
             let s: ClassStore = serde_json::from_str(&raw)
@@ -273,8 +284,20 @@ fn save_class(workdir: &Path, class: CorrectionClass) -> Result<(), String> {
             }
             s
         }
-        Err(_) => ClassStore::default(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ClassStore::default(),
+        Err(e) => return Err(format!("correction_classes.json: {e}")),
     };
+    if class.status != "enforced"
+        && store
+            .classes
+            .iter()
+            .any(|c| c.name == class.name && c.status == "enforced")
+    {
+        return Err(format!(
+            "class {} is already enforced; only a new proof replaces it",
+            class.name
+        ));
+    }
     store.snapshot_version = CLASSES_SNAPSHOT_VERSION;
     store.classes.retain(|c| c.name != class.name);
     store.classes.push(class);
@@ -291,7 +314,7 @@ pub fn correction_class_tool(
         "type": "object",
         "properties": {
             "name": {"type": "string"},
-            "event_ids": {"type": "array", "items": {"type": "string"}, "description": "correction ids (c1, c2, ...) from .cedian/corrections.jsonl"},
+            "event_ids": {"type": "array", "items": {"type": "string"}, "description": "correction ids (c1, c2, ...) from cedian's correction ledger"},
             "level": {"type": "string", "enum": ["architecture", "types", "lint", "test", "docs"]},
             "enforcer": {"type": "string", "description": "the check that prevents a repeat"},
             "proof": {
@@ -468,6 +491,7 @@ mod tests {
     fn user_edit_rows_are_recorded_once_per_hunk_text() {
         let dir = std::env::temp_dir().join(format!("cedian-corr-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
         let edit = || Event {
             turn: Some(1),
             path: Some("/a.rs".into()),
@@ -491,6 +515,81 @@ mod tests {
             Some("c2")
         );
         assert_eq!(load(&dir).unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn class(name: &str, status: &str) -> CorrectionClass {
+        CorrectionClass {
+            name: name.into(),
+            event_ids: vec!["c1".into(), "c3".into()],
+            level: Level::Lint,
+            enforcer: "clippy".into(),
+            status: status.into(),
+            note: None,
+        }
+    }
+
+    fn classes(dir: &Path) -> Vec<CorrectionClass> {
+        let raw =
+            std::fs::read_to_string(crate::state::dir(dir).unwrap().join(CLASSES_FILE)).unwrap();
+        serde_json::from_str::<ClassStore>(&raw).unwrap().classes
+    }
+
+    #[test]
+    fn concurrent_records_get_distinct_ids() {
+        let dir = std::env::temp_dir().join(format!("cedian-corr-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ids: Vec<String> = (0..16)
+            .map(|i| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    let event = Event {
+                        turn: Some(1),
+                        excerpt: Some(format!("hunk {i}")),
+                        ..Event::default()
+                    };
+                    record(&dir, CorrectionKind::HunkRejected, event)
+                        .unwrap()
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect();
+        let unique: BTreeSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), 16, "{ids:?}");
+        assert_eq!(load(&dir).unwrap().len(), 16);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unreadable_class_store_is_never_overwritten() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("cedian-corr-perm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        save_class(&dir, class("kept", "enforced")).unwrap();
+        let path = crate::state::dir(&dir).unwrap().join(CLASSES_FILE);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
+        let result = save_class(&dir, class("new", "documented"));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(classes(&dir)[0].name, "kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_enforced_class_is_not_replaced_by_a_weaker_one() {
+        let dir = std::env::temp_dir().join(format!("cedian-corr-weak-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        save_class(&dir, class("x", "enforced")).unwrap();
+        let weaker = save_class(&dir, class("x", "documented")).unwrap_err();
+        assert!(weaker.contains("already enforced"), "{weaker}");
+        assert_eq!(classes(&dir)[0].status, "enforced");
+        save_class(&dir, class("x", "enforced")).expect("a new proof replaces it");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

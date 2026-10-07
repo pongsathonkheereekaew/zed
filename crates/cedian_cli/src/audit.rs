@@ -1,4 +1,4 @@
-//! `.cedian/audit.jsonl` (§64 mechanism 4 envelope): `kind: "tool"` rows for
+//! `audit.jsonl` in the state dir (ADR-0044; §64 mechanism 4 envelope): `kind: "tool"` rows for
 //! each OMP tool execution start and end (ADR-0035 decision 4), and
 //! `kind: "gate"` rows for each decision cedian's own gate makes (S3 gate
 //! item 4): a host-tool call it serves (`allow`) and a dialog headless
@@ -11,7 +11,10 @@ use serde_json::{Value, json};
 use std::io::Write as _;
 use std::path::Path;
 
-pub const AUDIT_FILE: &str = ".cedian/audit.jsonl";
+pub const AUDIT_FILE: &str = "audit.jsonl";
+
+/// How much of a reviewer's tool arguments a row keeps.
+const MAX_ARGS_CHARS: usize = 500;
 
 pub struct AuditLog {
     path: std::path::PathBuf,
@@ -27,7 +30,7 @@ static NEXT_ORDINAL: std::sync::Mutex<Option<std::collections::HashMap<std::path
 
 impl AuditLog {
     pub fn open(workdir: &Path, approvals: Approvals) -> Result<Self, String> {
-        let path = workdir.join(AUDIT_FILE);
+        let path = crate::state::dir(workdir)?.join(AUDIT_FILE);
         let complete_rows = match std::fs::read_to_string(&path) {
             Ok(text) => text.lines().filter(|l| !l.trim().is_empty()).count() as u64,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
@@ -40,9 +43,6 @@ impl AuditLog {
             .or_insert(0);
         *entry = (*entry).max(complete_rows);
         drop(next);
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("audit log: {e}"))?;
-        }
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -67,7 +67,17 @@ impl AuditLog {
                 tool_name,
                 args_preview,
             } => {
-                let item = json!({"kind": "tool", "event": "start", "tool": tool_name, "tool_call_id": tool_call_id});
+                let mut item = json!({"kind": "tool", "event": "start", "tool": tool_name, "tool_call_id": tool_call_id});
+                // A reviewer's row says what it touched, not only which tool
+                // (ADR-0043): a read of a credential path shows up here.
+                if self.reviewer {
+                    item["args"] = json!(
+                        args_preview
+                            .chars()
+                            .take(MAX_ARGS_CHARS)
+                            .collect::<String>()
+                    );
+                }
                 self.append(item, None)?;
                 if let Some((host_tool, true)) =
                     cedian_agent_ui::host_device(tool_name, args_preview)
@@ -159,11 +169,12 @@ mod tests {
 
     /// Read the file back: every line parses and ordinals run 0, 1, 2, ….
     fn replay(dir: &Path) -> Vec<Value> {
-        let rows: Vec<Value> = std::fs::read_to_string(dir.join(AUDIT_FILE))
-            .unwrap()
-            .lines()
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect();
+        let rows: Vec<Value> =
+            std::fs::read_to_string(crate::state::dir(dir).unwrap().join(AUDIT_FILE))
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
         for (i, row) in rows.iter().enumerate() {
             assert_eq!(row["ordinal"], i as u64, "ordinals are contiguous");
         }
@@ -174,6 +185,7 @@ mod tests {
     fn rows_carry_envelope_source_and_continue_ordinals() {
         let dir = std::env::temp_dir().join(format!("cedian-audit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
         let start = RouterEvent::ToolStart {
             tool_call_id: "c1".into(),
             tool_name: "bash".into(),
@@ -213,6 +225,7 @@ mod tests {
     fn two_logs_on_one_file_share_the_ordinal_sequence() {
         let dir = std::env::temp_dir().join(format!("cedian-audit-two-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
         let start = |id: &str| RouterEvent::ToolStart {
             tool_call_id: id.into(),
             tool_name: "read".into(),
@@ -227,7 +240,12 @@ mod tests {
         let rows = replay(&dir);
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[1]["item"]["actor"], "reviewer");
+        assert_eq!(
+            rows[1]["item"]["args"], "notes.txt",
+            "a reviewer row says what it read"
+        );
         assert_eq!(rows[2]["item"].get("actor"), None);
+        assert_eq!(rows[2]["item"].get("args"), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -235,6 +253,7 @@ mod tests {
     fn gate_rows_for_a_host_tool_call_and_a_refused_dialog() {
         let dir = std::env::temp_dir().join(format!("cedian-audit-gate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
         let mut log = AuditLog::open(&dir, Approvals::Cedian(Default::default())).unwrap();
         log.record(&RouterEvent::ToolStart {
             tool_call_id: "c1".into(),

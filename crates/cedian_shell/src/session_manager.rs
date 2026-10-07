@@ -2,7 +2,7 @@
 //!
 //! Thin model over new/switch/archive + resume-checkbox state (§76) + storage
 //! meter per task. OMP owns transcripts; this owns the mapping list. No I/O:
-//! the owner persists entries (CLI: `.cedian/sessions.json`; app: real store).
+//! the owner persists entries (CLI: `sessions.json` in the state dir; app: real store).
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -31,7 +31,7 @@ pub struct SessionManager {
 /// Persisted session-manager schema version (ADR-0016 / P3).
 pub const SESSIONS_SNAPSHOT_VERSION: u32 = 1;
 
-/// On-disk shape the owner writes (CLI `.cedian/sessions.json`, app store).
+/// On-disk shape the owner writes (CLI `sessions.json` in the state dir, app store).
 #[derive(Serialize, Deserialize)]
 struct Snapshot {
     /// Missing in unversioned files → 0 → rejected.

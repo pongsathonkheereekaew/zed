@@ -1,7 +1,7 @@
 //! Headless browser session head for the CLI (S4 Task 5).
 //!
 //! One-shot-per-invocation stopgap: each `cedian browser …` command spawns
-//! its own headless Chrome (unique profile under `.cedian/chrome-<pid>-<nanos>`),
+//! its own headless Chrome (unique profile `chrome-<pid>-<nanos>` in the state dir),
 //! performs exactly one action, persists the updated [`BrowserHead`], and
 //! exits — the Chrome child dies with the invocation (reaped on drop, never
 //! reconnected). `status`/`dom`/`shot` re-read the head and respawn fresh
@@ -27,7 +27,7 @@ pub const CHROME_EXE: &str = "/Applications/Google Chrome.app/Contents/MacOS/Goo
 pub const CHROME_EXE: &str = "google-chrome";
 
 /// Last browser action: where the saved page lives and its frame seq.
-/// Persisted as JSON at `.cedian/browser.json` so CLI invocations share it
+/// Persisted as JSON at `browser.json` in the state dir (ADR-0044) so CLI invocations share it
 /// (same pattern as `workflow_store`; hand-rolled `serde_json::Value`
 /// mapping so this harness needs no `serde` derive dependency).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,13 +45,13 @@ pub struct BrowserHead {
 /// `browser.json` schema version (ADR-0016 / P3). Bump on any shape change.
 pub const BROWSER_SNAPSHOT_VERSION: u32 = 1;
 
-fn browser_path(workdir: &Path) -> PathBuf {
-    workdir.join(".cedian").join("browser.json")
+fn browser_path(workdir: &Path) -> Result<PathBuf, String> {
+    Ok(crate::state::dir(workdir)?.join("browser.json"))
 }
 
 /// Load the head, or fail with a usage hint when no session was opened.
 pub fn load(workdir: &Path) -> Result<BrowserHead, String> {
-    let raw = std::fs::read_to_string(browser_path(workdir))
+    let raw = std::fs::read_to_string(browser_path(workdir)?)
         .map_err(|_| "no browser session: run `cedian browser open <url>` first".to_string())?;
     let v: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("corrupt browser.json: {e}"))?;
@@ -87,9 +87,8 @@ pub fn load(workdir: &Path) -> Result<BrowserHead, String> {
     })
 }
 
-/// Save the head (creates `.cedian/` like the other stores).
+/// Save the head into the state dir.
 pub fn save(workdir: &Path, head: &BrowserHead) -> Result<(), String> {
-    std::fs::create_dir_all(workdir.join(".cedian")).map_err(|e| e.to_string())?;
     let raw = serde_json::to_string_pretty(&serde_json::json!({
         "snapshot_version": BROWSER_SNAPSHOT_VERSION,
         "port": head.port,
@@ -98,12 +97,14 @@ pub fn save(workdir: &Path, head: &BrowserHead) -> Result<(), String> {
         "seq": head.seq,
     }))
     .map_err(|e| e.to_string())?;
-    std::fs::write(browser_path(workdir), raw).map_err(|e| e.to_string())
+    std::fs::write(browser_path(workdir)?, raw).map_err(|e| e.to_string())
 }
 
 /// Delete the head (fresh `open` overwrites anyway; explicit for `close`).
 pub fn clear(workdir: &Path) {
-    let _ = std::fs::remove_file(browser_path(workdir));
+    if let Ok(path) = browser_path(workdir) {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// Spawn a FRESH headless Chrome on a unique profile, connect over the
@@ -123,9 +124,8 @@ pub fn spawn_fresh(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let profile = workdir
-        .join(".cedian")
-        .join(format!("chrome-{}-{nanos}", std::process::id()));
+    let profile =
+        crate::state::dir(workdir)?.join(format!("chrome-{}-{nanos}", std::process::id()));
     let proc = match BrowserProcess::spawn(CHROME_EXE, &profile) {
         Ok(proc) => proc,
         Err(e) => {
@@ -168,9 +168,9 @@ mod tests {
     #[test]
     fn unversioned_head_fails_closed() {
         let dir = std::env::temp_dir().join(format!("cedian-browser-stale-{}", std::process::id()));
-        std::fs::create_dir_all(dir.join(".cedian")).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            browser_path(&dir),
+            browser_path(&dir).unwrap(),
             r#"{"port":9222,"ws_url":"ws://x","url":"about:blank","seq":1}"#,
         )
         .unwrap();

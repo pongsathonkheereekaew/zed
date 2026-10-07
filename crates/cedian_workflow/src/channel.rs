@@ -59,7 +59,7 @@ pub fn may_mutate(tool_name: &str, args_preview: &str) -> bool {
     !READ_ONLY_TOOLS.contains(&tool_name) && !is_channel_call(tool_name, args_preview)
 }
 
-/// Where the workflow lives between calls (`.cedian/workflow.json` in the CLI).
+/// Where the workflow lives between calls (`workflow.json` in the CLI state dir).
 pub trait WorkflowStore: Send + Sync {
     /// `Ok(None)` when no workflow was ever started.
     fn load(&self) -> Result<Option<WorkflowState>, String>;
@@ -79,7 +79,7 @@ pub struct BoundCall {
 }
 
 /// Verification profiles (ADR-0025): the ledger cedian keeps
-/// (`.cedian/verify.json`) and read-only access to the profile skills
+/// (`verify.json` in the CLI state dir) and read-only access to the profile skills
 /// (`.omp/skills/<profile>/SKILL.md`, never written — §77).
 pub trait ProfileStore: Send + Sync {
     fn load(&self) -> Result<ProfileLedger, String>;

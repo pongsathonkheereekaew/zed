@@ -1,5 +1,5 @@
 //! Verification-profile ledger for the CLI harness (ADR-0025):
-//! `.cedian/verify.json`, `snapshot_version` envelope (P3, fails closed).
+//! `verify.json` in the state dir (ADR-0044), `snapshot_version` envelope (P3, fails closed).
 //! Profile skills are read from `.omp/skills/<profile>/SKILL.md` — the
 //! user's OMP config, never written here (§77).
 
@@ -18,8 +18,8 @@ struct Stored<S> {
     ledger: S,
 }
 
-fn verify_path(workdir: &Path) -> PathBuf {
-    workdir.join(".cedian").join("verify.json")
+fn verify_path(workdir: &Path) -> Result<PathBuf, String> {
+    Ok(crate::state::dir(workdir)?.join("verify.json"))
 }
 
 /// `verify-<app>` with a plain name: no path can escape `.omp/skills/`.
@@ -36,7 +36,7 @@ pub struct DiskProfileStore(pub PathBuf);
 
 impl ProfileStore for DiskProfileStore {
     fn load(&self) -> Result<ProfileLedger, String> {
-        let Ok(raw) = std::fs::read_to_string(verify_path(&self.0)) else {
+        let Ok(raw) = std::fs::read_to_string(verify_path(&self.0)?) else {
             return Ok(ProfileLedger::default());
         };
         let version: Stored<serde::de::IgnoredAny> =
@@ -44,8 +44,9 @@ impl ProfileStore for DiskProfileStore {
         if version.snapshot_version != VERIFY_SNAPSHOT_VERSION {
             return Err(format!(
                 "verification state too old (got v{}, want v{VERIFY_SNAPSHOT_VERSION}): \
-                 delete .cedian/verify.json and re-run the profile end to end",
-                version.snapshot_version
+                 delete {} and re-run the profile end to end",
+                version.snapshot_version,
+                verify_path(&self.0)?.display()
             ));
         }
         let stored: Stored<ProfileLedger> =
@@ -54,13 +55,12 @@ impl ProfileStore for DiskProfileStore {
     }
 
     fn save(&self, ledger: &ProfileLedger) -> Result<(), String> {
-        std::fs::create_dir_all(self.0.join(".cedian")).map_err(|e| e.to_string())?;
         let raw = serde_json::to_string_pretty(&Stored {
             snapshot_version: VERIFY_SNAPSHOT_VERSION,
             ledger,
         })
         .map_err(|e| e.to_string())?;
-        std::fs::write(verify_path(&self.0), raw).map_err(|e| e.to_string())
+        std::fs::write(verify_path(&self.0)?, raw).map_err(|e| e.to_string())
     }
 
     fn skill(&self, profile: &str) -> Option<String> {
@@ -92,7 +92,7 @@ mod tests {
         assert_eq!(store.skill("verify-notes").as_deref(), Some("# v"));
         assert_eq!(store.skill("verify-../../etc"), None);
         assert_eq!(store.skill("bug-fix"), None);
-        std::fs::write(verify_path(&d), r#"{"snapshot_version":0}"#).unwrap();
+        std::fs::write(verify_path(&d).unwrap(), r#"{"snapshot_version":0}"#).unwrap();
         assert!(store.load().unwrap_err().contains("too old"));
         let _ = std::fs::remove_dir_all(&d);
     }

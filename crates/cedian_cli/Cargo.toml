@@ -24,6 +24,7 @@ cedian_worker = { path = "../cedian_worker" }
 cedian_workflow = { path = "../cedian_workflow" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 cedian_fake_omp = { path = "../cedian_fake_omp" }

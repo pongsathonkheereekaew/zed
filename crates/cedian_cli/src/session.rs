@@ -1,6 +1,6 @@
 //! Review store for the CLI harness (headless stopgap, plan §§16–17, §75).
 //!
-//! One file per workdir, `.cedian/review.json`, holding the current review
+//! One file per workdir, `review.json` in its state dir (ADR-0044), holding the current review
 //! TASK: baseline texts (taken the first time a file is seen in the task —
 //! task baseline, not per-turn), the cedian-owned `AgentEdit` records (§17 R1:
 //! never derived from the OMP transcript), and the user's hunk resolutions.
@@ -160,25 +160,18 @@ impl Default for ReviewStore {
     }
 }
 
-fn store_path(workdir: &Path) -> PathBuf {
-    workdir.join(".cedian").join("review.json")
+fn store_path(workdir: &Path) -> Result<PathBuf, String> {
+    Ok(crate::state::dir(workdir)?.join("review.json"))
 }
 
 /// Load the review task. `Ok(None)` when no task exists yet. Corrupt or
 /// version-mismatched files fail closed.
 pub fn load(workdir: &Path) -> Result<Option<ReviewStore>, String> {
-    let path = store_path(workdir);
+    let path = store_path(workdir)?;
     let raw = match std::fs::read_to_string(&path) {
         Ok(raw) => raw,
-        Err(_) => {
-            if workdir.join(".cedian").join("baseline.json").exists() {
-                return Err(
-                    "review state too old (.cedian/baseline.json), re-baseline: run `cedian review reset`"
-                        .to_string(),
-                );
-            }
-            return Ok(None);
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
     };
     let store: ReviewStore = serde_json::from_str(&raw).map_err(|e| {
         format!(
@@ -197,18 +190,18 @@ pub fn load(workdir: &Path) -> Result<Option<ReviewStore>, String> {
 
 /// Save atomically (write temp + rename) so a crash never leaves half a file.
 pub fn save(workdir: &Path, store: &ReviewStore) -> Result<(), String> {
-    let path = store_path(workdir);
-    std::fs::create_dir_all(path.parent().unwrap_or(workdir)).map_err(|e| e.to_string())?;
+    let path = store_path(workdir)?;
     let raw = serde_json::to_string_pretty(store).map_err(|e| e.to_string())?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, raw).map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
 }
 
-/// Delete the review task (and the legacy baseline file).
+/// Delete the review task.
 pub fn reset(workdir: &Path) {
-    let _ = std::fs::remove_file(store_path(workdir));
-    let _ = std::fs::remove_file(workdir.join(".cedian").join("baseline.json"));
+    if let Ok(path) = store_path(workdir) {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 #[cfg(test)]
@@ -271,15 +264,14 @@ mod tests {
     }
 
     #[test]
-    fn version_mismatch_and_legacy_fail_closed() {
+    fn version_mismatch_fails_closed() {
         let dir = tmp("ver");
         let mut store = ReviewStore::new();
         store.snapshot_version = 0;
         save(&dir, &store).unwrap();
         assert!(load(&dir).unwrap_err().contains("re-baseline"));
         reset(&dir);
-        std::fs::write(dir.join(".cedian").join("baseline.json"), "{}").unwrap();
-        assert!(load(&dir).unwrap_err().contains("re-baseline"));
+        assert!(load(&dir).unwrap().is_none());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

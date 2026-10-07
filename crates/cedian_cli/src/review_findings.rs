@@ -1,4 +1,4 @@
-//! Reviewer findings (S3 exit, ADR-0041): `.cedian/findings.json` and the
+//! Reviewer findings (S3 exit, ADR-0041): `findings.json` in the state dir (ADR-0044) and the
 //! `cedian_review_finding` host tool a reviewer reports through. A finding
 //! binds to the unresolved hunk it names; one that names no hunk is refused,
 //! so the reviewer learns which hunks exist. Other snapshot versions fail
@@ -20,12 +20,12 @@ pub struct FindingStore {
     pub findings: Vec<AttachedFinding>,
 }
 
-fn findings_path(workdir: &Path) -> PathBuf {
-    workdir.join(".cedian").join("findings.json")
+fn findings_path(workdir: &Path) -> Result<PathBuf, String> {
+    Ok(crate::state::dir(workdir)?.join("findings.json"))
 }
 
 pub fn load(workdir: &Path) -> Result<FindingStore, String> {
-    let raw = match std::fs::read_to_string(findings_path(workdir)) {
+    let raw = match std::fs::read_to_string(findings_path(workdir)?) {
         Ok(raw) => raw,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(FindingStore::default()),
         Err(e) => return Err(format!("findings.json: {e}")),
@@ -44,9 +44,8 @@ pub fn load(workdir: &Path) -> Result<FindingStore, String> {
 
 pub fn save(workdir: &Path, store: &mut FindingStore) -> Result<(), String> {
     store.snapshot_version = FINDINGS_SNAPSHOT_VERSION;
-    std::fs::create_dir_all(workdir.join(".cedian")).map_err(|e| e.to_string())?;
     let raw = serde_json::to_string_pretty(store).map_err(|e| e.to_string())?;
-    std::fs::write(findings_path(workdir), raw).map_err(|e| e.to_string())
+    std::fs::write(findings_path(workdir)?, raw).map_err(|e| e.to_string())
 }
 
 /// Parse a reviewer's report and bind it to a hunk of `diff_for(path)`.
@@ -170,10 +169,14 @@ pub fn dismiss(workdir: &Path, id: &str, reason: &str) -> Result<String, String>
     let path = finding.finding.path.clone();
     let excerpt = finding.hunk_text.clone();
     save(workdir, &mut store)?;
+    // The turn that wrote the hunk, so two dismissals from two turns can
+    // form a reviewer-noise class (ADR-0032).
+    let turn = crate::session::load(workdir)?.and_then(|r| r.last_turn_touching(&path));
     crate::corrections::record(
         workdir,
         crate::corrections::CorrectionKind::FindingDismissed,
         crate::corrections::Event {
+            turn,
             path: Some(path.clone()),
             hunk_key: Some(id.to_string()),
             excerpt: Some(excerpt),
@@ -185,10 +188,11 @@ pub fn dismiss(workdir: &Path, id: &str, reason: &str) -> Result<String, String>
     Ok(format!("dismissed {id} on {path}: {}", reason.trim()))
 }
 
-/// The reviewer's host tool over `workdir`'s review diff.
+/// Bounds on what a reviewer can put in front of the implementer (ADR-0043).
 pub const MAX_MESSAGE_CHARS: usize = 2000;
 pub const MAX_FINDINGS_PER_REVIEW: usize = 50;
 
+/// The reviewer's host tool over `workdir`'s review diff.
 pub fn review_finding_tool(workdir: PathBuf) -> HostTool {
     let first_of_review = load(&workdir).map(|s| s.findings.len()).unwrap_or(0);
     let params = json!({
@@ -341,6 +345,7 @@ mod tests {
     fn store_roundtrips_and_other_versions_fail_closed() {
         let dir = std::env::temp_dir().join(format!("cedian-findings-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
         let mut store = FindingStore::default();
         record(
             &mut store,
@@ -351,7 +356,7 @@ mod tests {
         .unwrap();
         save(&dir, &mut store).unwrap();
         assert_eq!(load(&dir).unwrap().findings.len(), 1);
-        std::fs::write(dir.join(".cedian/findings.json"), r#"{"findings":[]}"#).unwrap();
+        std::fs::write(findings_path(&dir).unwrap(), r#"{"findings":[]}"#).unwrap();
         assert!(load(&dir).unwrap_err().contains("cedian review reset"));
         let _ = std::fs::remove_dir_all(&dir);
     }

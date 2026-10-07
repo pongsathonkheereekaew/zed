@@ -1,4 +1,4 @@
-//! `.cedian/shell.lock` (ADR-0021 / P4): one live `cedian shell` per workspace.
+//! `shell.lock` in the state dir (ADR-0021 / P4, ADR-0044): one live `cedian shell` per workspace.
 //!
 //! The shell holds the lock (pid + start time, `snapshot_version`) for its
 //! lifetime. Mutating one-shot commands check [`live_holder`] and refuse while
@@ -19,8 +19,8 @@ struct LockFile {
     started_ms: u64,
 }
 
-fn lock_path(workdir: &Path) -> PathBuf {
-    workdir.join(".cedian").join("shell.lock")
+fn lock_path(workdir: &Path) -> Result<PathBuf, String> {
+    Ok(crate::state::dir(workdir)?.join("shell.lock"))
 }
 
 /// Whether `pid` names a running process (`kill -0`; no `unsafe` needed).
@@ -33,7 +33,7 @@ fn alive(pid: u32) -> bool {
 }
 
 fn read(workdir: &Path) -> Option<LockFile> {
-    let raw = std::fs::read_to_string(lock_path(workdir)).ok()?;
+    let raw = std::fs::read_to_string(lock_path(workdir).ok()?).ok()?;
     serde_json::from_str(&raw).ok()
 }
 
@@ -52,14 +52,13 @@ pub struct ShellLock {
 impl ShellLock {
     /// Take the lock, reclaiming a stale one. Fails while a live shell holds it.
     pub fn acquire(workdir: &Path) -> Result<Self, String> {
+        let path = lock_path(workdir)?;
         if let Some(pid) = live_holder(workdir) {
             return Err(format!(
                 "a cedian shell (pid {pid}) already holds {} — use that shell",
-                lock_path(workdir).display()
+                path.display()
             ));
         }
-        let path = lock_path(workdir);
-        std::fs::create_dir_all(path.parent().unwrap_or(workdir)).map_err(|e| e.to_string())?;
         let started_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -113,20 +112,19 @@ mod tests {
     }
 
     fn write_lock(d: &Path, pid: u32) {
-        std::fs::create_dir_all(d.join(".cedian")).unwrap();
         let body = format!(r#"{{"snapshot_version":1,"pid":{pid},"started_ms":1}}"#);
-        std::fs::write(lock_path(d), body).unwrap();
+        std::fs::write(lock_path(d).unwrap(), body).unwrap();
     }
 
     #[test]
     fn acquire_writes_and_drop_removes() {
         let d = dir("own");
         let lock = ShellLock::acquire(&d).unwrap();
-        assert!(lock_path(&d).exists());
+        assert!(lock_path(&d).unwrap().exists());
         // Our own lock never refuses our own one-shot calls.
         assert!(refuse_if_shell_live(&d, "accept").is_ok());
         drop(lock);
-        assert!(!lock_path(&d).exists());
+        assert!(!lock_path(&d).unwrap().exists());
     }
 
     #[test]

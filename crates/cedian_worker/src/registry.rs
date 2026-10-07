@@ -1,4 +1,5 @@
-//! Worker registry: persisted heads at `<repo>/.cedian/workers.json`.
+//! Worker registry: persisted heads at `workers.json` in the repo's cedian
+//! state dir (ADR-0044), which the caller resolves and passes in.
 //!
 //! The registry is a MECHANISM record (§88): which workers exist, which
 //! branch/worktree serves each task, and their lifecycle state. No
@@ -80,8 +81,8 @@ impl std::fmt::Display for WorkerError {
     }
 }
 
-fn registry_path(repo: &Path) -> PathBuf {
-    repo.join(".cedian").join("workers.json")
+fn registry_path(state: &Path) -> PathBuf {
+    state.join("workers.json")
 }
 
 /// `workers.json` schema version (ADR-0016 / P3). Bump on any shape change.
@@ -110,8 +111,8 @@ impl Registry {
     /// registry plus whether the file already existed. An unreadable, corrupt
     /// or other-version file fails closed — never silently emptied, since the
     /// next save would forget live worktrees.
-    pub fn open(repo: &Path) -> Result<(Self, bool), WorkerError> {
-        let path = registry_path(repo);
+    pub fn open(state: &Path) -> Result<(Self, bool), WorkerError> {
+        let path = registry_path(state);
         if !path.exists() {
             return Ok((Self::default(), false));
         }
@@ -129,12 +130,11 @@ impl Registry {
         Ok((reg, true))
     }
 
-    /// Persist (creates `.cedian/`).
-    pub fn save(&self, repo: &Path) -> Result<(), WorkerError> {
-        std::fs::create_dir_all(repo.join(".cedian"))
-            .map_err(|e| WorkerError::Io(e.to_string()))?;
+    /// Persist into `state` (created if missing).
+    pub fn save(&self, state: &Path) -> Result<(), WorkerError> {
+        std::fs::create_dir_all(state).map_err(|e| WorkerError::Io(e.to_string()))?;
         let raw = serde_json::to_string_pretty(self).map_err(|e| WorkerError::Io(e.to_string()))?;
-        std::fs::write(registry_path(repo), raw).map_err(|e| WorkerError::Io(e.to_string()))?;
+        std::fs::write(registry_path(state), raw).map_err(|e| WorkerError::Io(e.to_string()))?;
         Ok(())
     }
 
@@ -186,7 +186,7 @@ mod tests {
     #[test]
     fn registry_roundtrip() {
         let repo = std::env::temp_dir().join(format!("cedian-reg-test-{}", std::process::id()));
-        std::fs::create_dir_all(repo.join(".cedian")).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
         let (mut reg, existed) = Registry::open(&repo).unwrap();
         assert!(!existed);
         reg.insert(WorkerHead {
@@ -221,7 +221,7 @@ mod tests {
     #[test]
     fn stale_or_corrupt_registry_fails_closed() {
         let repo = std::env::temp_dir().join(format!("cedian-reg-stale-{}", std::process::id()));
-        std::fs::create_dir_all(repo.join(".cedian")).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
         // Pre-P3 shape: no snapshot_version.
         std::fs::write(registry_path(&repo), r#"{"workers":{}}"#).unwrap();
         assert!(matches!(

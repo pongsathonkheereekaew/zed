@@ -1,6 +1,6 @@
 //! `cedian shell` (ADR-0021 / P4): one long-lived, foreground headless
 //! process per workspace. Holds ONE OMP runtime across turns, so a turn can
-//! be steered or aborted while it streams. Holds `.cedian/shell.lock`, so
+//! be steered or aborted while it streams. Holds `shell.lock` in the state dir, so
 //! mutating one-shot commands refuse while it runs. Dies with its terminal.
 //!
 //! Verbs: `prompt <msg>`, `edit <path> <start>-<end> <instruction>

@@ -157,6 +157,11 @@ impl OmpRuntime {
                     pump_router.dispatch_notification(&frame);
                 }
             }
+            // The channel closes when OMP's stdout does. Unless `shutdown`
+            // asked for it, OMP died: say so (U3 crash isolation).
+            if !pump_stop.load(Ordering::Relaxed) {
+                pump_router.dispatch_disconnected();
+            }
         });
 
         let runtime = Self {
@@ -202,6 +207,11 @@ impl OmpRuntime {
     /// Borrow the client (shutdown takes it; all ops require it present).
     fn client(&self) -> &Arc<Client> {
         self.client.as_ref().expect("client present until shutdown")
+    }
+
+    /// OMP's process id, while it runs.
+    pub fn pid(&self) -> Option<u32> {
+        self.client().pid()
     }
 
     /// Current lifecycle state.

@@ -183,6 +183,21 @@ impl Thread {
             RouterEvent::Unknown { .. } => {
                 // Tolerated + counted upstream (metric); never rendered.
             }
+            RouterEvent::Disconnected => {
+                let running: Vec<String> = self
+                    .events
+                    .iter()
+                    .filter_map(|e| match e {
+                        ThreadEvent::Tool {
+                            call_id,
+                            status: ToolCallStatus::Running,
+                            ..
+                        } => Some(call_id.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                self.on_disconnect(&running);
+            }
         }
     }
 
@@ -345,6 +360,24 @@ mod tests {
             }
         ));
     }
+    #[test]
+    fn omp_dying_interrupts_running_cards_and_ends_streaming() {
+        let mut t = Thread::new();
+        t.apply(&RouterEvent::ToolStart {
+            tool_call_id: "c1".to_string(),
+            tool_name: "bash".to_string(),
+            args_preview: "sleep 9".to_string(),
+        });
+        t.apply(&RouterEvent::Disconnected);
+        assert!(matches!(
+            &t.events()[0],
+            ThreadEvent::Tool {
+                status: ToolCallStatus::Interrupted,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn error_end_marks_card_error() {
         let mut t = Thread::new();

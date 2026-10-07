@@ -60,6 +60,9 @@ pub enum RouterEvent {
     },
     /// Forward-compat: recognized frame, unmodeled kind — never fatal.
     Unknown { frame_type: String },
+    /// OMP's output closed without cedian shutting it down: the process
+    /// crashed or was killed. Nothing follows; a restart is needed.
+    Disconnected,
 }
 
 /// Streaming delta kinds (coarse — Phase 2 panel refines rendering).
@@ -152,6 +155,11 @@ impl EventRouter {
         }
         let classified = classify_notification(frame);
         self.push(classified);
+    }
+
+    /// The runtime saw OMP's output close without a shutdown.
+    pub fn dispatch_disconnected(&self) {
+        self.push(RouterEvent::Disconnected);
     }
 
     /// The models that actually answered in this session, as

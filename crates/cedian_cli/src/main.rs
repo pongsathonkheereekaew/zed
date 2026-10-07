@@ -42,7 +42,7 @@ mod workflow_store;
 mod workspace_files;
 
 use cedian_agent_ui::Panel;
-use cedian_omp::{ApprovalMode, OmpBinary, OmpRuntime, RuntimeConfig, SpawnPolicy, ToolPolicy};
+use cedian_omp::{OmpBinary, OmpRuntime, RuntimeConfig};
 use cedian_review::{AgentEdit, ReviewTracker};
 use cedian_workspace::{HostTools, WorkspaceHost};
 use std::collections::HashMap;
@@ -184,44 +184,6 @@ pub(crate) fn dispatch(args: Vec<String>, in_shell: bool) -> Result<(), String> 
             Ok(())
         }
     }
-}
-
-/// Map `[permissions]` onto the OMP spawn policy (ADR-0020). Under the
-/// default policy it only tightens: `dangerous = allow` still leaves the exec
-/// floor at `prompt` (strict-wins, ADR-0012), and yolo is unrepresentable.
-/// Under `policy = "omp"` (ADR-0035) OMP's own config decides approvals;
-/// cedian's denies still apply.
-fn spawn_policy(
-    settings: &cedian_shell::Settings,
-    policy_source: cedian_shell::Policy,
-) -> SpawnPolicy {
-    use cedian_shell::Verdict;
-    let mut policy = SpawnPolicy::default();
-    if policy_source == cedian_shell::Policy::Omp {
-        policy.approvals = cedian_omp::Approvals::Omp;
-    }
-    for tool in host_tool_names(settings) {
-        policy.host_tools.insert(tool.to_string());
-    }
-    if settings.permissions.project_write != Verdict::Allow
-        && policy.approvals != cedian_omp::Approvals::Omp
-    {
-        policy.approvals = cedian_omp::Approvals::Cedian(ApprovalMode::AlwaysAsk);
-    }
-    let mut deny = |tools: &[&str]| {
-        for tool in tools {
-            policy
-                .tool_policies
-                .insert((*tool).to_string(), ToolPolicy::Deny);
-        }
-    };
-    if settings.permissions.project_write == Verdict::Deny {
-        deny(&["edit", "write", "ast_edit"]);
-    }
-    if settings.permissions.dangerous == Verdict::Deny {
-        deny(cedian_omp::spawn_profile::EXEC_TOOLS);
-    }
-    policy
 }
 
 /// The complete cedian host-tool set for these settings (ADR-0004: one
@@ -461,29 +423,7 @@ fn omp_policy_badge(workdir: &Path) -> String {
 
 /// The `omp` binary a spawn will run (`CEDIAN_OMP_BINARY`, else `PATH`).
 fn omp_binary_path() -> Result<PathBuf, String> {
-    match std::env::var("CEDIAN_OMP_BINARY") {
-        Ok(path) => Ok(PathBuf::from(path)),
-        Err(_) => cedian_omp::resolve_on_path("omp", std::env::var("PATH").ok().as_deref())
-            .map_err(|e| e.to_string()),
-    }
-}
-
-/// Tools OMP's merged config sets to `allow` in `workdir` (ADR-0041
-/// decision 2). Fails closed: without the record the default profile cannot
-/// pin them, so the spawn is refused.
-fn omp_config_allows(workdir: &Path) -> Result<std::collections::BTreeSet<String>, String> {
-    let binary = omp_binary_path()?;
-    let record =
-        cedian_omp::omp_config_get(&binary, workdir, "tools.approval", Duration::from_secs(10))
-            .map_err(|e| format!("cannot read OMP's tools.approval, so cannot pin it: {e}"))?;
-    let record = record
-        .as_object()
-        .ok_or("OMP's tools.approval is not a record")?;
-    Ok(record
-        .iter()
-        .filter(|(_, v)| v.as_str() == Some("allow"))
-        .map(|(k, _)| k.clone())
-        .collect())
+    cedian_shell::launch::omp_binary()
 }
 
 /// Spawn the runtime with workspace host tools + cedian:// wired.
@@ -514,9 +454,10 @@ fn spawn(
             );
         }
     }
-    let mut policy = spawn_policy(settings, choice.policy);
+    let mut policy =
+        cedian_shell::launch::spawn_policy(settings, choice.policy, &host_tool_names(settings));
     if choice.policy == cedian_shell::Policy::Cedian {
-        policy.config_allows = omp_config_allows(workdir)?;
+        policy.config_allows = cedian_shell::launch::config_allows(&omp_binary_path()?, workdir)?;
     }
     let rt = OmpRuntime::spawn(RuntimeConfig {
         binary,
@@ -1775,27 +1716,6 @@ mod tests {
         assert!(
             current_state(&dir).stale_reason(&bound).is_some(),
             "a change to a file over the buffer size cap makes tree-bound evidence stale"
-        );
-    }
-
-    #[test]
-    fn opt_in_hands_approvals_to_omp_but_keeps_denies() {
-        use cedian_omp::Approvals;
-        use cedian_shell::{Policy, Verdict};
-        let mut settings = cedian_shell::Settings::default();
-        let default = spawn_policy(&settings, Policy::Cedian);
-        assert_eq!(default.approvals, Approvals::Cedian(ApprovalMode::Write));
-        assert_eq!(
-            spawn_policy(&settings, Policy::Omp).approvals,
-            Approvals::Omp
-        );
-        settings.permissions.project_write = Verdict::Deny;
-        let opted = spawn_policy(&settings, Policy::Omp);
-        assert_eq!(opted.approvals, Approvals::Omp);
-        assert_eq!(opted.tool_policies.get("write"), Some(&ToolPolicy::Deny));
-        assert_eq!(
-            spawn_policy(&settings, Policy::Cedian).approvals,
-            Approvals::Cedian(ApprovalMode::AlwaysAsk)
         );
     }
 

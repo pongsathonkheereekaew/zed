@@ -2838,7 +2838,6 @@ dependencies = [
  "omp-rpc",
  "serde",
  "serde_json",
- "sha2",
 ]
 
 [[package]]
@@ -2923,9 +2922,11 @@ dependencies = [
 name = "cedian_shell"
 version = "0.1.0"
 dependencies = [
+ "cedian_omp",
  "cedian_workflow",
  "serde",
  "serde_json",
+ "sha2",
  "toml 0.8.23",
 ]
 

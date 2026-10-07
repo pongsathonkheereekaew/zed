@@ -275,7 +275,7 @@ pub fn run_review(
     let mut policy = SpawnPolicy {
         approvals: Approvals::Reviewer,
         bash_patterns: allow_patterns(&settings.reviewer_allow_list),
-        config_allows: crate::omp_config_allows(workdir)?,
+        config_allows: cedian_shell::launch::config_allows(&crate::omp_binary_path()?, workdir)?,
         model,
         sandbox: Some(layout.clone()),
         ..SpawnPolicy::default()

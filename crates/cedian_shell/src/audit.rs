@@ -1,8 +1,9 @@
 //! `audit.jsonl` in the state dir (ADR-0044; §64 mechanism 4 envelope): `kind: "tool"` rows for
 //! each OMP tool execution start and end (ADR-0035 decision 4), and
 //! `kind: "gate"` rows for each decision cedian's own gate makes (S3 gate
-//! item 4): a host-tool call it serves (`allow`) and a dialog headless
-//! refuses (`deny`, or `abstain` when nobody could answer). `decision_source`
+//! item 4): a host-tool call it serves (`allow`) and every dialog answered,
+//! by the person in the app or by headless fail-closed (`answered_by`), or
+//! left open when nobody could answer (`abstain`). `decision_source`
 //! says which profile let a tool run: `omp` under `policy = "omp"`, `cedian`
 //! under the default profile. Append-only.
 
@@ -29,8 +30,9 @@ static NEXT_ORDINAL: std::sync::Mutex<Option<std::collections::HashMap<std::path
     std::sync::Mutex::new(None);
 
 impl AuditLog {
-    pub fn open(workdir: &Path, approvals: Approvals) -> Result<Self, String> {
-        let path = crate::state::file(workdir, AUDIT_FILE)?;
+    /// The log in `state_dir`, the workspace's state dir (`crate::state`).
+    pub fn open(state_dir: &Path, approvals: Approvals) -> Result<Self, String> {
+        let path = state_dir.join(AUDIT_FILE);
         let complete_rows = match std::fs::read_to_string(&path) {
             Ok(text) => text.lines().filter(|l| !l.trim().is_empty()).count() as u64,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
@@ -103,25 +105,29 @@ impl AuditLog {
         self.append(item, None)
     }
 
-    /// The gate row for a dialog headless refused, stamped when it replied.
-    pub fn refusal(&mut self, refusal: &cedian_omp::Refusal) -> Result<(), String> {
+    /// The gate row for one dialog's outcome, stamped when it was answered.
+    pub fn dialog(&mut self, record: &cedian_omp::DialogRecord) -> Result<(), String> {
         let item = json!({
-            "kind": "gate", "tool": refusal.tool, "command": refusal.label,
-            "decision": refusal.decision.as_str(), "scope": "once",
+            "kind": "gate", "tool": record.tool, "command": record.label,
+            "decision": record.decision.as_str(), "scope": "once",
+            "answered_by": record.answered_by.as_str(),
         });
-        self.append(item, Some(refusal.at_ms))
+        self.append(item, Some(record.at_ms).filter(|ms| *ms != 0))
     }
 
     /// One review cedian ran: the role, both sides' models and whether it
     /// was independent (ADR-0039 decision 4).
     pub fn review(
         &mut self,
-        attribution: &crate::review_agent::ReviewAttribution,
+        role: &str,
+        reviewer_models: &[String],
+        implementer_models: &[String],
+        independent: bool,
     ) -> Result<(), String> {
         let item = json!({
-            "kind": "review", "tool": "cedian_review_request", "role": attribution.role,
-            "reviewer_models": attribution.reviewer, "implementer_models": attribution.implementer,
-            "independent": attribution.independent(),
+            "kind": "review", "tool": "cedian_review_request", "role": role,
+            "reviewer_models": reviewer_models, "implementer_models": implementer_models,
+            "independent": independent,
         });
         self.append(item, None)
     }
@@ -164,14 +170,38 @@ impl AuditLog {
 mod tests {
     use super::*;
 
+    /// A fresh, canonical temp directory per test, removed on drop.
+    struct TestDir(std::path::PathBuf);
+
+    impl TestDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("cedian-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(std::fs::canonicalize(&dir).unwrap())
+        }
+    }
+
+    impl std::ops::Deref for TestDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// Read the file back: every line parses and ordinals run 0, 1, 2, ….
     fn replay(dir: &Path) -> Vec<Value> {
-        let rows: Vec<Value> =
-            std::fs::read_to_string(crate::state::dir(dir).unwrap().join(AUDIT_FILE))
-                .unwrap()
-                .lines()
-                .map(|l| serde_json::from_str(l).unwrap())
-                .collect();
+        let rows: Vec<Value> = std::fs::read_to_string(dir.join(AUDIT_FILE))
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
         for (i, row) in rows.iter().enumerate() {
             assert_eq!(row["ordinal"], i as u64, "ordinals are contiguous");
         }
@@ -180,7 +210,7 @@ mod tests {
 
     #[test]
     fn rows_carry_envelope_source_and_continue_ordinals() {
-        let dir = crate::test_dir::TestDir::new("audit");
+        let dir = TestDir::new("audit");
         let start = RouterEvent::ToolStart {
             tool_call_id: "c1".into(),
             tool_name: "bash".into(),
@@ -217,7 +247,7 @@ mod tests {
 
     #[test]
     fn two_logs_on_one_file_share_the_ordinal_sequence() {
-        let dir = crate::test_dir::TestDir::new("audit-two");
+        let dir = TestDir::new("audit-two");
         let start = |id: &str| RouterEvent::ToolStart {
             tool_call_id: id.into(),
             tool_name: "read".into(),
@@ -242,7 +272,7 @@ mod tests {
 
     #[test]
     fn gate_rows_for_a_host_tool_call_and_a_refused_dialog() {
-        let dir = crate::test_dir::TestDir::new("audit-gate");
+        let dir = TestDir::new("audit-gate");
         let mut log = AuditLog::open(&dir, Approvals::Cedian(Default::default())).unwrap();
         log.record(&RouterEvent::ToolStart {
             tool_call_id: "c1".into(),
@@ -250,18 +280,28 @@ mod tests {
             args_preview: "xd://cedian_apply_edit".into(),
         })
         .unwrap();
-        log.refusal(&cedian_omp::Refusal {
+        log.dialog(&cedian_omp::DialogRecord {
             label: "Allow tool: bash — Command: rm -rf x".into(),
             tool: Some("bash".into()),
             decision: cedian_omp::GateDecision::Deny,
+            answered_by: cedian_omp::Answerer::Cedian,
             at_ms: 42,
         })
         .unwrap();
-        log.refusal(&cedian_omp::Refusal {
+        log.dialog(&cedian_omp::DialogRecord {
             label: "Name?".into(),
             tool: None,
             decision: cedian_omp::GateDecision::Abstain,
+            answered_by: cedian_omp::Answerer::Cedian,
             at_ms: 43,
+        })
+        .unwrap();
+        log.dialog(&cedian_omp::DialogRecord {
+            label: "Allow tool: bash — Command: ls".into(),
+            tool: Some("bash".into()),
+            decision: cedian_omp::GateDecision::Allow,
+            answered_by: cedian_omp::Answerer::User,
+            at_ms: 44,
         })
         .unwrap();
         drop(log);
@@ -272,7 +312,7 @@ mod tests {
             .filter(|r| r["item"]["kind"] == "gate")
             .collect();
         assert_eq!(rows[0]["item"]["kind"], "tool");
-        assert_eq!(gates.len(), 3, "{rows:?}");
+        assert_eq!(gates.len(), 4, "{rows:?}");
         assert_eq!(gates[0]["item"]["tool"], "cedian_apply_edit");
         assert_eq!(
             gates[0]["item"]["decision"], "allow",
@@ -289,7 +329,16 @@ mod tests {
             gates[1]["timestamp_ms"], 42,
             "stamped when headless replied"
         );
+        assert_eq!(gates[1]["item"]["answered_by"], "cedian");
         assert_eq!(gates[2]["item"]["decision"], "abstain");
         assert_eq!(gates[2]["item"]["tool"], Value::Null);
+        assert_eq!(
+            (
+                &gates[3]["item"]["decision"],
+                &gates[3]["item"]["answered_by"]
+            ),
+            (&json!("allow"), &json!("user")),
+            "the person approved it in the app"
+        );
     }
 }

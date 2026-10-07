@@ -183,8 +183,11 @@ pub fn dismiss(workdir: &Path, id: &str, reason: &str) -> Result<String, String>
             ..crate::corrections::Event::default()
         },
     )?;
-    crate::audit::AuditLog::open(workdir, cedian_omp::Approvals::Cedian(Default::default()))?
-        .dismissal(id, reason.trim())?;
+    cedian_shell::audit::AuditLog::open(
+        &crate::state::dir(workdir)?,
+        cedian_omp::Approvals::Cedian(Default::default()),
+    )?
+    .dismissal(id, reason.trim())?;
     Ok(format!("dismissed {id} on {path}: {}", reason.trim()))
 }
 

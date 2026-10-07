@@ -79,9 +79,9 @@ fn project_yolo_loses_to_spawn_profile_bash_prompts() {
     let bash_started = log.iter().any(
         |e| matches!(&e.event, RouterEvent::ToolStart { tool_name, .. } if tool_name == "bash"),
     );
-    let approval_requested = log.iter().any(|e| {
-        matches!(&e.event, RouterEvent::Unknown { frame_type } if frame_type == "extension_ui_request")
-    });
+    let approval_requested = log
+        .iter()
+        .any(|e| matches!(&e.event, RouterEvent::UiRequest(_)));
     eprintln!("prompt result: {:?}", result.as_ref().map(|_| "returned"));
     eprintln!("bash_started={bash_started} approval_requested={approval_requested}");
     let _ = rt.abort();

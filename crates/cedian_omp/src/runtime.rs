@@ -19,9 +19,10 @@ use crate::{
     EventRouter, OmpError, SessionBinding, Sessions, SpawnPolicy, SpawnProfile, resolve_on_path,
 };
 use omp_rpc::{
-    AbortCommand, Client, ClientOptions, Event, GetStateCommand, HostTool, HostUri, ImageContent,
-    NewSessionCommand, OpenSessionCommand, OpenSessionResult, PromptCommand, PromptTurn,
-    RpcInbound, RpcNotification, SessionState, SetAskDialogCommand, SetModelCommand, SteerCommand,
+    AbortCommand, Client, ClientOptions, Event, ExtensionUiResponse, GetStateCommand, HostTool,
+    HostUri, ImageContent, NewSessionCommand, OpenSessionCommand, OpenSessionResult, PromptCommand,
+    PromptTurn, RpcInbound, RpcNotification, SessionState, SetAskDialogCommand, SetModelCommand,
+    SteerCommand,
 };
 use std::{
     path::PathBuf,
@@ -96,7 +97,7 @@ pub struct OmpRuntime {
 struct HeadlessUi {
     enabled: AtomicBool,
     /// Labels of the dialogs answered fail-closed, oldest first.
-    refused: parking_lot::Mutex<Vec<crate::headless_ui::Refusal>>,
+    refused: parking_lot::Mutex<Vec<crate::DialogRecord>>,
 }
 
 impl OmpRuntime {
@@ -147,15 +148,15 @@ impl OmpRuntime {
                 if let Event::Notification(frame) = event {
                     if let RpcNotification::ExtensionUiRequest(request) = &frame {
                         if pump_headless.enabled.load(Ordering::Relaxed) {
-                            if let (Some((reply, mut refusal)), Some(client)) =
+                            if let (Some((reply, mut record)), Some(client)) =
                                 (crate::headless_answer(request), pump_client.upgrade())
                             {
                                 let _ = client.send(&RpcInbound::ExtensionUiResponse(reply));
-                                refusal.at_ms = std::time::SystemTime::now()
+                                record.at_ms = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .map(|d| d.as_millis() as u64)
                                     .unwrap_or(0);
-                                pump_headless.refused.lock().push(refusal);
+                                pump_headless.refused.lock().push(record);
                             }
                         }
                     }
@@ -197,7 +198,7 @@ impl OmpRuntime {
     }
 
     /// Drain the dialogs answered by [`Self::deny_ui_requests`].
-    pub fn take_refused_ui_requests(&self) -> Vec<crate::headless_ui::Refusal> {
+    pub fn take_refused_ui_requests(&self) -> Vec<crate::DialogRecord> {
         std::mem::take(&mut *self.headless.refused.lock())
     }
 
@@ -402,6 +403,13 @@ impl RuntimeControl {
                 message: message.to_string(),
                 images: None,
             })
+            .map_err(OmpError::from)
+    }
+
+    /// Answer one of OMP's dialogs (`crate::user_answer`).
+    pub fn respond(&self, reply: ExtensionUiResponse) -> Result<(), OmpError> {
+        self.client
+            .send(&RpcInbound::ExtensionUiResponse(reply))
             .map_err(OmpError::from)
     }
 

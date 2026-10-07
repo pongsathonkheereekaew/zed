@@ -2887,7 +2887,9 @@ dependencies = [
  "anyhow",
  "cedian_agent",
  "cedian_agent_ui",
+ "cedian_fake_omp",
  "cedian_omp",
+ "cedian_shell",
  "cedian_workspace",
  "clock",
  "collections",
@@ -2897,6 +2899,8 @@ dependencies = [
  "gpui",
  "language",
  "log",
+ "omp-rpc",
+ "parking_lot",
  "project",
  "serde_json",
  "settings",
@@ -2922,6 +2926,7 @@ dependencies = [
 name = "cedian_shell"
 version = "0.1.0"
 dependencies = [
+ "cedian_agent_ui",
  "cedian_omp",
  "cedian_workflow",
  "serde",

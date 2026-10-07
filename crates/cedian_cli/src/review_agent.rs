@@ -270,7 +270,8 @@ pub fn run_review(
     std::fs::write(layout.profile(), profile).map_err(|e| format!("reviewer profile: {e}"))?;
     // Opened before the reviewer runs: a log that cannot be written stops
     // the review instead of leaving its tool calls unrecorded.
-    let mut audit = crate::audit::AuditLog::open(workdir, Approvals::Reviewer)?;
+    let mut audit =
+        cedian_shell::audit::AuditLog::open(&crate::state::dir(workdir)?, Approvals::Reviewer)?;
 
     let mut policy = SpawnPolicy {
         approvals: Approvals::Reviewer,
@@ -307,7 +308,7 @@ pub fn run_review(
     }
     router.unsubscribe(sub);
     for refusal in rt.take_refused_ui_requests() {
-        audit_result = audit_result.and_then(|()| audit.refusal(&refusal));
+        audit_result = audit_result.and_then(|()| audit.dialog(&refusal));
         notes.push(format!("refused for the reviewer: {}", refusal.label));
     }
     let reviewer_models = router.answered_models();
@@ -328,7 +329,12 @@ pub fn run_review(
     }
     review_findings::save(workdir, &mut findings)?;
     let found = findings.findings.split_off(before);
-    audit.review(&attribution)?;
+    audit.review(
+        &attribution.role,
+        &attribution.reviewer,
+        &attribution.implementer,
+        attribution.independent(),
+    )?;
 
     let mut reply = review_reply(&attribution, &found);
     if let Some(channel) = requester.channel {

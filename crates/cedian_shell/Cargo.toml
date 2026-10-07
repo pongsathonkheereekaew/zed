@@ -8,6 +8,7 @@ edition = "2021"
 # UI, update banner) bind with the Zed fork; the data + validation lives here.
 
 [dependencies]
+cedian_agent_ui = { path = "../cedian_agent_ui" }
 cedian_omp = { path = "../cedian_omp" }
 cedian_workflow = { path = "../cedian_workflow" }
 sha2 = { workspace = true }

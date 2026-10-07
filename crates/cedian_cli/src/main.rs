@@ -24,7 +24,6 @@
     reason = "headless, synchronous process control (OMP, LSP, DAP, Chrome, git, sandbox-exec): Zed's async spawn helpers do not apply"
 )]
 
-mod audit;
 mod browser_store;
 mod corrections;
 mod revert_turn;
@@ -589,7 +588,7 @@ pub(crate) fn run_turn(
     let (settled_tx, settled_rx) = std::sync::mpsc::channel::<()>();
 
     let approvals = rt.approvals();
-    let mut audit = audit::AuditLog::open(workdir, approvals)?;
+    let mut audit = cedian_shell::audit::AuditLog::open(&state::dir(workdir)?, approvals)?;
 
     // Pump router events into the panel on a thread while the turn runs.
     let pump = std::thread::spawn(move || {
@@ -649,7 +648,7 @@ pub(crate) fn run_turn(
         pump.join().map_err(|_| "pump thread died".to_string())?;
     let refused = rt.take_refused_ui_requests();
     for r in &refused {
-        if let Err(e) = audit.refusal(r) {
+        if let Err(e) = audit.dialog(r) {
             audit_error.get_or_insert(e);
         }
     }

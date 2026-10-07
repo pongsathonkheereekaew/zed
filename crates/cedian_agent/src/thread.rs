@@ -180,8 +180,9 @@ impl Thread {
                     follow_up: follow_up.clone(),
                 });
             }
-            RouterEvent::Unknown { .. } => {
-                // Tolerated + counted upstream (metric); never rendered.
+            RouterEvent::UiRequest(_) | RouterEvent::Unknown { .. } => {
+                // Dialogs render outside the thread; unknown frames are
+                // tolerated + counted upstream (metric). Neither is rendered.
             }
             RouterEvent::Disconnected => {
                 let running: Vec<String> = self

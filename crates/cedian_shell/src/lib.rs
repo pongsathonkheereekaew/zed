@@ -6,6 +6,7 @@
 //! discoverable), session manager (task lifecycle over OMP sessions).
 //! Onboarding wizard + auto-update + keybinding UI bind with the Zed fork.
 
+pub mod audit;
 pub mod launch;
 pub mod palette;
 pub mod session_manager;

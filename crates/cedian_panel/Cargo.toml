@@ -29,6 +29,8 @@ futures.workspace = true
 gpui.workspace = true
 language.workspace = true
 log.workspace = true
+omp-rpc = { path = "../../vendor/omp-rpc" }
+parking_lot.workspace = true
 project.workspace = true
 serde_json.workspace = true
 text.workspace = true

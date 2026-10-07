@@ -10,7 +10,9 @@
 //! protocol forward-compat. Classification is a pure typed `match`, never
 //! Debug-string parsing.
 
-use omp_rpc::wire::{AgentMessage, AssistantMessageEvent, RpcAgentEvent, RpcNotification};
+use omp_rpc::wire::{
+    AgentMessage, AssistantMessageEvent, ExtensionUiRequest, RpcAgentEvent, RpcNotification,
+};
 use parking_lot::Mutex;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, mpsc};
@@ -58,6 +60,9 @@ pub enum RouterEvent {
         steering: Vec<String>,
         follow_up: Vec<String>,
     },
+    /// A dialog or UI notice from OMP: approvals and `ask` wait for an
+    /// answer (`crate::dialog`); the rest are fire-and-forget.
+    UiRequest(ExtensionUiRequest),
     /// Forward-compat: recognized frame, unmodeled kind — never fatal.
     Unknown { frame_type: String },
     /// OMP's output closed without cedian shutting it down: the process
@@ -277,6 +282,7 @@ fn classify_notification(frame: &RpcNotification) -> RouterEvent {
             status: result.status.into(),
         },
         RpcNotification::SessionSettled(_) => RouterEvent::Settled,
+        RpcNotification::ExtensionUiRequest(request) => RouterEvent::UiRequest(request.clone()),
         RpcNotification::Unknown(raw) => RouterEvent::Unknown {
             frame_type: raw
                 .get("type")

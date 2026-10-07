@@ -1,17 +1,29 @@
-//! The app's line to OMP (S9 U3): one OMP process per workspace, started the
-//! way the CLI starts it (`cedian_shell::launch`, the user's `cedian.toml`,
-//! the spawn profile) on its own thread, so a dying OMP never takes the IDE
-//! with it. Sessions live where OMP's CLI keeps them for the project, so a
-//! session started in either opens in the other (ADR-0040 decision 5) and a
-//! restart's `open_session` adopts it; cedian's overlay lives in the
-//! workspace's state dir (ADR-0044).
+//! The app's line to OMP (S9 U3, U4): one OMP process per workspace, started
+//! the way the CLI starts it (`cedian_shell::launch`, the user's
+//! `cedian.toml`, the spawn profile) on its own thread, so a dying OMP never
+//! takes the IDE with it. Sessions live where OMP's CLI keeps them for the
+//! project, so a session started in either opens in the other (ADR-0040
+//! decision 5) and a restart's `open_session` adopts it; cedian's overlay
+//! and audit log live in the workspace's state dir (ADR-0044).
+//!
+//! The link is cedian's gate for the app (§64): every tool execution and
+//! every dialog outcome is a row in `audit.jsonl`. A person's answer is sent
+//! and recorded in one step; a dialog still open when OMP dies, withdraws it
+//! or is stopped is recorded as `abstain` (§63 lease, ADR-0013).
 
-use cedian_omp::{OmpBinary, OmpRuntime, RouterEvent, RuntimeConfig, Sessions, SpawnPolicy};
+use cedian_omp::{
+    DialogRecord, OmpBinary, OmpRuntime, RouterEvent, RuntimeConfig, RuntimeControl, Sessions,
+    SpawnPolicy, UserAnswer,
+};
+use cedian_shell::audit::AuditLog;
 use cedian_shell::{Policy, RunKind};
+use collections::HashMap;
 use futures::channel::mpsc::UnboundedSender;
+use omp_rpc::{ExtensionUiRequest, ImageContent};
+use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, OnceLock, mpsc};
 use std::time::Duration;
 
 /// What the OMP thread tells the panel.
@@ -30,14 +42,23 @@ pub enum LinkEvent {
     Event(RouterEvent),
     /// OMP could not start, or its session could not open.
     Failed(String),
+    /// An audit row could not be written (ADR-0035: an unaudited turn fails).
+    AuditFailed(String),
+}
+
+/// One prompt from the composer.
+#[derive(Debug, Clone)]
+pub struct Prompt {
+    pub text: String,
+    pub images: Vec<ImageContent>,
 }
 
 /// Everything one launch needs, resolved before any process starts.
 pub struct LaunchSpec {
     pub binary: PathBuf,
     pub workdir: PathBuf,
-    /// cedian's directory for this OMP: the spawn overlay.
-    pub overlay_dir: PathBuf,
+    /// The workspace's state dir: the spawn overlay (`omp/`) and the audit log.
+    pub state_dir: PathBuf,
     pub sessions: Sessions,
     pub policy: SpawnPolicy,
     pub policy_note: Option<String>,
@@ -45,7 +66,7 @@ pub struct LaunchSpec {
 
 impl LaunchSpec {
     /// Resolve settings, policy and paths for `workdir`. The app registers no
-    /// host tools yet (U4, U5 add them).
+    /// host tools yet (U5 adds them).
     pub fn resolve(workdir: &Path) -> Result<Self, String> {
         let settings = cedian_shell::resolve_settings(workdir).map_err(|e| e.to_string())?;
         let binary = cedian_shell::launch::omp_binary()?;
@@ -61,7 +82,7 @@ impl LaunchSpec {
         Ok(Self {
             binary,
             workdir: workdir.to_path_buf(),
-            overlay_dir: cedian_shell::state::dir(workdir)?.join("omp"),
+            state_dir: cedian_shell::state::dir(workdir)?,
             sessions: Sessions::OmpDefault,
             policy,
             policy_note,
@@ -69,29 +90,91 @@ impl LaunchSpec {
     }
 }
 
-/// A running OMP. Dropping it shuts OMP down (no `Disconnected` follows).
+/// A running OMP. Dropping it shuts OMP down (no `Disconnected` follows) and
+/// records the dialogs it left open.
 pub struct OmpLink {
-    prompts: mpsc::Sender<String>,
+    prompts: mpsc::Sender<Prompt>,
     pid: Arc<AtomicU32>,
+    gate: Arc<Gate>,
+}
+
+/// Shared by the panel (answers), the event thread (tool rows, dialogs
+/// opening and closing) and the OMP thread (control, once spawned).
+#[derive(Default)]
+struct Gate {
+    control: OnceLock<RuntimeControl>,
+    state: Mutex<GateState>,
+}
+
+#[derive(Default)]
+struct GateState {
+    audit: Option<AuditLog>,
+    /// Dialogs OMP is waiting on, by request id.
+    open: HashMap<String, ExtensionUiRequest>,
+}
+
+impl GateState {
+    fn record(&mut self, mut record: DialogRecord) -> Result<(), String> {
+        record.at_ms = now_ms();
+        match &mut self.audit {
+            Some(audit) => audit.dialog(&record),
+            None => Err("the audit log is not open".to_string()),
+        }
+    }
+
+    /// Every open dialog, closed with nobody to answer it.
+    fn abstain_all(&mut self) -> Result<(), String> {
+        let open: Vec<_> = self.open.drain().map(|(_, request)| request).collect();
+        open.iter()
+            .filter_map(cedian_omp::abstained)
+            .try_for_each(|record| self.record(record))
+    }
+
+    /// Track and audit one event before the panel sees it.
+    fn observe(&mut self, event: &RouterEvent) -> Result<(), String> {
+        match event {
+            RouterEvent::UiRequest(ExtensionUiRequest::Cancel(cancel)) => {
+                match self.open.remove(&cancel.target_id) {
+                    Some(request) => {
+                        cedian_omp::abstained(&request).map_or(Ok(()), |record| self.record(record))
+                    }
+                    None => Ok(()),
+                }
+            }
+            RouterEvent::UiRequest(request) => {
+                if let Some((id, _)) = cedian_omp::dialog::dialog(request) {
+                    self.open.insert(id.to_string(), request.clone());
+                }
+                Ok(())
+            }
+            RouterEvent::Disconnected => self.abstain_all(),
+            event => match &mut self.audit {
+                Some(audit) => audit.record(event),
+                None => Ok(()),
+            },
+        }
+    }
 }
 
 impl OmpLink {
     /// Start OMP on its own thread; everything it reports goes to `events`.
     /// Prompts sent before it is ready wait in order.
     pub fn start(spec: LaunchSpec, events: UnboundedSender<LinkEvent>) -> Self {
-        let (prompts, prompt_rx) = mpsc::channel::<String>();
+        let (prompts, prompt_rx) = mpsc::channel::<Prompt>();
         let pid = Arc::new(AtomicU32::new(0));
+        let gate = Arc::new(Gate::default());
         let thread_pid = Arc::clone(&pid);
+        let thread_gate = Arc::clone(&gate);
         let spawned = std::thread::Builder::new()
             .name("cedian-omp".to_string())
-            .spawn(move || run(spec, prompt_rx, events, thread_pid));
+            .spawn(move || run(spec, prompt_rx, events, thread_pid, thread_gate));
         if let Err(e) = spawned {
             log::error!("cedian: cannot start the OMP thread: {e}");
         }
-        Self { prompts, pid }
+        Self { prompts, pid, gate }
     }
 
-    pub fn send(&self, prompt: String) -> Result<(), String> {
+    pub fn send(&self, prompt: Prompt) -> Result<(), String> {
         self.prompts
             .send(prompt)
             .map_err(|_| "OMP is not running".to_string())
@@ -101,17 +184,63 @@ impl OmpLink {
     pub fn pid(&self) -> Option<u32> {
         Some(self.pid.load(Ordering::Relaxed)).filter(|pid| *pid != 0)
     }
+
+    /// Mid-turn control (abort, steer), once OMP has started. Its calls
+    /// block until OMP answers: run them off the UI thread.
+    pub fn control(&self) -> Option<RuntimeControl> {
+        self.gate.control.get().cloned()
+    }
+
+    /// Send a person's answer to dialog `request_id` and record it.
+    pub fn answer(&self, request_id: &str, answer: UserAnswer) -> Result<(), String> {
+        let control = self.control().ok_or("OMP is not running")?;
+        let mut state = self.gate.state.lock();
+        let request = state
+            .open
+            .get(request_id)
+            .ok_or("OMP no longer waits on that dialog")?;
+        let (reply, record) = cedian_omp::user_answer(request, answer)
+            .ok_or("that answer does not fit the dialog")?;
+        control.respond(reply).map_err(|e| e.to_string())?;
+        state.open.remove(request_id);
+        state.record(record)
+    }
+}
+
+impl Drop for OmpLink {
+    fn drop(&mut self) {
+        if let Err(e) = self.gate.state.lock().abstain_all() {
+            log::error!("cedian: {e}");
+        }
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn run(
     spec: LaunchSpec,
-    prompts: mpsc::Receiver<String>,
+    prompts: mpsc::Receiver<Prompt>,
     events: UnboundedSender<LinkEvent>,
     pid: Arc<AtomicU32>,
+    gate: Arc<Gate>,
 ) {
+    match AuditLog::open(&spec.state_dir, spec.policy.approvals) {
+        Ok(audit) => gate.state.lock().audit = Some(audit),
+        Err(e) => {
+            let _ = events.unbounded_send(LinkEvent::Failed(format!(
+                "OMP not started, nothing could be audited: {e}"
+            )));
+            return;
+        }
+    }
     let mut runtime = match OmpRuntime::spawn(RuntimeConfig {
         binary: OmpBinary::Bundled(spec.binary),
-        session_dir: spec.overlay_dir,
+        session_dir: spec.state_dir.join("omp"),
         sessions: spec.sessions,
         cwd: spec.workdir,
         ask_dialog: true,
@@ -125,10 +254,15 @@ fn run(
         }
     };
     pid.store(runtime.pid().unwrap_or(0), Ordering::Relaxed);
+    let _ = gate.control.set(runtime.control());
     let (_sub, router_events) = runtime.router().subscribe();
     let forward = events.clone();
+    let forward_gate = Arc::clone(&gate);
     std::thread::spawn(move || {
         for event in router_events {
+            if let Err(e) = forward_gate.state.lock().observe(&event) {
+                let _ = forward.unbounded_send(LinkEvent::AuditFailed(e));
+            }
             if forward.unbounded_send(LinkEvent::Event(event)).is_err() {
                 break;
             }
@@ -152,7 +286,7 @@ fn run(
         }
     }
     for prompt in prompts {
-        if let Err(e) = runtime.prompt(&prompt, vec![]) {
+        if let Err(e) = runtime.prompt(&prompt.text, prompt.images) {
             log::error!("cedian: OMP turn failed: {e}");
         }
     }
@@ -177,7 +311,7 @@ mod tests {
                         ..
                     } => return (session_id, resumed, session_file),
                     LinkEvent::Failed(e) => panic!("{e}"),
-                    LinkEvent::Event(_) => {}
+                    LinkEvent::Event(_) | LinkEvent::AuditFailed(_) => {}
                 }
             }
             panic!("OMP thread ended without a session")
@@ -199,7 +333,7 @@ mod tests {
         let spec = || LaunchSpec {
             binary: cedian_shell::launch::omp_binary().unwrap(),
             workdir: root.join("ws"),
-            overlay_dir: root.join("overlay"),
+            state_dir: root.join("state"),
             sessions: Sessions::OmpDefault,
             policy: SpawnPolicy::default(),
             policy_note: None,
@@ -217,7 +351,11 @@ mod tests {
             "in OMP's own store: {}",
             file.display()
         );
-        link.send("Reply with exactly: ok".to_string()).unwrap();
+        link.send(Prompt {
+            text: "Reply with exactly: ok".to_string(),
+            images: Vec::new(),
+        })
+        .unwrap();
         futures::executor::block_on(async {
             while let Some(event) = rx.next().await {
                 if matches!(event, LinkEvent::Event(RouterEvent::Settled)) {

@@ -2,9 +2,10 @@
 //!
 //! Server (`out`) frames are emitted in recorded order. At each recorded host
 //! (`in`) frame, replay blocks for the host's next line and checks its `type`
-//! matches; the host's fresh request id is mapped onto the recorded one so the
-//! recorded `response` frames correlate. Any divergence exits with
-//! [`crate::EXIT_DIVERGED`] — the host sees a closed transport, never a hang.
+//! matches, and a dialog answer matches whole; the host's fresh request id is
+//! mapped onto the recorded one so the recorded `response` frames correlate.
+//! Any divergence exits with [`crate::EXIT_DIVERGED`] — the host sees a
+//! closed transport, never a hang.
 
 use crate::fixture::{Dir, Placeholders, Record};
 use serde_json::{Value, json};
@@ -68,6 +69,18 @@ pub(crate) fn run(fixture: &Path, cwd: &Path, placeholders: &Placeholders) -> i3
                         got_type
                     );
                     return crate::EXIT_DIVERGED;
+                }
+                // A dialog's answer is the host's decision, so it must match
+                // exactly: a replay that denies what the recording approved
+                // has diverged.
+                if got_type == Some("extension_ui_response") {
+                    let expected = placeholders.expand_value(&record.frame);
+                    if got != expected {
+                        eprintln!(
+                            "fake-omp replay: divergence at record {n}: expected answer {expected}, host sent {got}"
+                        );
+                        return crate::EXIT_DIVERGED;
+                    }
                 }
                 if let (Some(rec), Some(now)) = (
                     record.frame.get("id").and_then(Value::as_str),

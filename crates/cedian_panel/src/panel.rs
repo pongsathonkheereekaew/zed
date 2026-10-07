@@ -8,7 +8,7 @@
 //! OMP dies the panel says why and offers Restart; the IDE keeps running.
 
 use crate::import::{self, ImportOutcome, Mark};
-use crate::omp_link::{LaunchSpec, LinkEvent, OmpLink};
+use crate::omp_link::{LaunchSpec, LinkEvent, OmpLink, Prompt};
 use crate::omp_settings::OmpSettings;
 use cedian_agent::Thread;
 use cedian_omp::RouterEvent;
@@ -231,6 +231,7 @@ impl CedianPanel {
                 };
             }
             LinkEvent::Failed(reason) => self.stop(reason),
+            LinkEvent::AuditFailed(e) => self.status = format!("error: audit: {e}"),
             LinkEvent::Event(RouterEvent::Disconnected) => {
                 self.thread.apply(&RouterEvent::Disconnected);
                 self.stop("OMP stopped: its process exited".to_string());
@@ -264,7 +265,10 @@ impl CedianPanel {
         }
         let sent = match (&self.connection, &self.link) {
             (Connection::Stopped(reason), _) => Err(format!("{reason}; restart OMP")),
-            (_, Some(link)) => link.send(text.clone()),
+            (_, Some(link)) => link.send(Prompt {
+                text: text.clone(),
+                images: Vec::new(),
+            }),
             (_, None) => Err("OMP is not running; restart it".to_string()),
         };
         if let Err(e) = sent {

@@ -40,8 +40,14 @@ pub const EXIT_DIVERGED: i32 = 3;
 
 /// Entry point: `args` excludes the program name. Returns the exit code.
 pub fn run(args: &[String]) -> i32 {
-    let (Some(session_dir), Some(cwd)) = (flag(args, "--session-dir"), flag(args, "--cwd")) else {
-        eprintln!("fake-omp: --session-dir and --cwd are required");
+    // Without `--session-dir` (`Sessions::OmpDefault`) OMP picks its own
+    // store; fake-omp stands in with the overlay's directory.
+    let config_dir = || flag(args, "--config").and_then(|c| c.parent().map(Path::to_path_buf));
+    let (Some(session_dir), Some(cwd)) = (
+        flag(args, "--session-dir").or_else(config_dir),
+        flag(args, "--cwd"),
+    ) else {
+        eprintln!("fake-omp: --cwd and --session-dir or --config are required");
         return 2;
     };
     let placeholders = Placeholders::new(&session_dir, &cwd, std::env::var("HOME").ok());

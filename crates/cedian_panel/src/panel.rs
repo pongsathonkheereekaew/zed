@@ -200,6 +200,7 @@ impl CedianPanel {
                 session_id,
                 resumed,
                 policy_note,
+                ..
             } => {
                 self.connection = Connection::Ready {
                     session_id,

@@ -1,10 +1,12 @@
 //! The app's line to OMP (S9 U3): one OMP process per workspace, started the
 //! way the CLI starts it (`cedian_shell::launch`, the user's `cedian.toml`,
 //! the spawn profile) on its own thread, so a dying OMP never takes the IDE
-//! with it. The session lives in the workspace's state dir (ADR-0044), so a
-//! restart's `open_session` adopts the same session.
+//! with it. Sessions live where OMP's CLI keeps them for the project, so a
+//! session started in either opens in the other (ADR-0040 decision 5) and a
+//! restart's `open_session` adopts it; cedian's overlay lives in the
+//! workspace's state dir (ADR-0044).
 
-use cedian_omp::{OmpBinary, OmpRuntime, RouterEvent, RuntimeConfig, SpawnPolicy};
+use cedian_omp::{OmpBinary, OmpRuntime, RouterEvent, RuntimeConfig, Sessions, SpawnPolicy};
 use cedian_shell::{Policy, RunKind};
 use futures::channel::mpsc::UnboundedSender;
 use std::path::{Path, PathBuf};
@@ -18,6 +20,8 @@ pub enum LinkEvent {
     /// OMP is up and its session is open.
     Ready {
         session_id: String,
+        /// The session's file in OMP's store, where the CLI finds it too.
+        session_file: Option<String>,
         resumed: bool,
         /// Set under `policy = "omp"` (ADR-0035): OMP's config decides.
         policy_note: Option<String>,
@@ -32,7 +36,9 @@ pub enum LinkEvent {
 pub struct LaunchSpec {
     pub binary: PathBuf,
     pub workdir: PathBuf,
-    pub session_dir: PathBuf,
+    /// cedian's directory for this OMP: the spawn overlay.
+    pub overlay_dir: PathBuf,
+    pub sessions: Sessions,
     pub policy: SpawnPolicy,
     pub policy_note: Option<String>,
 }
@@ -55,7 +61,8 @@ impl LaunchSpec {
         Ok(Self {
             binary,
             workdir: workdir.to_path_buf(),
-            session_dir: cedian_shell::state::dir(workdir)?.join("session"),
+            overlay_dir: cedian_shell::state::dir(workdir)?.join("omp"),
+            sessions: Sessions::OmpDefault,
             policy,
             policy_note,
         })
@@ -104,7 +111,8 @@ fn run(
 ) {
     let mut runtime = match OmpRuntime::spawn(RuntimeConfig {
         binary: OmpBinary::Bundled(spec.binary),
-        session_dir: spec.session_dir,
+        session_dir: spec.overlay_dir,
+        sessions: spec.sessions,
         cwd: spec.workdir,
         ask_dialog: true,
         prompt_timeout: Duration::from_secs(600),
@@ -130,6 +138,7 @@ fn run(
         Ok(session) => {
             let _ = events.unbounded_send(LinkEvent::Ready {
                 session_id: session.session_id,
+                session_file: session.session_file,
                 resumed: session.resumed,
                 policy_note: spec.policy_note,
             });
@@ -155,15 +164,18 @@ mod tests {
     use super::*;
     use futures::StreamExt as _;
 
-    fn ready(events: &mut futures::channel::mpsc::UnboundedReceiver<LinkEvent>) -> (String, bool) {
+    fn ready(
+        events: &mut futures::channel::mpsc::UnboundedReceiver<LinkEvent>,
+    ) -> (String, bool, Option<String>) {
         futures::executor::block_on(async {
             while let Some(event) = events.next().await {
                 match event {
                     LinkEvent::Ready {
                         session_id,
                         resumed,
+                        session_file,
                         ..
-                    } => return (session_id, resumed),
+                    } => return (session_id, resumed, session_file),
                     LinkEvent::Failed(e) => panic!("{e}"),
                     LinkEvent::Event(_) => {}
                 }
@@ -172,9 +184,10 @@ mod tests {
         })
     }
 
-    /// Real OMP adopts the session it left in the session dir: what makes
-    /// Restart restore it. OMP writes a session only once it has a message,
-    /// so this sends one short prompt (one model call).
+    /// Real OMP keeps the app's session in its own store, where the CLI
+    /// finds it (ADR-0040 decision 5), and adopts it on restart. OMP writes a
+    /// session only once it has a message, so this sends one short prompt
+    /// (one model call). The session folder it made is removed after.
     /// `cargo test -p cedian_panel -- --ignored live_`
     #[test]
     #[ignore]
@@ -186,14 +199,24 @@ mod tests {
         let spec = || LaunchSpec {
             binary: cedian_shell::launch::omp_binary().unwrap(),
             workdir: root.join("ws"),
-            session_dir: root.join("session"),
+            overlay_dir: root.join("overlay"),
+            sessions: Sessions::OmpDefault,
             policy: SpawnPolicy::default(),
             policy_note: None,
         };
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         let link = OmpLink::start(spec(), tx);
-        let (first, resumed) = ready(&mut rx);
+        let (first, resumed, file) = ready(&mut rx);
         assert!(!resumed);
+        let file = PathBuf::from(file.expect("OMP names the session file"));
+        let agent = cedian_omp::OmpConfig::new(spec().binary)
+            .dir(&root)
+            .unwrap();
+        assert!(
+            file.starts_with(agent.join("sessions")),
+            "in OMP's own store: {}",
+            file.display()
+        );
         link.send("Reply with exactly: ok".to_string()).unwrap();
         futures::executor::block_on(async {
             while let Some(event) = rx.next().await {
@@ -205,8 +228,9 @@ mod tests {
         drop(link);
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         let _link = OmpLink::start(spec(), tx);
-        let (again, resumed) = ready(&mut rx);
+        let (again, resumed, _) = ready(&mut rx);
         assert_eq!((again.as_str(), resumed), (first.as_str(), true));
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

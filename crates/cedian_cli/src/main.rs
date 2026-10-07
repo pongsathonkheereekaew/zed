@@ -462,6 +462,7 @@ fn spawn(
     let rt = OmpRuntime::spawn(RuntimeConfig {
         binary,
         session_dir: session_dir.to_path_buf(),
+        sessions: cedian_omp::Sessions::InSessionDir,
         cwd: workdir.to_path_buf(),
         ask_dialog: true,
         prompt_timeout: Duration::from_secs(600),

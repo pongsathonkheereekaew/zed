@@ -15,7 +15,9 @@
 //! blocking and MUST be called off the UI thread; async/GPUI bridging lands
 //! with the panel in Phase 2.
 
-use crate::{EventRouter, OmpError, SessionBinding, SpawnPolicy, SpawnProfile, resolve_on_path};
+use crate::{
+    EventRouter, OmpError, SessionBinding, Sessions, SpawnPolicy, SpawnProfile, resolve_on_path,
+};
 use omp_rpc::{
     AbortCommand, Client, ClientOptions, Event, GetStateCommand, HostTool, HostUri, ImageContent,
     NewSessionCommand, OpenSessionCommand, OpenSessionResult, PromptCommand, PromptTurn,
@@ -46,8 +48,10 @@ pub enum OmpBinary {
 pub struct RuntimeConfig {
     /// OMP binary location.
     pub binary: OmpBinary,
-    /// `--session-dir` for this workspace (adopt-newest, leaf ephemeral).
+    /// cedian's directory for this runtime (the overlay; with
+    /// [`Sessions::InSessionDir`] also `--session-dir`).
     pub session_dir: PathBuf,
+    pub sessions: Sessions,
     /// Workspace root (cwd for the sidecar).
     pub cwd: PathBuf,
     /// Opt in to the `ask` tool dialog (off by default upstream — without it,
@@ -108,6 +112,7 @@ impl OmpRuntime {
         let plan = SpawnProfile {
             binary_path,
             session_dir: config.session_dir.clone(),
+            sessions: config.sessions,
             cwd: config.cwd.clone(),
             policy: config.policy.clone(),
         }
@@ -272,21 +277,38 @@ impl OmpRuntime {
     /// workspace↔session binding. Call before first prompt when restoring
     /// (plan §75: directory-adopt, not file-restore).
     pub fn open_session(&mut self, task: &str) -> Result<OpenSessionResult, OmpError> {
+        let session_dir = self.sessions_dir()?;
         let result: OpenSessionResult = self
             .client()
             .call(&OpenSessionCommand {
-                session_dir: self.config.session_dir.to_string_lossy().into_owned(),
+                session_dir: session_dir.to_string_lossy().into_owned(),
                 provider: None,
                 model_id: None,
             })
             .map_err(OmpError::from)?;
         self.session = Some(SessionBinding::new(
             self.config.cwd.clone(),
-            self.config.session_dir.clone(),
+            session_dir,
             result.session_id.clone(),
             task.to_string(),
         ));
         Ok(result)
+    }
+
+    /// The directory OMP keeps this child's sessions in. Under
+    /// [`Sessions::OmpDefault`] OMP chose it: the folder of its current
+    /// session file, as `get_state` reports before any prompt.
+    fn sessions_dir(&self) -> Result<PathBuf, OmpError> {
+        match self.config.sessions {
+            Sessions::InSessionDir => Ok(self.config.session_dir.clone()),
+            Sessions::OmpDefault => self
+                .get_state()?
+                .session_file
+                .as_deref()
+                .and_then(|file| std::path::Path::new(file).parent())
+                .map(PathBuf::from)
+                .ok_or_else(|| OmpError::Spawn("OMP reported no session file".to_string())),
+        }
     }
 
     /// Start a fresh session, optionally under a parent. Returns `true` when

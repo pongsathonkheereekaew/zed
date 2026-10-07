@@ -134,7 +134,9 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
 }
 
 fn session_dir(ws: &Path) -> PathBuf {
-    cedian_shell::state::dir(ws).unwrap().join("session")
+    // OMP's own session store in real use; fake-omp reads its fixture from
+    // the overlay's directory.
+    cedian_shell::state::dir(ws).unwrap().join("omp")
 }
 
 fn wait_ready(

@@ -18,6 +18,7 @@ fn dev_config(tag: &str) -> RuntimeConfig {
         binary: OmpBinary::Path("omp".to_string()),
         session_dir: std::env::temp_dir()
             .join(format!("cedian-phase4-{tag}-{}", std::process::id())),
+        sessions: cedian_omp::Sessions::InSessionDir,
         cwd: std::env::temp_dir(),
         ask_dialog: true,
         prompt_timeout: Duration::from_secs(240),

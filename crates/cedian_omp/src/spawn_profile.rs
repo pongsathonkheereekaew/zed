@@ -284,14 +284,27 @@ fn check_tool_name(tool: &str) -> Result<(), OmpError> {
     Ok(())
 }
 
+/// Where OMP keeps this child's sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sessions {
+    /// In `session_dir` (`--session-dir`): cedian-private sessions.
+    InSessionDir,
+    /// Where OMP's own CLI keeps them for this project, so a session started
+    /// in either opens in the other (ADR-0040 decision 5). `session_dir`
+    /// then holds only the overlay.
+    OmpDefault,
+}
+
 /// Inputs for one OMP child. The dedupe key is `{binary_path, session_dir,
 /// cwd, approvals}`, so a child is never reused under the other profile.
 #[derive(Debug, Clone)]
 pub struct SpawnProfile {
     /// Absolute path to the `omp` binary.
     pub binary_path: PathBuf,
-    /// `--session-dir` for this workspace; the overlay is written inside it.
+    /// cedian's directory for this child: the overlay is written inside it,
+    /// and with [`Sessions::InSessionDir`] it is `--session-dir` too.
     pub session_dir: PathBuf,
+    pub sessions: Sessions,
     /// Workspace root the child runs in.
     pub cwd: PathBuf,
     pub policy: SpawnPolicy,
@@ -335,6 +348,10 @@ pub const ENV_ALLOW: &[&str] = &[
     "XDG_DATA_HOME",
     "XDG_CACHE_HOME",
     "XDG_STATE_HOME",
+    // Which agent dir OMP reads: cedian and the user's CLI see one config
+    // (ADR-0045 decision 4). Directory names, not credentials.
+    "PI_CODING_AGENT_DIR",
+    "OMP_PROFILE",
 ];
 
 /// Filter `vars` down to [`ENV_ALLOW`], in allow-list order.
@@ -344,6 +361,10 @@ pub fn scrub_env(vars: impl IntoIterator<Item = (String, String)>) -> Vec<(Strin
         .iter()
         .filter_map(|name| vars.get(*name).map(|v| ((*name).to_string(), v.clone())))
         .collect()
+}
+
+pub(crate) fn check_binary(path: &Path) -> Result<(), OmpError> {
+    check_path("binary_path", path).map(|_| ())
 }
 
 fn check_path(label: &str, path: &Path) -> Result<String, OmpError> {
@@ -388,17 +409,11 @@ impl SpawnProfile {
             ]);
         }
         argv.extend(
-            [
-                binary.as_str(),
-                "--mode",
-                "rpc-ui",
-                "--session-dir",
-                session_dir.as_str(),
-                "--cwd",
-                cwd.as_str(),
-            ]
-            .map(str::to_string),
+            [binary.as_str(), "--mode", "rpc-ui", "--cwd", cwd.as_str()].map(str::to_string),
         );
+        if self.sessions == Sessions::InSessionDir {
+            argv.extend(["--session-dir".to_string(), session_dir.clone()]);
+        }
         if let Some(mode) = self.policy.approvals.mode() {
             argv.extend(["--approval-mode".to_string(), mode.as_str().to_string()]);
         }
@@ -553,6 +568,7 @@ mod tests {
         SpawnProfile {
             binary_path: PathBuf::from("/Applications/cedian.app/Contents/Resources/omp"),
             session_dir: PathBuf::from("/tmp/t1"),
+            sessions: Sessions::InSessionDir,
             cwd: PathBuf::from("/Users/u/work"),
             policy: SpawnPolicy::default(),
         }
@@ -566,6 +582,22 @@ mod tests {
     }
 
     #[test]
+    fn omp_default_sessions_pass_no_session_dir_but_keep_the_overlay() {
+        let mut p = profile();
+        p.sessions = Sessions::OmpDefault;
+        let plan = p.plan(Vec::new()).unwrap();
+        assert!(
+            !plan.argv.iter().any(|a| a == "--session-dir"),
+            "{:?}",
+            plan.argv
+        );
+        assert_eq!(
+            plan.overlay_path,
+            PathBuf::from("/tmp/t1/cedian-overlay.yml")
+        );
+    }
+
+    #[test]
     fn golden_argv() {
         let plan = profile().plan(Vec::new()).unwrap();
         assert_eq!(
@@ -574,10 +606,10 @@ mod tests {
                 "/Applications/cedian.app/Contents/Resources/omp",
                 "--mode",
                 "rpc-ui",
-                "--session-dir",
-                "/tmp/t1",
                 "--cwd",
                 "/Users/u/work",
+                "--session-dir",
+                "/tmp/t1",
                 "--approval-mode",
                 "write",
                 "--config",

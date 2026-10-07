@@ -284,6 +284,7 @@ pub fn run_review(
     let mut rt = OmpRuntime::spawn(RuntimeConfig {
         binary: OmpBinary::Bundled(binary),
         session_dir: layout.session(),
+        sessions: cedian_omp::Sessions::InSessionDir,
         cwd: workdir.to_path_buf(),
         ask_dialog: true,
         prompt_timeout: Duration::from_secs(600),

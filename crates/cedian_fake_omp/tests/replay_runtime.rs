@@ -29,6 +29,7 @@ fn config(root: &Path) -> RuntimeConfig {
     RuntimeConfig {
         binary: OmpBinary::Bundled(PathBuf::from(env!("CARGO_BIN_EXE_fake-omp"))),
         session_dir: root.join("sessions"),
+        sessions: cedian_omp::Sessions::InSessionDir,
         cwd: root.join("ws"),
         ask_dialog: true,
         prompt_timeout: Duration::from_secs(240),

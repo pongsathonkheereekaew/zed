@@ -12,6 +12,7 @@
 pub mod errors;
 pub mod event_router;
 pub mod headless_ui;
+pub mod omp_config;
 pub mod runtime;
 pub mod sandbox;
 pub mod session;
@@ -22,6 +23,7 @@ pub use event_router::{
     DeltaKind, EventRouter, FinishedToolCall, LogEntry, PromptStatus, RouterEvent,
 };
 pub use headless_ui::{GateDecision, Refusal, headless_answer};
+pub use omp_config::{Layer, OmpConfig, Setting, WriteOutcome};
 pub use runtime::{
     OmpBinary, OmpRuntime, RuntimeConfig, RuntimeControl, RuntimeState, image_content, last_text,
 };
@@ -29,6 +31,6 @@ pub use session::{
     ResumeState, SNAPSHOT_VERSION, SessionBinding, SnapshotVersionMismatch, validate_binding,
 };
 pub use spawn_profile::{
-    ApprovalMode, Approvals, BashRule, SpawnPlan, SpawnPolicy, SpawnProfile, ToolPolicy,
+    ApprovalMode, Approvals, BashRule, Sessions, SpawnPlan, SpawnPolicy, SpawnProfile, ToolPolicy,
     omp_config_get, resolve_on_path, scrub_env,
 };

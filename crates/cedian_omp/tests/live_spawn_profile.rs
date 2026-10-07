@@ -41,6 +41,7 @@ fn config(ws: &std::path::Path, timeout: Duration) -> RuntimeConfig {
     RuntimeConfig {
         binary: OmpBinary::Path("omp".to_string()),
         session_dir: ws.join(".sessions"),
+        sessions: cedian_omp::Sessions::InSessionDir,
         cwd: ws.to_path_buf(),
         ask_dialog: true,
         prompt_timeout: timeout,

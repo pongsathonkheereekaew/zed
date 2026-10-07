@@ -1,0 +1,29 @@
+#!/bin/sh
+# Agent guardrails for this checkout: pre-commit runs script/cedian-check;
+# pre-push blocks a non-fast-forward push (a human bypasses with --no-verify).
+set -eu
+HOOK_DIR="$(git rev-parse --git-dir)/hooks"
+cat > "$HOOK_DIR/pre-push" <<'HOOK'
+#!/bin/sh
+while read -r local_ref local_sha remote_ref remote_sha; do
+  if [ "$remote_sha" != "0000000000000000000000000000000000000000" ]; then
+    if ! git merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then
+      echo "BLOCKED: non-fast-forward push ($local_ref -> $remote_ref)." >&2
+      echo "If this rewrite is intentional, a human must push with --no-verify." >&2
+      exit 2
+    fi
+  fi
+done
+exit 0
+HOOK
+chmod +x "$HOOK_DIR/pre-push"
+cat > "$HOOK_DIR/pre-commit" <<'HOOK'
+#!/bin/sh
+# Only commits that touch cedian code pay for the check.
+if git diff --cached --name-only | grep -qE '^(crates/cedian_|vendor/|script/cedian-|cedian/|Cargo.lock)'; then
+  script/cedian-check >/dev/null 2>&1 || { echo "pre-commit: script/cedian-check failed" >&2; exit 1; }
+  echo "pre-commit: cedian-check green"
+fi
+HOOK
+chmod +x "$HOOK_DIR/pre-commit"
+echo "cedian guardrails installed in $HOOK_DIR"

@@ -1,0 +1,39 @@
+#!/bin/sh
+# Build the pinned OMP sidecar into cedian.app/Contents/Resources/omp.
+# Records {commit, normalized-source-tree hash, builder} into vendor/omp-revision.json
+# (plan §6: the startup handshake verifies this triple, never a bare version).
+set -eu
+
+PIN_FILE="vendor/omp-revision.json"
+OUT="cedian.app/Contents/Resources/omp"
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "build-omp: jq required" >&2
+  exit 1
+fi
+
+COMMIT="$(jq -r .commit "$PIN_FILE")"
+REPO="$(jq -r .repo "$PIN_FILE")"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+echo "build-omp: cloning $REPO @ $COMMIT"
+git clone -q "$REPO" "$WORK/omp"
+git -C "$WORK/omp" checkout -q "$COMMIT"
+
+# Normalized source-tree hash: stable ordering, no git metadata.
+TREE_HASH="$(cd "$WORK/omp" && git archive "$COMMIT" | shasum -a 256 | cut -d' ' -f1)"
+BUILDER="$(whoami)@$(hostname)"
+
+echo "build-omp: building (bun install + bun run build)"
+(cd "$WORK/omp" && bun install && bun run build)
+
+mkdir -p "$(dirname "$OUT")"
+cp "$WORK/omp/dist/omp" "$OUT" 2>/dev/null || cp "$WORK/omp/dist/cli.js" "$OUT-cli.js"
+
+jq --arg tree "$TREE_HASH" --arg builder "$BUILDER" \
+  '.sourceTreeHash = $tree | .builder = $builder' \
+  "$PIN_FILE" > "$PIN_FILE.new"
+mv "$PIN_FILE.new" "$PIN_FILE"
+
+echo "build-omp: done -> $OUT (tree=$TREE_HASH builder=$BUILDER)"

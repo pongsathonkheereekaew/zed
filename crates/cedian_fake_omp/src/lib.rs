@@ -19,6 +19,7 @@
     reason = "headless, synchronous process control (OMP, LSP, DAP, Chrome, git, sandbox-exec): Zed's async spawn helpers do not apply"
 )]
 
+mod config;
 mod fixture;
 mod fs_effects;
 mod record;
@@ -82,10 +83,14 @@ pub fn run(args: &[String]) -> i32 {
 }
 
 /// `omp config get <key> --json` stand-in: the badge's query in a replay.
+/// `list`, `set`, `reset` and `path` go to [`config`] (the settings page).
 /// Reads `tools.approvalMode` and `computer.enabled` from `.omp/config.yml`
 /// in the current directory, with fixed defaults (`write`, `false`), so a
 /// test workspace's project config shows up and an empty dir gives defaults.
 pub fn config_get(args: &[String]) -> i32 {
+    if let Some(code) = config::run(args) {
+        return code;
+    }
     let Some(key) = args.get(2) else {
         return 2;
     };

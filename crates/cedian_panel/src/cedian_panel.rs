@@ -3,7 +3,9 @@
 
 pub mod import;
 pub mod omp_link;
+pub mod omp_settings;
 pub mod panel;
 pub mod version;
 
+pub use omp_settings::OmpSettings;
 pub use panel::{CedianPanel, Connection, ImportedEdit, ToggleFocus, init};

@@ -9,6 +9,7 @@
 
 use crate::import::{self, ImportOutcome, Mark};
 use crate::omp_link::{LaunchSpec, LinkEvent, OmpLink};
+use crate::omp_settings::OmpSettings;
 use cedian_agent::Thread;
 use cedian_omp::RouterEvent;
 use collections::HashMap;
@@ -82,6 +83,9 @@ pub struct CedianPanel {
     imported: Vec<ImportedEdit>,
     stale: usize,
     status: String,
+    /// The OMP settings page, shown instead of the thread when open.
+    settings: Option<Entity<OmpSettings>>,
+    show_settings: bool,
     _events: Option<Task<()>>,
 }
 
@@ -115,6 +119,8 @@ impl CedianPanel {
             imported: Vec::new(),
             stale: 0,
             status: "idle".to_string(),
+            settings: None,
+            show_settings: false,
             _events: None,
         };
         if this.workspace_root(cx).is_some() {
@@ -156,6 +162,22 @@ impl CedianPanel {
     fn workspace_root(&self, cx: &App) -> Option<PathBuf> {
         let worktree = self.project.read(cx).visible_worktrees(cx).next()?;
         Some(worktree.read(cx).abs_path().to_path_buf())
+    }
+
+    /// Show or hide the OMP settings page; it is built on first open.
+    pub fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_settings = !self.show_settings;
+        if self.show_settings && self.settings.is_none() {
+            if let Some(root) = self.workspace_root(cx) {
+                let project = self.project.clone();
+                self.settings = Some(cx.new(|cx| OmpSettings::new(project, root, window, cx)));
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn omp_settings(&self) -> Option<&Entity<OmpSettings>> {
+        self.settings.as_ref()
     }
 
     /// Start (or restart) OMP for the open folder.
@@ -212,6 +234,13 @@ impl CedianPanel {
             LinkEvent::Event(RouterEvent::Disconnected) => {
                 self.thread.apply(&RouterEvent::Disconnected);
                 self.stop("OMP stopped: its process exited".to_string());
+            }
+            LinkEvent::Event(RouterEvent::Unknown { frame_type })
+                if frame_type == "config_update" =>
+            {
+                if let Some(settings) = &self.settings {
+                    settings.update(cx, |settings, cx| settings.reload(cx));
+                }
             }
             LinkEvent::Event(event) => return self.on_event(event, cx),
         }
@@ -377,13 +406,32 @@ impl Render for CedianPanel {
             .p_2()
             .gap_2()
             .child(
-                v_flex()
-                    .id("cedian-thread")
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .gap_1()
-                    .children(rows),
+                h_flex().justify_end().child(
+                    Button::new(
+                        "cedian-settings",
+                        if self.show_settings {
+                            "Back to chat"
+                        } else {
+                            "OMP settings"
+                        },
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_settings(window, cx))),
+                ),
             )
+            .when_some(
+                self.settings.clone().filter(|_| self.show_settings),
+                |panel, settings| panel.child(div().flex_1().child(settings)),
+            )
+            .when(!self.show_settings, |panel| {
+                panel.child(
+                    v_flex()
+                        .id("cedian-thread")
+                        .flex_1()
+                        .overflow_y_scroll()
+                        .gap_1()
+                        .children(rows),
+                )
+            })
             .child(
                 h_flex()
                     .gap_2()

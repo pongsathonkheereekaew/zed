@@ -81,7 +81,7 @@ Frames OMP sends besides the agent events above.
 | `btw_delta`, `btw_record` | side-question stream and history | planned S9 |
 | `command_output` | output of user-run `bash` | planned S9 |
 | `session_info_update` | session manager (name, metadata) | planned S9 |
-| `config_update` | settings refresh, live in both directions ([ADR-0040](https://github.com/pongsathonkheereekaew/cedian/blob/main/docs/decisions/0040-omp-settings-mirror-omp-config.md)) | planned S9 |
+| `config_update` | the settings page re-reads on it ([ADR-0040](https://github.com/pongsathonkheereekaew/cedian/blob/main/docs/decisions/0040-omp-settings-mirror-omp-config.md)); it carries only model and thinking level, so file changes are watched instead ([ADR-0045](https://github.com/pongsathonkheereekaew/cedian/blob/main/docs/decisions/0045-omp-settings-live-by-watching-config-sources.md)) | native (S9 U3a) |
 
 ## UI requests (12)
 
@@ -114,6 +114,8 @@ Frames OMP sends besides the agent events above.
 | Feature | cedian surface | Status |
 |---|---|---|
 | approval modes (`always-ask`, `write`, `yolo`) | default `write`; `always-ask` for reviewers (S3); OMP's own mode by opt-in | headless by opt-in ([ADR-0035](https://github.com/pongsathonkheereekaew/cedian/blob/main/docs/decisions/0035-omp-native-approval-opt-in.md), P8): `policy = "omp"` passes no mode; badge, `approved by OMP` card label, `audit.jsonl` rows in the state dir ([ADR-0044](https://github.com/pongsathonkheereekaew/cedian/blob/main/docs/decisions/0044-cedian-state-outside-the-workspace.md)) |
+| `omp config list`, `set`, `reset`, `path` (`--json`) | the OMP settings page: every key with its value and derived layer, simple types edited in place, `modelRoles` by role, `overriddenBy` shown, OMP's refusal shown; the global and project `config.yml` are watched ([ADR-0045](https://github.com/pongsathonkheereekaew/cedian/blob/main/docs/decisions/0045-omp-settings-live-by-watching-config-sources.md)) | native (S9 U3a) |
+| `PI_CODING_AGENT_DIR`, `OMP_PROFILE` | passed through the spawn profile, so cedian and the CLI read one config ([ADR-0045](https://github.com/pongsathonkheereekaew/cedian/blob/main/docs/decisions/0045-omp-settings-live-by-watching-config-sources.md)) | native (S9 U3a) |
 | `omp config get <key> --json` | OMP policy badge (effective `tools.approvalMode`, `computer.enabled`); `tools.approval` read before every default-profile spawn to pin unnamed allows ([ADR-0041](https://github.com/pongsathonkheereekaew/cedian/blob/main/docs/decisions/0041-reviewer-is-a-host-spawned-omp-process.md)) | headless (P8, S3 U1) |
 | `--model` (launch-time) | the reviewer runs on its `review` role, resolved from OMP's `modelRoles` in a cedian-owned directory; a same-model review is `inconclusive` ([ADR-0039](https://github.com/pongsathonkheereekaew/cedian/blob/main/docs/decisions/0039-model-roles-and-independent-review.md), [ADR-0041](https://github.com/pongsathonkheereekaew/cedian/blob/main/docs/decisions/0041-reviewer-is-a-host-spawned-omp-process.md)) | headless (S3): reviewer processes only |
 | running under `sandbox-exec` | the reviewer's generated Seatbelt profile: writes only its per-review run dir, workspace unwritable, credential reads denied, exec allow-list ([ADR-0043](https://github.com/pongsathonkheereekaew/cedian/blob/main/docs/decisions/0043-reviewer-sandbox-private-state-no-credentials.md)) | headless (S3): reviewer processes only |

@@ -176,7 +176,11 @@ impl OmpConfig {
                 .unwrap_or_default()
                 .trim_start_matches("Error: ")
                 .to_string();
-            return Err(OmpError::Spawn(message));
+            return Err(OmpError::Command {
+                command: format!("config {}", args.join(" ")),
+                error: message,
+                code: None,
+            });
         }
         Ok(out)
     }

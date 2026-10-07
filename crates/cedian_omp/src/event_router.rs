@@ -428,20 +428,15 @@ fn summarize_result(name: &str, result: Option<&serde_json::Value>) -> String {
     let line_count = joined.lines().count();
     match name {
         "bash" | "eval" => {
-            if line_count > 1 {
-                format!(
-                    "{} lines, last: {}",
-                    line_count,
-                    joined.lines().last().unwrap_or("")
-                )
-            } else {
-                joined
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .chars()
-                    .take(100)
-                    .collect()
+            // OMP 18.6 ends the output with a blank-separated `Wall time:` line.
+            let output: Vec<&str> = joined
+                .lines()
+                .filter(|l| !l.trim().is_empty() && !l.starts_with("Wall time: "))
+                .collect();
+            match output.as_slice() {
+                [] => String::new(),
+                [only] => only.chars().take(100).collect(),
+                [.., last] => format!("{} lines, last: {last}", output.len()),
             }
         }
         "grep" | "glob" | "find" => {

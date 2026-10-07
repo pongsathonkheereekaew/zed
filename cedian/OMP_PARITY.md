@@ -99,7 +99,7 @@ Frames OMP sends besides the agent events above.
 |---|---|---|
 | `read`, `grep`/`glob`/`find`, `ast_grep` | tool cards | headless |
 | `edit`, `write`, `ast_edit` | agent transactions, review, undo ([ADR-0027](https://github.com/pongsathonkheereekaew/cedian/blob/main/docs/decisions/0027-zero-omp-fork.md)) | headless (disk), native at S9 |
-| `bash`, `eval` | tool cards; prompts per approval mode, answered in the app's approval dialog (S9 U4) | headless (cards); native (approvals) |
+| `bash`, `eval` | tool cards (the summary is the output, without OMP's `Wall time:` footer); prompts per approval mode, answered in the app's approval dialog (S9 U4; a real OMP 18.6.1 approval recorded and replayed in the app: `cedian_panel/tests/live_approval.rs`) | headless (cards); native (approvals) |
 | `lsp`, `debug` | backed by Zed LSP/DAP via `cedian://` | headless stand-in (row B); native S9 |
 | `task`, `hub`/`wait`, `vibe_spawn`/`vibe_send` | subagent tree | planned S5 |
 | `todo` | Workflow UI | planned S2 |

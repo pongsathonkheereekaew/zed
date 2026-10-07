@@ -209,6 +209,20 @@ impl CedianPanel {
         self.dialogs.keys().cloned().collect()
     }
 
+    /// The thread as the panel renders it: messages, then tool cards.
+    pub fn transcript(&self) -> Vec<String> {
+        let (messages, cards) = cedian_agent_ui::render_thread(self.thread.events());
+        messages
+            .into_iter()
+            .map(|m| format!("{:?}: {}", m.role, m.text))
+            .chain(
+                cards
+                    .into_iter()
+                    .map(|c| format!("[{:?}] {}", c.status, c.display_line())),
+            )
+            .collect()
+    }
+
     pub fn dialog(&self, id: &str) -> Option<&OpenDialog> {
         self.dialogs.get(id)
     }
@@ -714,15 +728,10 @@ impl Focusable for CedianPanel {
 
 impl Render for CedianPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (messages, cards) = cedian_agent_ui::render_thread(self.thread.events());
-        let rows = messages
+        let rows = self
+            .transcript()
             .into_iter()
-            .map(|m| Label::new(format!("{:?}: {}", m.role, m.text)).into_any_element())
-            .chain(cards.into_iter().map(|c| {
-                Label::new(format!("[{:?}] {}", c.status, c.display_line()))
-                    .color(Color::Muted)
-                    .into_any_element()
-            }));
+            .map(|line| Label::new(line).into_any_element());
         let connection = match &self.connection {
             Connection::NotStarted => "OMP not started".to_string(),
             Connection::Starting => "starting OMP…".to_string(),

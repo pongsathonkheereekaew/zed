@@ -44,6 +44,18 @@ pub enum LinkEvent {
     Failed(String),
     /// An audit row could not be written (ADR-0035: an unaudited turn fails).
     AuditFailed(String),
+    /// Another process drives the session, or whether one does could not be
+    /// checked: the app sends it no prompt (ADR-0040 decision 5).
+    Taken { session_id: String, reason: String },
+}
+
+/// What the panel asks of the OMP thread, in order.
+enum Command {
+    Prompt(Prompt),
+    /// Check the session again for another driver.
+    Retry,
+    /// Leave the session to its driver and start a fresh one.
+    NewSession,
 }
 
 /// One prompt from the composer.
@@ -62,6 +74,8 @@ pub struct LaunchSpec {
     pub sessions: Sessions,
     pub policy: SpawnPolicy,
     pub policy_note: Option<String>,
+    /// OMP's state root, where session owner leases live.
+    pub omp_state: Option<PathBuf>,
 }
 
 impl LaunchSpec {
@@ -86,6 +100,7 @@ impl LaunchSpec {
             sessions: Sessions::OmpDefault,
             policy,
             policy_note,
+            omp_state: cedian_omp::driver::state_root(),
         })
     }
 }
@@ -94,7 +109,7 @@ impl LaunchSpec {
 /// cancel reply and an `abstain` row each), aborts a running turn so the
 /// old process ends promptly, and shuts OMP down (no `Disconnected` follows).
 pub struct OmpLink {
-    prompts: mpsc::Sender<Prompt>,
+    commands: mpsc::Sender<Command>,
     pid: Arc<AtomicU32>,
     gate: Arc<Gate>,
 }
@@ -220,23 +235,41 @@ impl OmpLink {
     /// Start OMP on its own thread; everything it reports goes to `events`.
     /// Prompts sent before it is ready wait in order.
     pub fn start(spec: LaunchSpec, events: UnboundedSender<LinkEvent>) -> Self {
-        let (prompts, prompt_rx) = mpsc::channel::<Prompt>();
+        let (commands, command_rx) = mpsc::channel::<Command>();
         let pid = Arc::new(AtomicU32::new(0));
         let gate = Arc::new(Gate::default());
         let thread_pid = Arc::clone(&pid);
         let thread_gate = Arc::clone(&gate);
         let spawned = std::thread::Builder::new()
             .name("cedian-omp".to_string())
-            .spawn(move || run(spec, prompt_rx, events, thread_pid, thread_gate));
+            .spawn(move || run(spec, command_rx, events, thread_pid, thread_gate));
         if let Err(e) = spawned {
             log::error!("cedian: cannot start the OMP thread: {e}");
         }
-        Self { prompts, pid, gate }
+        Self {
+            commands,
+            pid,
+            gate,
+        }
     }
 
     pub fn send(&self, prompt: Prompt) -> Result<(), String> {
-        self.prompts
-            .send(prompt)
+        self.command(Command::Prompt(prompt))
+    }
+
+    /// Check a taken session again; `Ready` or `Taken` follows.
+    pub fn retry(&self) -> Result<(), String> {
+        self.command(Command::Retry)
+    }
+
+    /// Start a fresh session; `Ready` follows.
+    pub fn new_session(&self) -> Result<(), String> {
+        self.command(Command::NewSession)
+    }
+
+    fn command(&self, command: Command) -> Result<(), String> {
+        self.commands
+            .send(command)
             .map_err(|_| "OMP is not running".to_string())
     }
 
@@ -297,7 +330,7 @@ impl Drop for OmpLink {
 
 fn run(
     spec: LaunchSpec,
-    prompts: mpsc::Receiver<Prompt>,
+    commands: mpsc::Receiver<Command>,
     events: UnboundedSender<LinkEvent>,
     pid: Arc<AtomicU32>,
     gate: Arc<Gate>,
@@ -326,7 +359,8 @@ fn run(
             return;
         }
     };
-    pid.store(runtime.pid().unwrap_or(0), Ordering::Relaxed);
+    let own = runtime.pid().unwrap_or(0);
+    pid.store(own, Ordering::Relaxed);
     let _ = gate.control.set(runtime.control());
     let (_sub, router_events) = runtime.router().subscribe();
     let forward = events.clone();
@@ -341,15 +375,12 @@ fn run(
             }
         }
     });
-    match runtime.open_session("app") {
-        Ok(session) => {
-            let _ = events.unbounded_send(LinkEvent::Ready {
-                session_id: session.session_id,
-                session_file: session.session_file,
-                resumed: session.resumed,
-                policy_note: spec.policy_note,
-            });
-        }
+    let mut session = match runtime.open_session("app") {
+        Ok(opened) => Session {
+            id: opened.session_id,
+            file: opened.session_file,
+            resumed: opened.resumed,
+        },
         Err(e) => {
             let _ = events.unbounded_send(LinkEvent::Failed(format!(
                 "OMP's session did not open: {e}"
@@ -357,15 +388,89 @@ fn run(
             let _ = runtime.shutdown();
             return;
         }
-    }
-    for prompt in prompts {
-        gate.turn.store(true, Ordering::Relaxed);
-        if let Err(e) = runtime.prompt(&prompt.text, prompt.images) {
-            log::error!("cedian: OMP turn failed: {e}");
+    };
+    let state = spec.omp_state;
+    let taken = |session: &Session| -> Option<LinkEvent> {
+        let files = cedian_omp::driver::session_files(
+            state.as_deref().unwrap_or(Path::new("/nonexistent")),
+            &session.id,
+            session.file.as_deref().map(Path::new),
+        );
+        let reason = match cedian_omp::driver::other_drivers_of(&files, own) {
+            Ok(others) if others.is_empty() => return None,
+            Ok(others) => format!(
+                "another process drives this session (pid {})",
+                others
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Err(e) => format!("cannot check whether another process drives this session: {e}"),
+        };
+        Some(LinkEvent::Taken {
+            session_id: session.id.clone(),
+            reason,
+        })
+    };
+    let ready = |session: &Session| LinkEvent::Ready {
+        session_id: session.id.clone(),
+        session_file: session.file.clone(),
+        resumed: session.resumed,
+        policy_note: spec.policy_note.clone(),
+    };
+    let first = if session.resumed {
+        taken(&session)
+    } else {
+        None
+    };
+    let _ = events.unbounded_send(first.unwrap_or_else(|| ready(&session)));
+    for command in commands {
+        match command {
+            Command::Prompt(prompt) => {
+                if let Some(refusal) = taken(&session) {
+                    let _ = events.unbounded_send(refusal);
+                    continue;
+                }
+                gate.turn.store(true, Ordering::Relaxed);
+                if let Err(e) = runtime.prompt(&prompt.text, prompt.images) {
+                    log::error!("cedian: OMP turn failed: {e}");
+                }
+                gate.turn.store(false, Ordering::Relaxed);
+            }
+            Command::Retry => {
+                let _ = events.unbounded_send(taken(&session).unwrap_or_else(|| ready(&session)));
+            }
+            Command::NewSession => {
+                let fresh = runtime
+                    .new_session(None, "app")
+                    .and_then(|_| runtime.get_state());
+                match fresh {
+                    Ok(state) => {
+                        session = Session {
+                            id: state.session_id,
+                            file: state.session_file,
+                            resumed: false,
+                        };
+                        let _ = events.unbounded_send(ready(&session));
+                    }
+                    Err(e) => {
+                        let _ = events.unbounded_send(LinkEvent::Taken {
+                            session_id: session.id.clone(),
+                            reason: format!("a new session did not start: {e}"),
+                        });
+                    }
+                }
+            }
         }
-        gate.turn.store(false, Ordering::Relaxed);
     }
     let _ = runtime.shutdown();
+}
+
+struct Session {
+    id: String,
+    file: Option<String>,
+    resumed: bool,
 }
 
 #[cfg(test)]
@@ -515,7 +620,7 @@ mod tests {
                         ..
                     } => return (session_id, resumed, session_file),
                     LinkEvent::Failed(e) => panic!("{e}"),
-                    LinkEvent::Event(_) | LinkEvent::AuditFailed(_) => {}
+                    LinkEvent::Event(_) | LinkEvent::AuditFailed(_) | LinkEvent::Taken { .. } => {}
                 }
             }
             panic!("OMP thread ended without a session")
@@ -541,6 +646,7 @@ mod tests {
             sessions: Sessions::OmpDefault,
             policy: SpawnPolicy::default(),
             policy_note: None,
+            omp_state: cedian_omp::driver::state_root(),
         };
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         let link = OmpLink::start(spec(), tx);

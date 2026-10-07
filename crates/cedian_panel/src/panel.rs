@@ -72,6 +72,8 @@ pub const DIALOG_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Turn {
     Idle,
+    /// Sent; OMP has not started it yet.
+    Queued,
     Streaming,
     /// Stop was pressed; OMP has not settled yet.
     Stopping,
@@ -83,6 +85,7 @@ impl Turn {
     fn label(&self) -> String {
         match self {
             Turn::Idle => "idle".to_string(),
+            Turn::Queued => "queued".to_string(),
             Turn::Streaming => "streaming".to_string(),
             Turn::Stopping => "stopping".to_string(),
             Turn::Failed(reason) => format!("failed: {reason}"),
@@ -103,6 +106,12 @@ pub enum Connection {
     },
     /// OMP failed to start or died. Prompts are refused until Restart.
     Stopped(String),
+    /// Another process drives the session (ADR-0040 decision 5). Prompts
+    /// are refused until Retry finds it free or a new session starts.
+    Taken {
+        session_id: String,
+        reason: String,
+    },
 }
 
 pub struct CedianPanel {
@@ -281,6 +290,22 @@ impl CedianPanel {
         cx.notify();
     }
 
+    /// The Retry button of a taken session.
+    pub fn retry_session(&mut self, cx: &mut Context<Self>) {
+        if let Some(Err(e)) = self.link.as_ref().map(OmpLink::retry) {
+            self.notice = Some(e);
+        }
+        cx.notify();
+    }
+
+    /// The "Start a new session" button of a taken session.
+    pub fn start_new_session(&mut self, cx: &mut Context<Self>) {
+        if let Some(Err(e)) = self.link.as_ref().map(OmpLink::new_session) {
+            self.notice = Some(e);
+        }
+        cx.notify();
+    }
+
     /// The Restart button: a fresh OMP on the same session.
     pub fn restart(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.start(window, cx);
@@ -301,6 +326,10 @@ impl CedianPanel {
                 };
             }
             LinkEvent::Failed(reason) => self.stop(reason),
+            LinkEvent::Taken { session_id, reason } => {
+                self.turn = Turn::Idle;
+                self.connection = Connection::Taken { session_id, reason };
+            }
             LinkEvent::AuditFailed(e) => self.audit_failed(e, cx),
             LinkEvent::Event(RouterEvent::UiRequest(ExtensionUiRequest::Cancel(cancel))) => {
                 self.dialogs.shift_remove(&cancel.target_id);
@@ -352,6 +381,9 @@ impl CedianPanel {
         }
         let sent = match (&self.connection, &self.link) {
             (Connection::Stopped(reason), _) => Err(format!("{reason}; restart OMP")),
+            (Connection::Taken { reason, .. }, _) => {
+                Err(format!("{reason}; start a new session or retry"))
+            }
             (_, Some(link)) => link.send(Prompt {
                 text: text.clone(),
                 images: self.images.clone(),
@@ -367,7 +399,7 @@ impl CedianPanel {
         self.images.clear();
         self.thread.push_user(&text);
         self.notice = None;
-        self.turn = Turn::Streaming;
+        self.turn = Turn::Queued;
         cx.notify();
     }
 
@@ -405,6 +437,7 @@ impl CedianPanel {
                     }
                 }
             }
+            RouterEvent::AgentStart if self.turn == Turn::Queued => self.turn = Turn::Streaming,
             RouterEvent::Settled => {
                 if let Turn::Failed(reason) = std::mem::replace(&mut self.turn, Turn::Idle) {
                     self.notice = Some(format!("turn failed: {reason}"));
@@ -436,7 +469,7 @@ impl CedianPanel {
         match self.turn {
             Turn::Failed(_) => {}
             Turn::Idle => self.notice = Some(reason),
-            Turn::Streaming | Turn::Stopping => {
+            Turn::Queued | Turn::Streaming | Turn::Stopping => {
                 self.turn = Turn::Failed(reason);
                 self.abort(cx);
             }
@@ -707,14 +740,19 @@ impl Render for CedianPanel {
                     .unwrap_or_default()
             ),
             Connection::Stopped(reason) => reason.clone(),
+            Connection::Taken { session_id, reason } => format!(
+                "session {} not opened: {reason}",
+                session_id.get(..8).unwrap_or(session_id)
+            ),
         };
+        let taken = matches!(self.connection, Connection::Taken { .. });
         let stopped = matches!(self.connection, Connection::Stopped(_));
         let dialogs: Vec<AnyElement> = self
             .dialogs
             .iter()
             .map(|(id, dialog)| self.render_dialog(id, dialog, cx))
             .collect();
-        let stoppable = matches!(self.turn, Turn::Streaming | Turn::Failed(_));
+        let stoppable = matches!(self.turn, Turn::Queued | Turn::Streaming | Turn::Failed(_));
         let images = self.images.len();
         let footer = format!(
             "{} · {} · imported {} agent edit(s){}",
@@ -809,11 +847,36 @@ impl Render for CedianPanel {
             .child(
                 h_flex()
                     .gap_2()
-                    .child(Label::new(footer).size(LabelSize::Small).color(if stopped {
-                        Color::Error
-                    } else {
-                        Color::Muted
-                    }))
+                    .child(
+                        Label::new(footer)
+                            .size(LabelSize::Small)
+                            .color(if stopped || taken {
+                                Color::Error
+                            } else {
+                                Color::Muted
+                            }),
+                    )
+                    .when(taken, |row| {
+                        row.child(
+                            div()
+                                .debug_selector(|| "cedian-new-session".to_string())
+                                .child(
+                                    Button::new("cedian-new-session", "Start a new session")
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.start_new_session(cx)
+                                            }),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(|| "cedian-retry".to_string())
+                                .child(Button::new("cedian-retry", "Retry").on_click(
+                                    cx.listener(|this, _, _, cx| this.retry_session(cx)),
+                                )),
+                        )
+                    })
                     .when(stopped, |row| {
                         row.child(
                             Button::new("cedian-restart", "Restart OMP").on_click(
@@ -964,7 +1027,7 @@ mod tests {
                         .input
                         .update(cx, |editor, cx| editor.set_text(text, window, cx));
                     panel.send(window, cx);
-                    assert_eq!(panel.turn, Turn::Streaming, "{:?}", panel.notice);
+                    assert_eq!(panel.turn, Turn::Queued, "{:?}", panel.notice);
                 })
                 .unwrap();
         };

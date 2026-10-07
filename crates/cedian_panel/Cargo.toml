@@ -60,3 +60,7 @@ harness = false
 [[test]]
 name = "agent_loop"
 harness = false
+
+[[test]]
+name = "one_driver"
+harness = false

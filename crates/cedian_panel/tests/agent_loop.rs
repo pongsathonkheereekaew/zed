@@ -183,14 +183,16 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
             panel.turn().clone()
         })
         .unwrap();
-    assert_eq!(turn, Turn::Streaming);
+    assert_eq!(turn, Turn::Queued);
     assert!(
         window
             .update(cx, |p, _, _| p.attached_images().is_empty())
             .unwrap(),
         "sent with the prompt"
     );
-    vcx.run_until_parked();
+    wait(cx, &window, "OMP to start the turn", |p| {
+        p.turn() == &Turn::Streaming
+    });
     click(&mut vcx, "cedian-stop");
     wait(cx, &window, "the stopped turn to go idle", |p| {
         p.turn() == &Turn::Idle
@@ -357,7 +359,7 @@ fn prompt(cx: &mut TestAppContext, window: &WindowHandle<CedianPanel>, text: &st
             panel.turn().clone()
         })
         .unwrap();
-    assert_eq!(turn, Turn::Streaming);
+    assert_eq!(turn, Turn::Queued);
 }
 
 fn rendered(

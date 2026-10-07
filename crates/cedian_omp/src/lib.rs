@@ -10,6 +10,7 @@
 )]
 
 pub mod dialog;
+pub mod driver;
 pub mod errors;
 pub mod event_router;
 pub mod omp_config;

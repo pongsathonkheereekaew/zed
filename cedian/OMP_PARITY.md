@@ -19,7 +19,7 @@ The one home for **per-feature OMP coverage** ([ADR-0034](https://github.com/pon
 | `remove_queued_message`, `promote_queued_message` | queued-message chips | planned S9 |
 | `set_steering_mode`, `set_follow_up_mode`, `set_interrupt_mode` | composer settings | planned S9 |
 | `get_state` | runtime state / status line | headless |
-| `new_session`, `open_session` | new task / resume task; the app opens the workspace's session on launch and Restart adopts it (S9 U3) | native (`open_session`, U3), headless (`new_session`) |
+| `new_session`, `open_session` | new task / resume task; the app opens the workspace's session on launch and Restart adopts it (S9 U3). OMP lets a second process resume a live session; the app does not: after a resume and before each prompt it lists the processes holding the session file or OMP's owner lease (`~/.omp/run/session-owners/<id>.lock`, `lsof`), and any but its own OMP refuses the session with "Start a new session" (`new_session`) and "Retry" (ADR-0040 decision 5, S9 U4). Gap: a process that resumed but has not written yet holds neither file | native (`open_session` U3, one-driver check and `new_session` U4) |
 | `switch_session`, `set_session_name` | session manager | planned S9 |
 | `branch`, `fork`, `get_branch_messages`, `get_tree` | thread tree: branch, fork, checkpoints | planned S9 |
 | `get_entries`, `get_messages`, `get_messages_page`, `get_last_assistant_text` | thread history and paging | planned S9 |

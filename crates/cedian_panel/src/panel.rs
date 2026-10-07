@@ -6,20 +6,26 @@
 //! own thread, the user's `cedian.toml`, the spawn profile. Events cross into
 //! GPUI over a channel; edit-class tool events drive [`crate::import`]. When
 //! OMP dies the panel says why and offers Restart; the IDE keeps running.
+//!
+//! OMP's dialogs (approvals, `confirm`, `input`, `editor`, `ask`) are answered
+//! here (U4, §63): several can be open at once, keyed by request id. A turn
+//! can be stopped, and images pasted into the composer go with the prompt.
 
+use crate::dialogs::OpenDialog;
 use crate::import::{self, ImportOutcome, Mark};
 use crate::omp_link::{LaunchSpec, LinkEvent, OmpLink, Prompt};
 use crate::omp_settings::OmpSettings;
 use cedian_agent::Thread;
-use cedian_omp::RouterEvent;
-use collections::HashMap;
-use editor::Editor;
+use cedian_omp::{RouterEvent, UserAnswer};
+use collections::{HashMap, IndexMap};
+use editor::{Editor, actions::Paste};
 use futures::{StreamExt, channel::mpsc};
 use gpui::{
-    Action, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable, Pixels,
-    Render, Task, WeakEntity, Window, actions, px,
+    Action, AnyElement, App, AsyncWindowContext, ClipboardEntry, Context, ElementId, Entity,
+    EventEmitter, FocusHandle, Focusable, Pixels, Render, Task, WeakEntity, Window, actions, px,
 };
 use language::Buffer;
+use omp_rpc::{ExtensionUiRequest, ImageContent};
 use project::Project;
 use std::path::PathBuf;
 use text::TransactionId;
@@ -83,6 +89,10 @@ pub struct CedianPanel {
     imported: Vec<ImportedEdit>,
     stale: usize,
     status: String,
+    /// OMP's dialogs waiting on the person, by request id, oldest first.
+    dialogs: IndexMap<String, OpenDialog>,
+    /// Images pasted into the composer, sent with the next prompt.
+    images: Vec<ImageContent>,
     /// The OMP settings page, shown instead of the thread when open.
     settings: Option<Entity<OmpSettings>>,
     show_settings: bool,
@@ -119,12 +129,14 @@ impl CedianPanel {
             imported: Vec::new(),
             stale: 0,
             status: "idle".to_string(),
+            dialogs: IndexMap::default(),
+            images: Vec::new(),
             settings: None,
             show_settings: false,
             _events: None,
         };
         if this.workspace_root(cx).is_some() {
-            this.start(cx);
+            this.start(window, cx);
         }
         this
     }
@@ -147,6 +159,16 @@ impl CedianPanel {
     /// Send the prompt box, as the Send button does.
     pub fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.send(window, cx);
+    }
+
+    /// The open dialogs' request ids, oldest first.
+    pub fn dialog_ids(&self) -> Vec<String> {
+        self.dialogs.keys().cloned().collect()
+    }
+
+    /// Images attached to the next prompt.
+    pub fn attached_images(&self) -> &[ImageContent] {
+        &self.images
     }
 
     /// OMP's process id while it runs.
@@ -181,8 +203,9 @@ impl CedianPanel {
     }
 
     /// Start (or restart) OMP for the open folder.
-    fn start(&mut self, cx: &mut Context<Self>) {
+    fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.link = None;
+        self.dialogs.clear();
         let Some(root) = self.workspace_root(cx) else {
             self.connection = Connection::Stopped("open a folder first".to_string());
             return;
@@ -198,10 +221,10 @@ impl CedianPanel {
         let (event_tx, mut event_rx) = mpsc::unbounded::<LinkEvent>();
         self.link = Some(OmpLink::start(spec, event_tx));
         self.connection = Connection::Starting;
-        self._events = Some(cx.spawn(async move |this, cx| {
+        self._events = Some(cx.spawn_in(window, async move |this, cx| {
             while let Some(event) = event_rx.next().await {
                 if this
-                    .update(cx, |this, cx| this.on_link_event(event, cx))
+                    .update_in(cx, |this, window, cx| this.on_link_event(event, window, cx))
                     .is_err()
                 {
                     break;
@@ -212,11 +235,11 @@ impl CedianPanel {
     }
 
     /// The Restart button: a fresh OMP on the same session.
-    pub fn restart(&mut self, cx: &mut Context<Self>) {
-        self.start(cx);
+    pub fn restart(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.start(window, cx);
     }
 
-    fn on_link_event(&mut self, event: LinkEvent, cx: &mut Context<Self>) {
+    fn on_link_event(&mut self, event: LinkEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
             LinkEvent::Ready {
                 session_id,
@@ -231,7 +254,22 @@ impl CedianPanel {
                 };
             }
             LinkEvent::Failed(reason) => self.stop(reason),
-            LinkEvent::AuditFailed(e) => self.status = format!("error: audit: {e}"),
+            LinkEvent::AuditFailed(e) => {
+                // ADR-0035: an unaudited turn fails; it does not stream on.
+                self.status = format!("error: audit: {e}; turn stopped");
+                self.abort(cx);
+            }
+            LinkEvent::Event(RouterEvent::UiRequest(ExtensionUiRequest::Cancel(cancel))) => {
+                self.dialogs.shift_remove(&cancel.target_id);
+            }
+            LinkEvent::Event(RouterEvent::UiRequest(request)) => {
+                let id = cedian_omp::dialog::dialog(&request).map(|(id, _)| id.to_string());
+                if let Some(id) = id
+                    && let Some(dialog) = OpenDialog::new(request, window, cx)
+                {
+                    self.dialogs.insert(id, dialog);
+                }
+            }
             LinkEvent::Event(RouterEvent::Disconnected) => {
                 self.thread.apply(&RouterEvent::Disconnected);
                 self.stop("OMP stopped: its process exited".to_string());
@@ -250,6 +288,7 @@ impl CedianPanel {
 
     fn stop(&mut self, reason: String) {
         self.link = None;
+        self.dialogs.clear();
         self.marks.clear();
         self.status = "idle".to_string();
         self.connection = Connection::Stopped(reason);
@@ -261,13 +300,13 @@ impl CedianPanel {
             return;
         }
         if self.connection == Connection::NotStarted {
-            self.start(cx);
+            self.start(window, cx);
         }
         let sent = match (&self.connection, &self.link) {
             (Connection::Stopped(reason), _) => Err(format!("{reason}; restart OMP")),
             (_, Some(link)) => link.send(Prompt {
                 text: text.clone(),
-                images: Vec::new(),
+                images: self.images.clone(),
             }),
             (_, None) => Err("OMP is not running; restart it".to_string()),
         };
@@ -277,6 +316,7 @@ impl CedianPanel {
             return;
         }
         self.input.update(cx, |editor, cx| editor.clear(window, cx));
+        self.images.clear();
         self.thread.push_user(&text);
         self.status = "streaming".to_string();
         cx.notify();
@@ -316,11 +356,172 @@ impl CedianPanel {
                     }
                 }
             }
-            RouterEvent::Settled => self.status = "idle".to_string(),
+            RouterEvent::Settled if self.status == "streaming" || self.status == "stopping" => {
+                self.status = "idle".to_string()
+            }
             _ => {}
         }
         self.thread.apply(&event);
         cx.notify();
+    }
+
+    /// The Stop button: abort the running turn. The status goes idle when
+    /// OMP reports the session settled.
+    pub fn stop_turn(&mut self, cx: &mut Context<Self>) {
+        self.status = "stopping".to_string();
+        self.abort(cx);
+        cx.notify();
+    }
+
+    fn abort(&mut self, cx: &mut Context<Self>) {
+        let Some(control) = self.link.as_ref().and_then(OmpLink::control) else {
+            return;
+        };
+        let aborted = cx.background_spawn(async move { control.abort() });
+        cx.spawn(async move |this, cx| {
+            if let Err(e) = aborted.await {
+                this.update(cx, |this, cx| {
+                    this.status = format!("error: stop: {e}");
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Answer dialog `id` as its buttons do. An answer OMP did not get
+    /// leaves the dialog open with the reason on it.
+    pub fn answer(&mut self, id: &str, answer: UserAnswer, cx: &mut Context<Self>) {
+        let sent = match &self.link {
+            Some(link) => link.answer(id, answer),
+            None => Err("OMP is not running".to_string()),
+        };
+        match sent {
+            Ok(()) => {
+                self.dialogs.shift_remove(id);
+            }
+            Err(e) => {
+                if let Some(dialog) = self.dialogs.get_mut(id) {
+                    dialog.error = Some(e);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn submit_dialog(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(dialog) = self.dialogs.get_mut(id) else {
+            return;
+        };
+        match dialog.submission(cx) {
+            Ok(answer) => self.answer(id, answer, cx),
+            Err(e) => {
+                dialog.error = Some(e);
+                cx.notify();
+            }
+        }
+    }
+
+    /// Paste in the panel: clipboard images attach to the next prompt; text
+    /// goes on to the focused editor as usual.
+    fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
+        let images: Vec<_> = cx
+            .read_from_clipboard()
+            .into_iter()
+            .flat_map(|item| item.into_entries())
+            .filter_map(|entry| match entry {
+                ClipboardEntry::Image(image) => Some(cedian_omp::image_content(
+                    image.format.mime_type(),
+                    &image.bytes,
+                )),
+                _ => None,
+            })
+            .collect();
+        if images.is_empty() {
+            cx.propagate();
+            return;
+        }
+        self.images.extend(images);
+        cx.notify();
+    }
+
+    fn render_dialog(&self, id: &str, dialog: &OpenDialog, cx: &mut Context<Self>) -> AnyElement {
+        let button = |label: &str, answer: Option<UserAnswer>| {
+            let id = id.to_string();
+            let element = ElementId::Name(format!("cedian-dialog-{id}-{label}").into());
+            div()
+                .debug_selector(|| format!("cedian-dialog-{id}-{label}"))
+                .child(
+                    Button::new(element, label.to_string()).on_click(cx.listener(
+                        move |this, _, _, cx| match answer.clone() {
+                            Some(answer) => this.answer(&id, answer, cx),
+                            None => this.submit_dialog(&id, cx),
+                        },
+                    )),
+                )
+        };
+        let mut body = v_flex()
+            .debug_selector(|| format!("cedian-dialog-{id}"))
+            .p_2()
+            .gap_1()
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .child(Label::new(dialog.title().to_string()));
+        let mut buttons = h_flex().gap_2().flex_wrap();
+        match dialog.request() {
+            ExtensionUiRequest::Select(r) => {
+                for option in &r.options {
+                    buttons =
+                        buttons.child(button(option, Some(UserAnswer::Choice(option.clone()))));
+                }
+            }
+            ExtensionUiRequest::Confirm(r) => {
+                body = body.child(Label::new(r.message.clone()).color(Color::Muted));
+                buttons = buttons
+                    .child(button("Yes", Some(UserAnswer::Confirm(true))))
+                    .child(button("No", Some(UserAnswer::Confirm(false))));
+            }
+            _ => {}
+        }
+        if let Some(ask) = dialog.ask() {
+            for (n, question) in ask.questions().iter().enumerate() {
+                let mut options = h_flex().gap_1().flex_wrap();
+                for option in &question.options {
+                    let (id, qid, label) = (id.to_string(), question.id.clone(), option.clone());
+                    let element = ElementId::Name(format!("cedian-ask-{id}-{qid}-{label}").into());
+                    options = options.child(
+                        Button::new(element, option.clone())
+                            .toggle_state(question.selected.contains(option))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(dialog) = this.dialogs.get_mut(&id) {
+                                    dialog.toggle_option(&qid, &label);
+                                    dialog.error = None;
+                                }
+                                cx.notify();
+                            })),
+                    );
+                }
+                body = body
+                    .child(Label::new(question.question.clone()))
+                    .child(options)
+                    .when_some(dialog.custom_box(n).cloned(), |body, editor| {
+                        body.child(editor)
+                    });
+            }
+        }
+        if let Some(text) = dialog.text_box() {
+            body = body.child(text.clone());
+        }
+        if dialog.text_box().is_some() || dialog.ask().is_some() {
+            buttons = buttons.child(button("Submit", None));
+        }
+        buttons = buttons.child(button("Dismiss", Some(UserAnswer::Dismiss)));
+        body.child(buttons)
+            .when_some(dialog.error.clone(), |body, error| {
+                body.child(Label::new(error).color(Color::Error))
+            })
+            .into_any_element()
     }
 
     fn import(
@@ -392,6 +593,13 @@ impl Render for CedianPanel {
             Connection::Stopped(reason) => reason.clone(),
         };
         let stopped = matches!(self.connection, Connection::Stopped(_));
+        let dialogs: Vec<AnyElement> = self
+            .dialogs
+            .iter()
+            .map(|(id, dialog)| self.render_dialog(id, dialog, cx))
+            .collect();
+        let streaming = self.status == "streaming";
+        let images = self.images.len();
         let footer = format!(
             "{} · {} · imported {} agent edit(s){}",
             connection,
@@ -406,6 +614,7 @@ impl Render for CedianPanel {
         v_flex()
             .key_context("CedianPanel")
             .track_focus(&self.focus_handle)
+            .capture_action(cx.listener(Self::paste))
             .size_full()
             .p_2()
             .gap_2()
@@ -436,6 +645,25 @@ impl Render for CedianPanel {
                         .children(rows),
                 )
             })
+            .children(dialogs)
+            .when(images > 0, |panel| {
+                panel.child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Label::new(format!("{images} image(s) attached"))
+                                .size(LabelSize::Small),
+                        )
+                        .child(
+                            Button::new("cedian-clear-images", "Remove images").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.images.clear();
+                                    cx.notify();
+                                }),
+                            ),
+                        ),
+                )
+            })
             .child(
                 h_flex()
                     .gap_2()
@@ -443,7 +671,15 @@ impl Render for CedianPanel {
                     .child(
                         Button::new("cedian-send", "Send")
                             .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
-                    ),
+                    )
+                    .when(streaming, |row| {
+                        row.child(
+                            div().debug_selector(|| "cedian-stop".to_string()).child(
+                                Button::new("cedian-stop", "Stop")
+                                    .on_click(cx.listener(|this, _, _, cx| this.stop_turn(cx))),
+                            ),
+                        )
+                    }),
             )
             .child(
                 h_flex()
@@ -455,8 +691,9 @@ impl Render for CedianPanel {
                     }))
                     .when(stopped, |row| {
                         row.child(
-                            Button::new("cedian-restart", "Restart OMP")
-                                .on_click(cx.listener(|this, _, _, cx| this.restart(cx))),
+                            Button::new("cedian-restart", "Restart OMP").on_click(
+                                cx.listener(|this, _, window, cx| this.restart(window, cx)),
+                            ),
                         )
                     }),
             )

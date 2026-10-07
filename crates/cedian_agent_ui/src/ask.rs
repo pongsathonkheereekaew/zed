@@ -86,7 +86,7 @@ pub enum AskState {
 }
 
 /// One `ask` tool call as a native dialog.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AskDialog {
     request_id: String,
     questions: Vec<AskQuestionModel>,

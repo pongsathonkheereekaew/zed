@@ -1,0 +1,36 @@
+{"dir":"out","frame":{"maxFrameBytes":1048576,"maxReassembledFrameBytes":67108864,"protocolVersion":1,"supportedProtocolVersions":[1,2],"type":"ready"}}
+{"dir":"in","frame":{"id":"req_1","protocolVersion":2,"type":"negotiate_protocol"}}
+{"dir":"out","frame":{"id":"159c3f6c83cc2319","method":"setWidget","type":"extension_ui_request","widgetKey":"autoresearch"}}
+{"dir":"out","frame":{"type":"advisor_cost_changed"}}
+{"dir":"out","frame":{"command":"negotiate_protocol","data":{"protocolVersion":2},"id":"req_1","success":true,"type":"response"}}
+{"dir":"in","frame":{"enabled":true,"id":"req_2","type":"set_ask_dialog"}}
+{"dir":"out","frame":{"command":"set_ask_dialog","data":{"enabled":true},"id":"req_2","success":true,"type":"response"}}
+{"dir":"in","frame":{"id":"req_3","type":"get_state"}}
+{"dir":"out","frame":{"command":"get_state","id":"req_3","success":true,"type":"response","data":{"sessionId":"01a113c8-6171-72ca-9b6b-1c696dd443e1","sessionFile":"${CEDIAN_SESSION_DIR}/2026-10-07T00-34-21-681Z_01a113c8-6171-72ca-9b6b-1c696dd443e1.jsonl"}}}
+{"dir":"in","frame":{"id":"req_5","sessionDir":"${CEDIAN_SESSION_DIR}","type":"open_session"}}
+{"dir":"out","frame":{"command":"open_session","data":{"cancelled":false,"resumed":false,"sessionFile":"${CEDIAN_SESSION_DIR}/2026-10-07T00-34-21-681Z_01a113c8-6171-72ca-9b6b-1c696dd443e1.jsonl","sessionId":"01a113c8-6171-72ca-9b6b-1c696dd443e1"},"id":"req_5","success":true,"type":"response"}}
+{"dir":"in","frame":{"id":"req_6","message":"Run sh check.sh","type":"prompt"}}
+{"dir":"out","frame":{"command":"prompt","id":"req_6","success":true,"type":"response"}}
+{"dir":"out","frame":{"type":"agent_start"}}
+{"dir":"out","frame":{"args":{"command":"sh check.sh"},"toolCallId":"call_u4_approve","toolName":"bash","type":"tool_execution_start"}}
+{"dir":"out","frame":{"id":"u4-approve","method":"select","options":["Approve","Deny"],"title":"Allow tool: bash\nCommand: sh check.sh","type":"extension_ui_request"}}
+{"dir":"in","frame":{"id":"u4-approve","type":"extension_ui_response","value":"Approve"}}
+{"dir":"out","frame":{"isError":false,"result":{"content":[{"text":"exit=0","type":"text"}],"details":{}},"toolCallId":"call_u4_approve","toolName":"bash","type":"tool_execution_end"}}
+{"dir":"out","frame":{"agentInvoked":true,"id":"req_6","sessionSettled":true,"status":"completed","type":"prompt_result"}}
+{"dir":"out","frame":{"type":"session_settled"}}
+{"dir":"in","frame":{"id":"req_7","message":"Run rm -rf build","type":"prompt"}}
+{"dir":"out","frame":{"command":"prompt","id":"req_7","success":true,"type":"response"}}
+{"dir":"out","frame":{"type":"agent_start"}}
+{"dir":"out","frame":{"args":{"command":"rm -rf build"},"toolCallId":"call_u4_dismiss","toolName":"bash","type":"tool_execution_start"}}
+{"dir":"out","frame":{"id":"u4-dismiss","method":"select","options":["Approve","Deny"],"title":"Allow tool: bash\nCommand: rm -rf build","type":"extension_ui_request"}}
+{"dir":"in","frame":{"id":"u4-dismiss","type":"extension_ui_response","cancelled":true}}
+{"dir":"out","frame":{"isError":true,"result":{"content":[{"text":"Tool call denied by user: bash","type":"text"}],"details":{}},"toolCallId":"call_u4_dismiss","toolName":"bash","type":"tool_execution_end"}}
+{"dir":"out","frame":{"agentInvoked":true,"id":"req_7","sessionSettled":true,"status":"completed","type":"prompt_result"}}
+{"dir":"out","frame":{"type":"session_settled"}}
+{"dir":"in","frame":{"id":"req_8","message":"What is in this image?","type":"prompt","images":[{"data":"Y2VkaWFuLXU0LWltYWdl","mimeType":"image/png"}]}}
+{"dir":"out","frame":{"command":"prompt","id":"req_8","success":true,"type":"response"}}
+{"dir":"out","frame":{"type":"agent_start"}}
+{"dir":"in","frame":{"id":"req_9","type":"abort"}}
+{"dir":"out","frame":{"command":"abort","id":"req_9","success":true,"type":"response"}}
+{"dir":"out","frame":{"agentInvoked":true,"id":"req_8","sessionSettled":true,"status":"aborted","type":"prompt_result"}}
+{"dir":"out","frame":{"type":"session_settled"}}

@@ -13,7 +13,7 @@ The one home for **per-feature OMP coverage** ([ADR-0034](https://github.com/pon
 | Command(s) | cedian surface | Status |
 |---|---|---|
 | `negotiate_protocol` | runtime handshake (v2) | headless |
-| `prompt`, `abort` | composer send / stop | headless |
+| `prompt`, `abort` | composer send (images pasted into the composer go as `images`) / Stop button while a turn streams; an audit write failure aborts the turn (S9 U4) | native |
 | `steer` | steer while a turn runs | headless |
 | `follow_up`, `abort_and_prompt`, `abort_and_restore_queue` | composer queue actions | planned S9 |
 | `remove_queued_message`, `promote_queued_message` | queued-message chips | planned S9 |
@@ -73,7 +73,7 @@ Frames OMP sends besides the agent events above.
 |---|---|---|
 | `ready`, `rpc_frame_error` | runtime handshake; protocol error banner (fail safe, §5) | headless |
 | `prompt_result`, `session_settled` | turn completion state | headless |
-| `extension_ui_request` | carries the UI requests below | headless |
+| `extension_ui_request` | carries the UI requests below | native (dialogs, S9 U4); see rows below |
 | `extension_error` | extension error toast | planned S9 |
 | `available_commands_update` | slash-command palette refresh | planned S9 |
 | `subagent_lifecycle`, `subagent_progress`, `subagent_event` | subagent tree | planned S5 |
@@ -87,7 +87,7 @@ Frames OMP sends besides the agent events above.
 
 | Request(s) | cedian surface | Status |
 |---|---|---|
-| `select`, `confirm`, `input`, `editor`, `ask`, `cancel` | native dialogs ([§63](https://github.com/pongsathonkheereekaew/cedian/blob/main/docs/ARCHITECTURE.md)) | headless (fail-closed answers) |
+| `select`, `confirm`, `input`, `editor`, `ask`, `cancel` | native dialogs ([§63](https://github.com/pongsathonkheereekaew/cedian/blob/main/docs/ARCHITECTURE.md)): the app panel shows each open dialog (one button per `select` option, Yes/No, a text box, `ask` questions with options and free text, Dismiss on all) and answers it; `audit.jsonl` gets a gate row `answered_by: user`; OMP's `cancel` removes the dialog | native (S9 U4); headless runs answer fail-closed |
 | `notify` | toast | planned S9 |
 | `setStatus`, `setWidget`, `setTitle` | status line, panel widget, window title | planned S9 |
 | `set_editor_text` | composer text | planned S9 |
@@ -99,11 +99,11 @@ Frames OMP sends besides the agent events above.
 |---|---|---|
 | `read`, `grep`/`glob`/`find`, `ast_grep` | tool cards | headless |
 | `edit`, `write`, `ast_edit` | agent transactions, review, undo ([ADR-0027](https://github.com/pongsathonkheereekaew/cedian/blob/main/docs/decisions/0027-zero-omp-fork.md)) | headless (disk), native at S9 |
-| `bash`, `eval` | tool cards; prompts per approval mode | headless |
+| `bash`, `eval` | tool cards; prompts per approval mode, answered in the app's approval dialog (S9 U4) | headless (cards); native (approvals) |
 | `lsp`, `debug` | backed by Zed LSP/DAP via `cedian://` | headless stand-in (row B); native S9 |
 | `task`, `hub`/`wait`, `vibe_spawn`/`vibe_send` | subagent tree | planned S5 |
 | `todo` | Workflow UI | planned S2 |
-| `ask` | native dialog | headless |
+| `ask` | native dialog | native (S9 U4) |
 | `browser` | shared Chromium + browser pane | headless stand-in (row D); native S4/S9 |
 | `computer` (`eval` prelude) | OMP prelude by opt-in; CUA driver later | headless by opt-in ([ADR-0035](https://github.com/pongsathonkheereekaew/cedian/blob/main/docs/decisions/0035-omp-native-approval-opt-in.md), P8): off in the default profile; under `policy = "omp"` OMP's config decides and the badge shows it |
 | `gh` | PR workspace | planned S6 |

@@ -12,7 +12,7 @@ pub mod message;
 pub mod panel;
 pub mod text_buffer;
 pub mod tool_card;
-pub use ask::{AskAnswer, AskDialog, AskQuestionModel, AskState};
+pub use ask::{AskAnswer, AskDialog, AskError, AskQuestionModel, AskState};
 pub use composer::{Composer, ComposerMode};
 pub use message::{MessageModel, MessageRole, ToolCard, ToolCardStatus, render_thread};
 pub use panel::{Panel, PanelTask};

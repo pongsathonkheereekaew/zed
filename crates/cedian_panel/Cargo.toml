@@ -56,3 +56,7 @@ harness = false
 [[test]]
 name = "settings_page"
 harness = false
+
+[[test]]
+name = "agent_loop"
+harness = false

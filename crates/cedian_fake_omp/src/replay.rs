@@ -2,8 +2,9 @@
 //!
 //! Server (`out`) frames are emitted in recorded order. At each recorded host
 //! (`in`) frame, replay blocks for the host's next line and checks its `type`
-//! matches, and a dialog answer matches whole; the host's fresh request id is
-//! mapped onto the recorded one so the recorded `response` frames correlate.
+//! matches, and a dialog answer (and a prompt's recorded images) matches
+//! whole; the host's fresh request id is mapped onto the recorded one so the
+//! recorded `response` frames correlate.
 //! Any divergence exits with [`crate::EXIT_DIVERGED`] — the host sees a
 //! closed transport, never a hang.
 
@@ -40,7 +41,11 @@ pub(crate) fn run(fixture: &Path, cwd: &Path, placeholders: &Placeholders) -> i3
             }
             Dir::Out => {
                 let mut frame = placeholders.expand_value(&record.frame);
-                if frame.get("type").and_then(Value::as_str) == Some("response") {
+                // A prompt's result names the prompt's request id too.
+                if matches!(
+                    frame.get("type").and_then(Value::as_str),
+                    Some("response" | "prompt_result")
+                ) {
                     remap_id(&mut frame, &ids);
                 }
                 if writeln!(stdout, "{frame}")
@@ -81,6 +86,15 @@ pub(crate) fn run(fixture: &Path, cwd: &Path, placeholders: &Placeholders) -> i3
                         );
                         return crate::EXIT_DIVERGED;
                     }
+                }
+                // Images the recording prompted with must reach OMP too.
+                let expected = record.frame.get("images");
+                if expected.is_some() && got.get("images") != expected {
+                    eprintln!(
+                        "fake-omp replay: divergence at record {n}: expected images {expected:?}, host sent {:?}",
+                        got.get("images")
+                    );
+                    return crate::EXIT_DIVERGED;
                 }
                 if let (Some(rec), Some(now)) = (
                     record.frame.get("id").and_then(Value::as_str),

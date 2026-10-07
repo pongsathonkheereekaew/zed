@@ -123,7 +123,9 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
 
     // Restart: a fresh OMP adopts the same session.
     cedian_fake_omp::install_replay(&session_dir, Path::new(RESUME)).unwrap();
-    window.update(cx, |panel, _, cx| panel.restart(cx)).unwrap();
+    window
+        .update(cx, |panel, window, cx| panel.restart(window, cx))
+        .unwrap();
     let again = wait_ready(cx, &window, "restart");
     assert!(
         matches!(&again, Connection::Ready { session_id: s, resumed: true, .. } if *s == session_id),

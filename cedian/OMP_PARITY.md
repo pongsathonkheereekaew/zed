@@ -34,7 +34,7 @@ The one home for **per-feature OMP coverage** ([ADR-0034](https://github.com/pon
 | `set_cache_warming`, `set_auto_retry`, `abort_retry` | runtime settings, retry banner | planned S9 |
 | `goal` | Goal mode ([ADR-0014](https://github.com/pongsathonkheereekaew/cedian/blob/main/docs/decisions/0014-agent-modes.md)) | planned S9 |
 | `set_todos` | todo list in Workflow UI | planned S2 |
-| `set_host_tools`, `set_host_uri_schemes` | cedian host tools, `cedian://` | headless |
+| `set_host_tools`, `set_host_uri_schemes` | cedian host tools, `cedian://`; `cedian_apply_edit` takes `expected_version` as the buffer's version token (`0` for a buffer no edit has touched, else `replica.seq` pairs), and a malformed or outdated token refuses the edit (S9 U5) | headless |
 | `set_ask_dialog` | native ask dialogs | headless |
 | `set_event_filter` | router subscription | planned S9 |
 | `get_available_commands` | slash commands in palette and composer | planned S9 |
@@ -51,7 +51,7 @@ The one home for **per-feature OMP coverage** ([ADR-0034](https://github.com/pon
 |---|---|---|
 | `agent_start`, `agent_end`, `turn_start`, `turn_end` | turn lifecycle | headless |
 | `message_start`, `message_update`, `message_end` | streaming thread | headless |
-| `tool_execution_start`, `tool_execution_update`, `tool_stream_update`, `tool_execution_end` | tool cards, edit import, provenance | headless |
+| `tool_execution_start`, `tool_execution_update`, `tool_stream_update`, `tool_execution_end` | tool cards; `tool_execution_start` of `edit`/`write`/`ast_edit` names the files the call writes (the app opens the ones not open and marks every open buffer before the write), `tool_execution_end` imports the write as one buffer transaction attributed to the `toolCallId` in the task's review (S9 U5) | native (S9 U5); headless (cards) |
 | `auto_compaction_start`, `auto_compaction_end` | compaction notice | planned S9 |
 | `auto_retry_start`, `auto_retry_end`, `retry_fallback_applied`, `retry_fallback_succeeded` | retry / fallback banner | planned S9 |
 | `cache_warming_start`, `cache_warming_end` | status line | planned S9 |
@@ -98,7 +98,7 @@ Frames OMP sends besides the agent events above.
 | Tool | cedian surface | Status |
 |---|---|---|
 | `read`, `grep`/`glob`/`find`, `ast_grep` | tool cards | headless |
-| `edit`, `write`, `ast_edit` | agent transactions, review, undo ([ADR-0027](https://github.com/pongsathonkheereekaew/cedian/blob/main/docs/decisions/0027-zero-omp-fork.md)) | headless (disk), native at S9 |
+| `edit`, `write`, `ast_edit` | one agent transaction per call on the Zed buffer, native undo; Review Changes per task with Accept/Reject per hunk, Accept all (skips STALE), Revert turn; a hunk the user edited after the agent is STALE and never rejected; a write over unsaved edits is refused and the file shows STALE with the reason ([ADR-0006](https://github.com/pongsathonkheereekaew/cedian/blob/main/docs/decisions/0006-review-baseline-provenance-precedence.md), [ADR-0027](https://github.com/pongsathonkheereekaew/cedian/blob/main/docs/decisions/0027-zero-omp-fork.md)) | native (S9 U5); headless CLI review commands still on the disk model (follow-up) |
 | `bash`, `eval` | tool cards (the summary is the output, without OMP's `Wall time:` footer); prompts per approval mode, answered in the app's approval dialog (S9 U4; a real OMP 18.6.1 approval recorded and replayed in the app: `cedian_panel/tests/live_approval.rs`) | headless (cards); native (approvals) |
 | `lsp`, `debug` | backed by Zed LSP/DAP via `cedian://` | headless stand-in (row B); native S9 |
 | `task`, `hub`/`wait`, `vibe_spawn`/`vibe_send` | subagent tree | planned S5 |

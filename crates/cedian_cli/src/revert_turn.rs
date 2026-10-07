@@ -139,8 +139,7 @@ mod tests {
     use crate::session::ReviewStore;
 
     fn workdir(tag: &str) -> crate::test_dir::TestDir {
-        let dir = crate::test_dir::TestDir::new(&format!("revert-{tag}"));
-        dir
+        crate::test_dir::TestDir::new(&format!("revert-{tag}"))
     }
 
     fn file(key: &str, before: &str, after: &str, created: bool) -> TurnFile {

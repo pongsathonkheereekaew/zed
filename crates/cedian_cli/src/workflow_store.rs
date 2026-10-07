@@ -73,8 +73,7 @@ mod tests {
     use cedian_workflow::{Complexity, Risk, TaskKind, TaskProfile};
 
     fn dir(tag: &str) -> crate::test_dir::TestDir {
-        let d = crate::test_dir::TestDir::new(&format!("wf-store-{tag}"));
-        d
+        crate::test_dir::TestDir::new(&format!("wf-store-{tag}"))
     }
 
     #[test]

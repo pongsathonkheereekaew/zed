@@ -1395,7 +1395,7 @@ fn cmd_browser(workdir: &Path, args: &[String]) -> Result<(), String> {
             let head = browser_store::load(workdir)?;
             let (proc, session, ws_url) = browser_store::spawn_fresh(workdir, &head.url)?;
             let shot = session
-                .screenshot(&state::file(workdir, "shots")?)
+                .screenshot(&state::dir(workdir)?.join("shots"))
                 .map_err(|e| e.to_string())?;
             browser_store::save(
                 workdir,

@@ -209,8 +209,7 @@ mod tests {
     use super::*;
 
     fn tmp(tag: &str) -> crate::test_dir::TestDir {
-        let dir = crate::test_dir::TestDir::new(&format!("review-store-{tag}"));
-        dir
+        crate::test_dir::TestDir::new(&format!("review-store-{tag}"))
     }
 
     #[test]

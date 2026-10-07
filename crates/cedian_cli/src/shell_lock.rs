@@ -105,8 +105,7 @@ mod tests {
     use super::*;
 
     fn dir(tag: &str) -> crate::test_dir::TestDir {
-        let d = crate::test_dir::TestDir::new(&format!("lock-{tag}"));
-        d
+        crate::test_dir::TestDir::new(&format!("lock-{tag}"))
     }
 
     fn write_lock(d: &Path, pid: u32) {

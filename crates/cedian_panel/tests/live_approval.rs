@@ -39,6 +39,7 @@ fn main() {
         Some("config") => std::process::exit(cedian_fake_omp::config_get(&args)),
         _ => {}
     }
+    scrub_removes_the_persons_setup();
     let record = std::env::var_os("CEDIAN_U4_RECORD").is_some();
     let root = std::env::temp_dir().join(format!("cedian-u4-live-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -145,7 +146,7 @@ async fn scenario(cx: &mut TestAppContext, root: &Path, record: bool) {
     if record {
         let recorded =
             std::fs::read_to_string(sessions.join(cedian_fake_omp::RECORDED_FILE)).unwrap();
-        std::fs::write(FIXTURE, recorded).unwrap();
+        std::fs::write(FIXTURE, scrub(&recorded)).unwrap();
         eprintln!("fixture written: {FIXTURE}");
     }
     let transcript = window.update(cx, |p, _, _| p.transcript()).unwrap();
@@ -181,6 +182,44 @@ async fn scenario(cx: &mut TestAppContext, root: &Path, record: bool) {
         window.update(cx, |p, _, _| p.connection().clone()).unwrap(),
         Connection::Ready { .. }
     ));
+}
+
+/// What the recorder's redaction leaves but the fixture must not carry:
+/// get_state's system prompt (the person's global prefs and memory setup)
+/// and tool dump, and the installed skills in OMP's command lists.
+fn scrub(recorded: &str) -> String {
+    recorded
+        .lines()
+        .map(|line| {
+            let mut record: Value = serde_json::from_str(line).unwrap();
+            let frame = &mut record["frame"];
+            if frame["command"] == "get_state"
+                && let Some(data) = frame.get_mut("data").and_then(Value::as_object_mut)
+            {
+                data.insert("systemPrompt".into(), "${SCRUBBED}".into());
+                data.insert("dumpTools".into(), Value::Array(Vec::new()));
+            }
+            if frame["type"] == "available_commands_update" {
+                frame["commands"] = Value::Array(Vec::new());
+            }
+            format!("{record}\n")
+        })
+        .collect()
+}
+
+/// Run on every invocation, replay included: a re-record cannot leak.
+fn scrub_removes_the_persons_setup() {
+    let recorded = concat!(
+        r#"{"dir":"out","frame":{"type":"response","command":"get_state","data":{"systemPrompt":"my memory","dumpTools":[{"name":"x"}],"sessionId":"s"}}}"#,
+        "\n",
+        r#"{"dir":"out","frame":{"type":"available_commands_update","commands":[{"name":"my-skill"}]}}"#,
+        "\n"
+    );
+    let scrubbed = scrub(recorded);
+    for secret in ["my memory", "\"x\"", "my-skill"] {
+        assert!(!scrubbed.contains(secret), "{secret} in {scrubbed}");
+    }
+    assert!(scrubbed.contains("\"sessionId\":\"s\""));
 }
 
 fn rendered(

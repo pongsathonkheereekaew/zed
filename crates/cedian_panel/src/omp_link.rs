@@ -219,15 +219,18 @@ impl GateState {
             None => self.open.drain().map(|(_, request)| request).collect(),
         };
         let any = !requests.is_empty();
+        let mut first_error = None;
         for request in &requests {
             if let Some((reply, record)) = cedian_omp::abandoned(request, timed_out) {
                 if let Err(e) = send(reply) {
                     log::warn!("cedian: OMP did not get the dialog's cancel: {e}");
                 }
-                self.record(record)?;
+                if let Err(e) = self.record(record) {
+                    first_error.get_or_insert(e);
+                }
             }
         }
-        Ok(any)
+        first_error.map_or(Ok(any), Err)
     }
 }
 
@@ -605,6 +608,21 @@ mod tests {
         );
         assert_eq!(rows(&dir), [abstain()]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn closing_every_dialog_with_the_audit_failing_still_cancels_each() {
+        let mut gate = GateState::default();
+        gate.observe(&approval("d1")).unwrap();
+        gate.observe(&approval("d2")).unwrap();
+        let sent = std::cell::RefCell::new(Vec::new());
+        let result = gate.abandon(None, false, |reply| {
+            sent.borrow_mut().push(reply);
+            Ok(())
+        });
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(sent.borrow().len(), 2, "every dialog got its cancel");
+        assert!(gate.open.is_empty());
     }
 
     fn ready(

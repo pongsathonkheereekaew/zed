@@ -19,7 +19,7 @@ struct Stored<S> {
 }
 
 fn verify_path(workdir: &Path) -> Result<PathBuf, String> {
-    Ok(crate::state::dir(workdir)?.join("verify.json"))
+    crate::state::file(workdir, "verify.json")
 }
 
 /// `verify-<app>` with a plain name: no path can escape `.omp/skills/`.
@@ -77,11 +77,10 @@ mod tests {
 
     #[test]
     fn roundtrip_reads_skills_and_rejects_escapes() {
-        let d = std::env::temp_dir().join(format!("cedian-verify-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
+        let d = crate::test_dir::TestDir::new("verify");
         std::fs::create_dir_all(d.join(".omp/skills/verify-notes")).unwrap();
         std::fs::write(d.join(".omp/skills/verify-notes/SKILL.md"), "# v").unwrap();
-        let store = DiskProfileStore(d.clone());
+        let store = DiskProfileStore(d.to_path_buf());
         assert_eq!(store.load().unwrap(), ProfileLedger::default());
         let ledger = ProfileLedger {
             seq: 7,
@@ -94,6 +93,5 @@ mod tests {
         assert_eq!(store.skill("bug-fix"), None);
         std::fs::write(verify_path(&d).unwrap(), r#"{"snapshot_version":0}"#).unwrap();
         assert!(store.load().unwrap_err().contains("too old"));
-        let _ = std::fs::remove_dir_all(&d);
     }
 }

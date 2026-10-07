@@ -20,7 +20,7 @@ chmod +x "$HOOK_DIR/pre-push"
 cat > "$HOOK_DIR/pre-commit" <<'HOOK'
 #!/bin/sh
 # Only commits that touch cedian code pay for the check.
-if git diff --cached --name-only | grep -qE '^(crates/cedian_|vendor/|script/cedian-|cedian/|Cargo.lock)'; then
+if git diff --cached --name-only | grep -qE '^(crates/cedian_|vendor/omp-|script/cedian-|cedian/|Cargo.lock)'; then
   script/cedian-check >/dev/null 2>&1 || { echo "pre-commit: script/cedian-check failed" >&2; exit 1; }
   echo "pre-commit: cedian-check green"
 fi

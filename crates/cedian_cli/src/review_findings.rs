@@ -21,7 +21,7 @@ pub struct FindingStore {
 }
 
 fn findings_path(workdir: &Path) -> Result<PathBuf, String> {
-    Ok(crate::state::dir(workdir)?.join("findings.json"))
+    crate::state::file(workdir, "findings.json")
 }
 
 pub fn load(workdir: &Path) -> Result<FindingStore, String> {
@@ -343,9 +343,7 @@ mod tests {
 
     #[test]
     fn store_roundtrips_and_other_versions_fail_closed() {
-        let dir = std::env::temp_dir().join(format!("cedian-findings-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new("findings");
         let mut store = FindingStore::default();
         record(
             &mut store,
@@ -358,6 +356,5 @@ mod tests {
         assert_eq!(load(&dir).unwrap().findings.len(), 1);
         std::fs::write(findings_path(&dir).unwrap(), r#"{"findings":[]}"#).unwrap();
         assert!(load(&dir).unwrap_err().contains("cedian review reset"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -46,7 +46,7 @@ pub struct BrowserHead {
 pub const BROWSER_SNAPSHOT_VERSION: u32 = 1;
 
 fn browser_path(workdir: &Path) -> Result<PathBuf, String> {
-    Ok(crate::state::dir(workdir)?.join("browser.json"))
+    crate::state::file(workdir, "browser.json")
 }
 
 /// Load the head, or fail with a usage hint when no session was opened.
@@ -124,8 +124,7 @@ pub fn spawn_fresh(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let profile =
-        crate::state::dir(workdir)?.join(format!("chrome-{}-{nanos}", std::process::id()));
+    let profile = crate::state::file(workdir, &format!("chrome-{}-{nanos}", std::process::id()))?;
     let proc = match BrowserProcess::spawn(CHROME_EXE, &profile) {
         Ok(proc) => proc,
         Err(e) => {
@@ -167,14 +166,12 @@ mod tests {
 
     #[test]
     fn unversioned_head_fails_closed() {
-        let dir = std::env::temp_dir().join(format!("cedian-browser-stale-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new("browser-stale");
         std::fs::write(
             browser_path(&dir).unwrap(),
             r#"{"port":9222,"ws_url":"ws://x","url":"about:blank","seq":1}"#,
         )
         .unwrap();
         assert!(load(&dir).unwrap_err().contains("too old"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

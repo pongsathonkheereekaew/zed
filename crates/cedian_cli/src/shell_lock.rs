@@ -20,7 +20,7 @@ struct LockFile {
 }
 
 fn lock_path(workdir: &Path) -> Result<PathBuf, String> {
-    Ok(crate::state::dir(workdir)?.join("shell.lock"))
+    crate::state::file(workdir, "shell.lock")
 }
 
 /// Whether `pid` names a running process (`kill -0`; no `unsafe` needed).
@@ -104,10 +104,8 @@ pub fn refuse_if_shell_live(workdir: &Path, command: &str) -> Result<(), String>
 mod tests {
     use super::*;
 
-    fn dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("cedian-lock-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
+    fn dir(tag: &str) -> crate::test_dir::TestDir {
+        let d = crate::test_dir::TestDir::new(&format!("lock-{tag}"));
         d
     }
 

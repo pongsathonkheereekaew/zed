@@ -391,8 +391,7 @@ mod tests {
 
     #[test]
     fn inline_edit_parses_range_model_and_selection() {
-        let dir = std::env::temp_dir().join(format!("cedian-inline-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new("inline");
         std::fs::write(dir.join("n.txt"), "alpha\nbeta\ngamma\n").unwrap();
         let e = edit_in(&dir, "edit n.txt 2-2 \"make it loud\" --model acme/fast-1").unwrap();
         assert_eq!((e.start, e.end), (2, 2));

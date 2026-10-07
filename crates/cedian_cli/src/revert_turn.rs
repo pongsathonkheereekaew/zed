@@ -137,12 +137,9 @@ pub fn cmd_revert_turn(workdir: &Path, which: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::session::ReviewStore;
-    use std::path::PathBuf;
 
-    fn workdir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("cedian-revert-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+    fn workdir(tag: &str) -> crate::test_dir::TestDir {
+        let dir = crate::test_dir::TestDir::new(&format!("revert-{tag}"));
         dir
     }
 
@@ -203,6 +200,5 @@ mod tests {
             TurnKind::Revert { of: 2 }
         );
         assert!(cmd_revert_turn(&dir, "9").unwrap_err().contains("no turn"));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -30,7 +30,7 @@ static NEXT_ORDINAL: std::sync::Mutex<Option<std::collections::HashMap<std::path
 
 impl AuditLog {
     pub fn open(workdir: &Path, approvals: Approvals) -> Result<Self, String> {
-        let path = crate::state::dir(workdir)?.join(AUDIT_FILE);
+        let path = crate::state::file(workdir, AUDIT_FILE)?;
         let complete_rows = match std::fs::read_to_string(&path) {
             Ok(text) => text.lines().filter(|l| !l.trim().is_empty()).count() as u64,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
@@ -116,15 +116,12 @@ impl AuditLog {
     /// was independent (ADR-0039 decision 4).
     pub fn review(
         &mut self,
-        role: &str,
-        reviewer: &[String],
-        implementer: &[String],
-        independent: bool,
+        attribution: &crate::review_agent::ReviewAttribution,
     ) -> Result<(), String> {
         let item = json!({
-            "kind": "review", "tool": "cedian_review_request", "role": role,
-            "reviewer_models": reviewer, "implementer_models": implementer,
-            "independent": independent,
+            "kind": "review", "tool": "cedian_review_request", "role": attribution.role,
+            "reviewer_models": attribution.reviewer, "implementer_models": attribution.implementer,
+            "independent": attribution.independent(),
         });
         self.append(item, None)
     }
@@ -183,9 +180,7 @@ mod tests {
 
     #[test]
     fn rows_carry_envelope_source_and_continue_ordinals() {
-        let dir = std::env::temp_dir().join(format!("cedian-audit-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new("audit");
         let start = RouterEvent::ToolStart {
             tool_call_id: "c1".into(),
             tool_name: "bash".into(),
@@ -218,14 +213,11 @@ mod tests {
         assert_eq!(rows[1]["item"]["is_error"], false);
         assert_eq!(rows[2]["item"]["decision_source"], "cedian");
         assert!(rows[0]["timestamp_ms"].as_u64().unwrap() > 0);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn two_logs_on_one_file_share_the_ordinal_sequence() {
-        let dir = std::env::temp_dir().join(format!("cedian-audit-two-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new("audit-two");
         let start = |id: &str| RouterEvent::ToolStart {
             tool_call_id: id.into(),
             tool_name: "read".into(),
@@ -246,14 +238,11 @@ mod tests {
         );
         assert_eq!(rows[2]["item"].get("actor"), None);
         assert_eq!(rows[2]["item"].get("args"), None);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn gate_rows_for_a_host_tool_call_and_a_refused_dialog() {
-        let dir = std::env::temp_dir().join(format!("cedian-audit-gate-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new("audit-gate");
         let mut log = AuditLog::open(&dir, Approvals::Cedian(Default::default())).unwrap();
         log.record(&RouterEvent::ToolStart {
             tool_call_id: "c1".into(),
@@ -302,6 +291,5 @@ mod tests {
         );
         assert_eq!(gates[2]["item"]["decision"], "abstain");
         assert_eq!(gates[2]["item"]["tool"], Value::Null);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

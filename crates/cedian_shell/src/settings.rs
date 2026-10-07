@@ -29,6 +29,13 @@ impl Default for ReviewRole {
         Self("review".to_string())
     }
 }
+
+impl ReviewRole {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 pub const SETTINGS_FILE: &str = "cedian.toml";
 /// Env override for the settings path. Set but missing is an error.
 pub const CONFIG_ENV: &str = "CEDIAN_CONFIG";
@@ -425,9 +432,9 @@ mod tests {
 
     #[test]
     fn review_role_defaults_to_review_and_a_model_id_is_refused() {
-        assert_eq!(parse("schema = 1").unwrap().review_role.0, "review");
+        assert_eq!(parse("schema = 1").unwrap().review_role.as_str(), "review");
         let s = parse("schema = 1\n[review]\nrole = \"review-alt\"\n").unwrap();
-        assert_eq!(s.review_role.0, "review-alt");
+        assert_eq!(s.review_role.as_str(), "review-alt");
         assert!(
             parse("schema = 1\n[review]\nmodel = \"opencode-go/glm-5.3\"\n").is_err(),
             "cedian.toml names roles, never model ids (ADR-0039)"

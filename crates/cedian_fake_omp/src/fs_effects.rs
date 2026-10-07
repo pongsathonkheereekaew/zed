@@ -14,7 +14,7 @@ use std::path::Path;
 const MAX_BYTES: u64 = 256 * 1024;
 
 /// Relative path → text, for every small UTF-8 file under `root`, skipping
-/// dot-directories (`.cedian`, `.git`, `.worktrees`).
+/// dot-directories (`.git`, `.worktrees`, any `.name`).
 pub fn snapshot(root: &Path) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     walk(root, root, &mut out);
@@ -98,13 +98,13 @@ mod tests {
     fn snapshot_diff_apply_roundtrip() {
         let root = std::env::temp_dir().join(format!("cedian-fsfx-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join(".cedian")).unwrap();
+        std::fs::create_dir_all(root.join(".hidden")).unwrap();
         std::fs::write(root.join("a.txt"), "one\n").unwrap();
         std::fs::write(root.join("gone.txt"), "x\n").unwrap();
-        std::fs::write(root.join(".cedian/review.json"), "{}").unwrap();
+        std::fs::write(root.join(".hidden/state.json"), "{}").unwrap();
         let before = snapshot(&root);
         assert!(
-            !before.contains_key(".cedian/review.json"),
+            !before.contains_key(".hidden/state.json"),
             "dot dirs skipped"
         );
         std::fs::write(root.join("a.txt"), "ONE\n").unwrap();

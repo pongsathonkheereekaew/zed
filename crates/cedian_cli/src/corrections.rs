@@ -61,7 +61,7 @@ pub fn excerpt_hash(text: &str) -> String {
 }
 
 pub fn load(workdir: &Path) -> Result<Vec<Correction>, String> {
-    match std::fs::read_to_string(crate::state::dir(workdir)?.join(CORRECTIONS_FILE)) {
+    match std::fs::read_to_string(crate::state::file(workdir, CORRECTIONS_FILE)?) {
         Ok(text) => parse(&text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(format!("corrections.jsonl: {e}")),
@@ -89,7 +89,7 @@ pub fn record(
         .create(true)
         .read(true)
         .append(true)
-        .open(crate::state::dir(workdir)?.join(CORRECTIONS_FILE))
+        .open(crate::state::file(workdir, CORRECTIONS_FILE)?)
         .map_err(|e| format!("corrections.jsonl: {e}"))?;
     file.lock()
         .map_err(|e| format!("corrections.jsonl lock: {e}"))?;
@@ -138,14 +138,30 @@ pub enum Level {
     Docs,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClassStatus {
+    /// Its proof was checked: the enforcer failed on the old code and passes now.
+    Enforced,
+    Documented,
+}
+
+impl ClassStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Enforced => "enforced",
+            Self::Documented => "documented",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CorrectionClass {
     pub name: String,
     pub event_ids: Vec<String>,
     pub level: Level,
     pub enforcer: String,
-    /// `enforced` (proof checked) or `documented`.
-    pub status: String,
+    pub status: ClassStatus,
     /// Why it is not `enforced`, when it is not.
     pub note: Option<String>,
 }
@@ -204,16 +220,16 @@ pub fn check_class(
     }
     let (status, note) = match (level, args.get("proof")) {
         (Level::Docs, _) => (
-            "documented",
+            ClassStatus::Documented,
             Some("a docs-level class is never enforced".to_string()),
         ),
         (_, None) => (
-            "documented",
+            ClassStatus::Documented,
             Some("no proof: give `proof` {fail, pass} evidence ids".to_string()),
         ),
         (_, Some(proof)) => match prove(proof, evidence, current) {
-            Ok(()) => ("enforced", None),
-            Err(why) => ("documented", Some(why)),
+            Ok(()) => (ClassStatus::Enforced, None),
+            Err(why) => (ClassStatus::Documented, Some(why)),
         },
     };
     Ok(CorrectionClass {
@@ -221,7 +237,7 @@ pub fn check_class(
         event_ids: ids,
         level,
         enforcer: enforcer.to_string(),
-        status: status.to_string(),
+        status,
         note,
     })
 }
@@ -271,7 +287,7 @@ struct ClassStore {
 }
 
 fn save_class(workdir: &Path, class: CorrectionClass) -> Result<(), String> {
-    let path = crate::state::dir(workdir)?.join(CLASSES_FILE);
+    let path = crate::state::file(workdir, CLASSES_FILE)?;
     let mut store: ClassStore = match std::fs::read_to_string(&path) {
         Ok(raw) => {
             let s: ClassStore = serde_json::from_str(&raw)
@@ -287,11 +303,11 @@ fn save_class(workdir: &Path, class: CorrectionClass) -> Result<(), String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => ClassStore::default(),
         Err(e) => return Err(format!("correction_classes.json: {e}")),
     };
-    if class.status != "enforced"
+    if class.status != ClassStatus::Enforced
         && store
             .classes
             .iter()
-            .any(|c| c.name == class.name && c.status == "enforced")
+            .any(|c| c.name == class.name && c.status == ClassStatus::Enforced)
     {
         return Err(format!(
             "class {} is already enforced; only a new proof replaces it",
@@ -343,7 +359,7 @@ pub fn correction_class_tool(
             let reply = format!(
                 "class {} recorded as {}{}",
                 class.name,
-                class.status,
+                class.status.as_str(),
                 class
                     .note
                     .as_deref()
@@ -431,7 +447,7 @@ mod tests {
             &cur,
         )
         .unwrap();
-        assert_eq!(class.status, "documented");
+        assert_eq!(class.status, ClassStatus::Documented);
         let docs = check_class(
             &args(json!({"name": "y", "event_ids": ["c1", "c3"], "level": "docs", "enforcer": "AGENTS.md",
                           "proof": {"fail": "e1", "pass": "e2"}})),
@@ -440,7 +456,7 @@ mod tests {
             &cur,
         )
         .unwrap();
-        assert_eq!(docs.status, "documented");
+        assert_eq!(docs.status, ClassStatus::Documented);
     }
 
     fn evidence(id: &str, outcome: Outcome, file_text: &str) -> Evidence {
@@ -479,19 +495,17 @@ mod tests {
             )
             .unwrap()
         };
-        assert_eq!(class("e1", "e2").status, "enforced");
+        assert_eq!(class("e1", "e2").status, ClassStatus::Enforced);
         let on_head = class("e3", "e2");
-        assert_eq!(on_head.status, "documented");
+        assert_eq!(on_head.status, ClassStatus::Documented);
         assert!(on_head.note.unwrap().contains("not the mistake"));
         let swapped = class("e2", "e1");
-        assert_eq!(swapped.status, "documented");
+        assert_eq!(swapped.status, ClassStatus::Documented);
     }
 
     #[test]
     fn user_edit_rows_are_recorded_once_per_hunk_text() {
-        let dir = std::env::temp_dir().join(format!("cedian-corr-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new("corr");
         let edit = || Event {
             turn: Some(1),
             path: Some("/a.rs".into()),
@@ -515,16 +529,15 @@ mod tests {
             Some("c2")
         );
         assert_eq!(load(&dir).unwrap().len(), 2);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn class(name: &str, status: &str) -> CorrectionClass {
+    fn class(name: &str, status: ClassStatus) -> CorrectionClass {
         CorrectionClass {
             name: name.into(),
             event_ids: vec!["c1".into(), "c3".into()],
             level: Level::Lint,
             enforcer: "clippy".into(),
-            status: status.into(),
+            status,
             note: None,
         }
     }
@@ -537,12 +550,10 @@ mod tests {
 
     #[test]
     fn concurrent_records_get_distinct_ids() {
-        let dir = std::env::temp_dir().join(format!("cedian-corr-race-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new("corr-race");
         let ids: Vec<String> = (0..16)
             .map(|i| {
-                let dir = dir.clone();
+                let dir = dir.to_path_buf();
                 std::thread::spawn(move || {
                     let event = Event {
                         turn: Some(1),
@@ -561,35 +572,28 @@ mod tests {
         let unique: BTreeSet<&String> = ids.iter().collect();
         assert_eq!(unique.len(), 16, "{ids:?}");
         assert_eq!(load(&dir).unwrap().len(), 16);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn an_unreadable_class_store_is_never_overwritten() {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir = std::env::temp_dir().join(format!("cedian-corr-perm-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        save_class(&dir, class("kept", "enforced")).unwrap();
+        let dir = crate::test_dir::TestDir::new("corr-perm");
+        save_class(&dir, class("kept", ClassStatus::Enforced)).unwrap();
         let path = crate::state::dir(&dir).unwrap().join(CLASSES_FILE);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
-        let result = save_class(&dir, class("new", "documented"));
+        let result = save_class(&dir, class("new", ClassStatus::Documented));
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(result.is_err(), "{result:?}");
         assert_eq!(classes(&dir)[0].name, "kept");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn an_enforced_class_is_not_replaced_by_a_weaker_one() {
-        let dir = std::env::temp_dir().join(format!("cedian-corr-weak-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        save_class(&dir, class("x", "enforced")).unwrap();
-        let weaker = save_class(&dir, class("x", "documented")).unwrap_err();
+        let dir = crate::test_dir::TestDir::new("corr-weak");
+        save_class(&dir, class("x", ClassStatus::Enforced)).unwrap();
+        let weaker = save_class(&dir, class("x", ClassStatus::Documented)).unwrap_err();
         assert!(weaker.contains("already enforced"), "{weaker}");
-        assert_eq!(classes(&dir)[0].status, "enforced");
-        save_class(&dir, class("x", "enforced")).expect("a new proof replaces it");
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(classes(&dir)[0].status, ClassStatus::Enforced);
+        save_class(&dir, class("x", ClassStatus::Enforced)).expect("a new proof replaces it");
     }
 }

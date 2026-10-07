@@ -34,6 +34,8 @@ mod session;
 mod shell;
 mod shell_lock;
 mod state;
+#[cfg(test)]
+mod test_dir;
 mod timing;
 mod verify_store;
 mod workflow_store;
@@ -1393,7 +1395,7 @@ fn cmd_browser(workdir: &Path, args: &[String]) -> Result<(), String> {
             let head = browser_store::load(workdir)?;
             let (proc, session, ws_url) = browser_store::spawn_fresh(workdir, &head.url)?;
             let shot = session
-                .screenshot(&state::dir(workdir)?.join("shots"))
+                .screenshot(&state::file(workdir, "shots")?)
                 .map_err(|e| e.to_string())?;
             browser_store::save(
                 workdir,
@@ -1511,6 +1513,7 @@ fn worker_base(args: &[String], from: usize) -> Result<String, String> {
 /// only records the note (status Running); the actual agent turn in the
 /// worktree is a follow-up invocation.
 fn cmd_worker(workdir: &Path, args: &[String]) -> Result<(), String> {
+    let state = state::dir(workdir)?;
     match args.first().map(|s| s.as_str()) {
         Some("spawn") => {
             let usage = "usage: cedian worker spawn <id> <kind> <title> [--base B]";
@@ -1518,15 +1521,14 @@ fn cmd_worker(workdir: &Path, args: &[String]) -> Result<(), String> {
             let kind = args.get(2).ok_or(usage)?;
             let title = args.get(3).ok_or(usage)?;
             let base = worker_base(args, 4)?;
-            let (mut reg, _) =
-                cedian_worker::Registry::open(&state::dir(workdir)?).map_err(|e| e.to_string())?;
+            let (mut reg, _) = cedian_worker::Registry::open(&state).map_err(|e| e.to_string())?;
             let mut head = cedian_worker::spawn(workdir, id, &base).map_err(|e| e.to_string())?;
             head.status = cedian_worker::WorkerStatus::Running;
             head.task_title = title.clone();
             head.kind = kind.clone();
             let (worktree, branch) = (head.worktree.clone(), head.branch.clone());
             reg.insert(head).map_err(|e| e.to_string())?;
-            reg.save(&state::dir(workdir)?).map_err(|e| e.to_string())?;
+            reg.save(&state).map_err(|e| e.to_string())?;
             println!("worker {id} → {worktree} (branch {branch})");
             Ok(())
         }
@@ -1534,8 +1536,7 @@ fn cmd_worker(workdir: &Path, args: &[String]) -> Result<(), String> {
             if args.len() > 1 {
                 return Err("usage: cedian worker list".to_string());
             }
-            let (reg, _) =
-                cedian_worker::Registry::open(&state::dir(workdir)?).map_err(|e| e.to_string())?;
+            let (reg, _) = cedian_worker::Registry::open(&state).map_err(|e| e.to_string())?;
             let mut any = false;
             for head in reg.all() {
                 any = true;
@@ -1557,15 +1558,14 @@ fn cmd_worker(workdir: &Path, args: &[String]) -> Result<(), String> {
                 return Err(usage.to_string());
             }
             let note = args[2..].join(" ");
-            let (mut reg, _) =
-                cedian_worker::Registry::open(&state::dir(workdir)?).map_err(|e| e.to_string())?;
+            let (mut reg, _) = cedian_worker::Registry::open(&state).map_err(|e| e.to_string())?;
             let head = reg
                 .get(id)
                 .cloned()
                 .ok_or_else(|| cedian_worker::WorkerError::NoSuch(id.clone()).to_string())?;
             reg.set_status(id, cedian_worker::WorkerStatus::Running, note.clone())
                 .map_err(|e| e.to_string())?;
-            reg.save(&state::dir(workdir)?).map_err(|e| e.to_string())?;
+            reg.save(&state).map_err(|e| e.to_string())?;
             let wt = workdir.join(&head.worktree);
             println!("steer {id}: {note}");
             println!(
@@ -1579,8 +1579,7 @@ fn cmd_worker(workdir: &Path, args: &[String]) -> Result<(), String> {
                 .get(1)
                 .ok_or("usage: cedian worker preview <id> [--base <branch>]")?;
             let base = worker_base(args, 2)?;
-            let (reg, _) =
-                cedian_worker::Registry::open(&state::dir(workdir)?).map_err(|e| e.to_string())?;
+            let (reg, _) = cedian_worker::Registry::open(&state).map_err(|e| e.to_string())?;
             let head = reg
                 .get(id)
                 .cloned()
@@ -1602,8 +1601,7 @@ fn cmd_worker(workdir: &Path, args: &[String]) -> Result<(), String> {
                 .get(1)
                 .ok_or("usage: cedian worker merge-back <id> [--base <branch>]")?;
             let base = worker_base(args, 2)?;
-            let (mut reg, _) =
-                cedian_worker::Registry::open(&state::dir(workdir)?).map_err(|e| e.to_string())?;
+            let (mut reg, _) = cedian_worker::Registry::open(&state).map_err(|e| e.to_string())?;
             let head = reg
                 .get(id)
                 .cloned()
@@ -1612,7 +1610,7 @@ fn cmd_worker(workdir: &Path, args: &[String]) -> Result<(), String> {
                 Ok(()) => {
                     reg.set_status(id, cedian_worker::WorkerStatus::Done, String::new())
                         .map_err(|e| e.to_string())?;
-                    reg.save(&state::dir(workdir)?).map_err(|e| e.to_string())?;
+                    reg.save(&state).map_err(|e| e.to_string())?;
                     println!("merged {} → {base}", head.branch);
                     Ok(())
                 }
@@ -1631,15 +1629,14 @@ fn cmd_worker(workdir: &Path, args: &[String]) -> Result<(), String> {
             if args.len() > 2 {
                 return Err("usage: cedian worker remove <id>".to_string());
             }
-            let (mut reg, _) =
-                cedian_worker::Registry::open(&state::dir(workdir)?).map_err(|e| e.to_string())?;
+            let (mut reg, _) = cedian_worker::Registry::open(&state).map_err(|e| e.to_string())?;
             let head = reg
                 .get(id)
                 .cloned()
                 .ok_or_else(|| cedian_worker::WorkerError::NoSuch(id.clone()).to_string())?;
             cedian_worker::remove(workdir, &head).map_err(|e| e.to_string())?;
             reg.remove(id);
-            reg.save(&state::dir(workdir)?).map_err(|e| e.to_string())?;
+            reg.save(&state).map_err(|e| e.to_string())?;
             println!("removed {id}");
             Ok(())
         }
@@ -1759,9 +1756,7 @@ mod tests {
 
     #[test]
     fn evidence_goes_stale_on_lockfile_and_large_file_changes() {
-        let dir = std::env::temp_dir().join(format!("cedian-code-state-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new("code-state");
         std::fs::write(dir.join("Cargo.lock"), "serde 1.0.0").unwrap();
         let big = vec![b'x'; workspace_files::MAX_FILE_BYTES as usize + 1];
         std::fs::write(dir.join("fixture.dat"), &big).unwrap();
@@ -1781,7 +1776,6 @@ mod tests {
             current_state(&dir).stale_reason(&bound).is_some(),
             "a change to a file over the buffer size cap makes tree-bound evidence stale"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1823,9 +1817,7 @@ mod tests {
     #[test]
     fn refused_claim_blocks_at_turn_end_and_resume_unblocks() {
         use cedian_workflow::{CompletionAttempt, TaskKind, TaskProfile, WorkflowStatus};
-        let d = std::env::temp_dir().join(format!("cedian-u5-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
+        let d = crate::test_dir::TestDir::new("u5");
         end_workflow_turn(&d).unwrap(); // fast lane: no workflow, nothing to do
         assert!(!workflow_store::exists(&d));
         let mut state =
@@ -1860,7 +1852,6 @@ mod tests {
             )
             .is_err()
         );
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// The verify-notes profile skill (test fixture copy) only uses keys and

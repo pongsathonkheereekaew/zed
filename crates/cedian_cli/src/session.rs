@@ -161,7 +161,7 @@ impl Default for ReviewStore {
 }
 
 fn store_path(workdir: &Path) -> Result<PathBuf, String> {
-    Ok(crate::state::dir(workdir)?.join("review.json"))
+    crate::state::file(workdir, "review.json")
 }
 
 /// Load the review task. `Ok(None)` when no task exists yet. Corrupt or
@@ -208,11 +208,8 @@ pub fn reset(workdir: &Path) {
 mod tests {
     use super::*;
 
-    fn tmp(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("cedian-review-store-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+    fn tmp(tag: &str) -> crate::test_dir::TestDir {
+        let dir = crate::test_dir::TestDir::new(&format!("review-store-{tag}"));
         dir
     }
 
@@ -260,7 +257,6 @@ mod tests {
         assert_eq!(back.turns[1].kind, TurnKind::Revert { of: 1 });
         reset(&dir);
         assert!(load(&dir).unwrap().is_none());
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -272,6 +268,5 @@ mod tests {
         assert!(load(&dir).unwrap_err().contains("re-baseline"));
         reset(&dir);
         assert!(load(&dir).unwrap().is_none());
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

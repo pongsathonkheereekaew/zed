@@ -1,7 +1,7 @@
 #!/bin/sh
 # Build the pinned OMP sidecar into cedian.app/Contents/Resources/omp.
 # Records {commit, normalized-source-tree hash, builder} into vendor/omp-revision.json
-# (plan §6: the startup handshake verifies this triple, never a bare version).
+# (ADR-0003: the startup handshake verifies this triple, never a bare version).
 set -eu
 
 PIN_FILE="vendor/omp-revision.json"
@@ -29,7 +29,11 @@ echo "build-omp: building (bun install + bun run build)"
 (cd "$WORK/omp" && bun install && bun run build)
 
 mkdir -p "$(dirname "$OUT")"
-cp "$WORK/omp/dist/omp" "$OUT" 2>/dev/null || cp "$WORK/omp/dist/cli.js" "$OUT-cli.js"
+if [ ! -f "$WORK/omp/dist/omp" ]; then
+  echo "build-omp: the build produced no dist/omp; check OMP's build output before bundling" >&2
+  exit 1
+fi
+cp "$WORK/omp/dist/omp" "$OUT"
 
 jq --arg tree "$TREE_HASH" --arg builder "$BUILDER" \
   '.sourceTreeHash = $tree | .builder = $builder' \

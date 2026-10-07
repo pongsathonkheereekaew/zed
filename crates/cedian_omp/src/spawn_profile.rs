@@ -253,25 +253,22 @@ impl SpawnPolicy {
         let approval = Value::Object(self.approval_record()?);
         let bash = json!({"patterns": patterns, "allowCompoundCommands": false});
         Ok(match self.approvals {
-            Approvals::Cedian(_) => json!({
-                // Until ADR-0008's atomic landing (driver + Seatbelt + bypass test).
-                "computer": {"enabled": false},
-                "tools": {
-                    "approvalMode": self.approvals.mode().map(ApprovalMode::as_str),
-                    "approval": approval,
-                },
-                "bash": bash,
-            }),
-            Approvals::Reviewer => json!({
-                "computer": {"enabled": false},
-                "tools": {
-                    "approvalMode": self.approvals.mode().map(ApprovalMode::as_str),
-                    "approval": approval,
-                },
-                "bash": bash,
-                // A workspace's `.mcp.json` would add tools (ADR-0043).
-                "mcp": {"enableProjectConfig": false},
-            }),
+            Approvals::Cedian(_) | Approvals::Reviewer => {
+                let mut overlay = json!({
+                    // Until ADR-0008's atomic landing (driver + Seatbelt + bypass test).
+                    "computer": {"enabled": false},
+                    "tools": {
+                        "approvalMode": self.approvals.mode().map(ApprovalMode::as_str),
+                        "approval": approval,
+                    },
+                    "bash": bash,
+                });
+                if self.approvals == Approvals::Reviewer {
+                    // A workspace's `.mcp.json` would add tools (ADR-0043).
+                    overlay["mcp"] = json!({"enableProjectConfig": false});
+                }
+                overlay
+            }
             Approvals::Omp if patterns.is_empty() => json!({"tools": {"approval": approval}}),
             Approvals::Omp => json!({"tools": {"approval": approval}, "bash": bash}),
         })

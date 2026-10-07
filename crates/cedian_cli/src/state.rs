@@ -30,6 +30,28 @@ pub fn dir(workdir: &Path) -> Result<PathBuf, String> {
     dir_in(&root()?, workdir)
 }
 
+/// `name` inside the state directory for `workdir`.
+pub fn file(workdir: &Path, name: &str) -> Result<PathBuf, String> {
+    Ok(dir(workdir)?.join(name))
+}
+
+/// `dir` (created if missing), canonical, after checking it does not
+/// resolve inside `workdir`: anything there the implementer can write
+/// (ADR-0043, ADR-0044). `what` names it in the refusal.
+pub fn outside_workspace(dir: &Path, workdir: &Path, what: &str) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("{what} {}: {e}", dir.display()))?;
+    let dir = std::fs::canonicalize(dir).map_err(|e| format!("{what}: {e}"))?;
+    let workdir = std::fs::canonicalize(workdir)
+        .map_err(|e| format!("workspace {}: {e}", workdir.display()))?;
+    if dir.starts_with(&workdir) {
+        return Err(format!(
+            "the {what} {} is inside the workspace, where the agent can write it",
+            dir.display()
+        ));
+    }
+    Ok(dir)
+}
+
 fn dir_in(root: &Path, workdir: &Path) -> Result<PathBuf, String> {
     let workdir = std::fs::canonicalize(workdir)
         .map_err(|e| format!("workspace {}: {e}", workdir.display()))?;
@@ -42,16 +64,12 @@ fn dir_in(root: &Path, workdir: &Path) -> Result<PathBuf, String> {
         .collect();
     let digest = Sha256::digest(workdir.as_os_str().as_encoded_bytes());
     let hash: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
-    let dir = root.join("workspaces").join(format!("{name}-{hash}"));
-    std::fs::create_dir_all(&dir).map_err(|e| format!("state dir {}: {e}", dir.display()))?;
-    let dir = std::fs::canonicalize(&dir).map_err(|e| format!("state dir: {e}"))?;
-    if dir.starts_with(&workdir) {
-        return Err(format!(
-            "the state dir {} is inside the workspace, where the agent can write it; \
-             set CEDIAN_STATE_DIR outside it",
-            dir.display()
-        ));
-    }
+    let dir = outside_workspace(
+        &root.join("workspaces").join(format!("{name}-{hash}")),
+        &workdir,
+        "state dir",
+    )
+    .map_err(|e| format!("{e}; set CEDIAN_STATE_DIR outside it"))?;
     let marker = dir.join("workspace");
     if !marker.exists() {
         std::fs::write(&marker, format!("{}\n", workdir.display()))
@@ -66,8 +84,7 @@ mod tests {
 
     #[test]
     fn one_dir_per_workspace_outside_it() {
-        let base = std::env::temp_dir().join(format!("cedian-state-ws-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let base = crate::test_dir::TestDir::new("state-ws");
         for ws in ["a b", "c"] {
             std::fs::create_dir_all(base.join(ws)).unwrap();
         }
@@ -85,6 +102,5 @@ mod tests {
         assert!(named.trim_end().ends_with("a b"));
         let err = dir_in(&base.join("c/.state"), &base.join("c")).unwrap_err();
         assert!(err.contains("inside the workspace"), "{err}");
-        let _ = std::fs::remove_dir_all(&base);
     }
 }

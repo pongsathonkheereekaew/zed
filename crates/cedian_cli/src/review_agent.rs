@@ -11,9 +11,10 @@ use cedian_omp::{
     Approvals, BashRule, OmpBinary, OmpRuntime, RuntimeConfig, SpawnPolicy, ToolPolicy,
 };
 use cedian_review::{FileDiff, HunkStatus};
+use cedian_workflow::Outcome;
 use omp_rpc::HostTool;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -98,15 +99,62 @@ fn prompt(diff: &str, focus: &str) -> String {
     )
 }
 
+/// The model a role maps to in OMP's `modelRoles` record: the role, else
+/// `default` (with a note), else none (OMP's own routing, with a note).
+pub fn role_model(record: &Value, role: &str) -> (Option<String>, Option<String>) {
+    let get = |key: &str| record.get(key).and_then(Value::as_str).map(str::to_string);
+    match (get(role), get("default")) {
+        (Some(model), _) => (Some(model), None),
+        (None, Some(model)) => (
+            Some(model),
+            Some(format!(
+                "no `{role}` model role in OMP's modelRoles: the reviewer runs on `default`"
+            )),
+        ),
+        (None, None) => (
+            None,
+            Some("OMP's modelRoles names no model: the reviewer runs on OMP's routing".to_string()),
+        ),
+    }
+}
+
+/// ADR-0039 decision 4: independent only when every model that answered
+/// in the review differs from every model that edited the task, and both
+/// sides are known.
+pub fn independent(reviewer: &[String], editors: &BTreeSet<String>) -> bool {
+    !reviewer.is_empty() && !editors.is_empty() && reviewer.iter().all(|m| !editors.contains(m))
+}
+
+/// What the review shows the `review` gate: a same-model review is never a
+/// pass; an independent one fails on a new blocker.
+pub fn review_outcome(independent: bool, blocker: bool) -> Outcome {
+    match (independent, blocker) {
+        (false, _) => Outcome::Inconclusive,
+        (true, true) => Outcome::Fail,
+        (true, false) => Outcome::Pass,
+    }
+}
+
+/// Who asked for the review. Inside an implementer turn: its live buffers,
+/// the models that answered so far, the asking call and the workflow
+/// channel. From the CLI: the stored task only.
+#[derive(Default)]
+pub struct Requester<'a> {
+    pub live: Option<&'a cedian_workspace::HostTools>,
+    pub implementer_models: Vec<String>,
+    pub tool_call_id: Option<String>,
+    pub channel: Option<&'a cedian_workflow::WorkflowChannel>,
+}
+
 /// Run one review. Returns the summary the implementing turn sees.
 pub fn run_review(
     workdir: &Path,
     session_dir: &Path,
     settings: &cedian_shell::Settings,
     focus: &str,
-    live: Option<&cedian_workspace::HostTools>,
+    requester: Requester,
 ) -> Result<String, String> {
-    if let Some(live) = live {
+    if let Some(live) = requester.live {
         crate::flush_turn_for_review(workdir, live)?;
     }
     let host = cedian_workspace::HostTools::new(workdir);
@@ -121,6 +169,8 @@ pub fn run_review(
     if diff.is_empty() {
         return Err("nothing to review: no open hunks in this task".to_string());
     }
+    let mut editors = store.models.clone();
+    editors.extend(requester.implementer_models.iter().cloned());
 
     let dir = reviewer_dir(session_dir, workdir)?;
     let _ = std::fs::remove_dir_all(dir.join("sessions"));
@@ -131,6 +181,29 @@ pub fn run_review(
         &settings.reviewer_allow_list,
         std::env::var("PATH").ok().as_deref(),
     );
+    // ADR-0039 decision 3: read the role from a directory cedian owns, so a
+    // workspace's .omp/config.yml cannot choose who reviews it.
+    let roles_dir = session_dir.join("roles");
+    std::fs::create_dir_all(&roles_dir).map_err(|e| format!("roles dir: {e}"))?;
+    let role = &settings.review_role.0;
+    let model = match cedian_omp::omp_config_get(
+        &binary,
+        &roles_dir,
+        "modelRoles",
+        Duration::from_secs(10),
+    ) {
+        Ok(record) => {
+            let (model, note) = role_model(&record, role);
+            notes.extend(note);
+            model
+        }
+        Err(e) => {
+            notes.push(format!(
+                "cannot read OMP's modelRoles ({e}): the reviewer runs on OMP's routing"
+            ));
+            None
+        }
+    };
     let home = PathBuf::from(std::env::var("HOME").map_err(|_| "HOME is not set")?);
     let profile = ReviewerSandbox {
         omp_binary: binary.clone(),
@@ -142,19 +215,12 @@ pub fn run_review(
     .profile()?;
     let profile_path = dir.join(REVIEWER_PROFILE_FILE);
     std::fs::write(&profile_path, profile).map_err(|e| format!("reviewer profile: {e}"))?;
-    if settings.review_model.is_none() {
-        notes.push(
-            "the reviewer runs on OMP's default model, likely the implementer's; set \
-             [review] model in cedian.toml (ADR-0011)"
-                .to_string(),
-        );
-    }
 
     let mut policy = SpawnPolicy {
         approvals: Approvals::Reviewer,
         bash_patterns: allow_patterns(&settings.reviewer_allow_list),
         config_allows: crate::omp_config_allows(workdir)?,
-        model: settings.review_model.clone(),
+        model,
         sandbox_profile: Some(profile_path),
         ..SpawnPolicy::default()
     };
@@ -187,16 +253,32 @@ pub fn run_review(
         audit.refusal(&refusal)?;
         notes.push(format!("refused for the reviewer: {}", refusal.label));
     }
+    let reviewer_models = router.answered_models();
     let _ = rt.shutdown();
     turn.map_err(|e| format!("reviewer turn: {e}"))?;
 
-    let found = review_findings::load(workdir)?.findings.split_off(before);
+    let independent = independent(&reviewer_models, &editors);
+    let editors: Vec<String> = editors.into_iter().collect();
+    let mut findings = review_findings::load(workdir)?;
+    for f in findings.findings.iter_mut().skip(before) {
+        f.reviewer_model = Some(reviewer_models.join(", "));
+        f.implementer_models = editors.clone();
+    }
+    review_findings::save(workdir, &mut findings)?;
+    let found = findings.findings.split_off(before);
+    let blocker = found
+        .iter()
+        .any(|f| f.finding.severity == cedian_review::FindingSeverity::Blocker);
+    audit.review(role, &reviewer_models, &editors, independent)?;
+
+    let models = format!(
+        "reviewer {}, implementer {}",
+        or_unknown(&reviewer_models),
+        or_unknown(&editors)
+    );
     let mut reply = format!(
-        "reviewer ({}) reported {} finding(s)",
-        settings
-            .review_model
-            .as_deref()
-            .unwrap_or("OMP default model"),
+        "reviewer (role {role}: {}) reported {} finding(s)",
+        or_unknown(&reviewer_models),
         found.len()
     );
     for f in &found {
@@ -205,16 +287,49 @@ pub fn run_review(
             f.id, f.finding.severity, f.finding.path, f.hunk, f.finding.message
         ));
     }
-    if found
-        .iter()
-        .any(|f| f.finding.severity == cedian_review::FindingSeverity::Blocker)
-    {
+    if blocker {
         reply.push_str("\nA blocker keeps the review gate unmet until its hunk is fixed or a person dismisses it.");
+    }
+    reply.push_str(&if independent {
+        format!("\nindependent review ({models})")
+    } else {
+        format!("\nNOT an independent review ({models}): it counts as inconclusive (ADR-0039)")
+    });
+    if let Some(channel) = requester.channel {
+        let outcome = review_outcome(independent, blocker);
+        let summary = format!("review: {} finding(s), {models}", found.len());
+        if let Some(id) = channel.cedian_evidence(
+            "review",
+            outcome,
+            &summary,
+            requester.tool_call_id.as_deref(),
+        )? {
+            reply.push_str(&format!(
+                "\nreview gate evidence {id}: {}",
+                outcome_word(outcome)
+            ));
+        }
     }
     for note in notes {
         reply.push_str(&format!("\nnote: {note}"));
     }
     Ok(reply)
+}
+
+fn or_unknown(models: &[String]) -> String {
+    if models.is_empty() {
+        "unknown".to_string()
+    } else {
+        models.join(", ")
+    }
+}
+
+fn outcome_word(outcome: Outcome) -> &'static str {
+    match outcome {
+        Outcome::Pass => "pass",
+        Outcome::Fail => "fail",
+        Outcome::Inconclusive => "inconclusive",
+    }
 }
 
 /// The implementer's host tool.
@@ -223,6 +338,8 @@ pub fn review_request_tool(
     session_dir: PathBuf,
     settings: cedian_shell::Settings,
     live: std::sync::Arc<cedian_workspace::HostTools>,
+    implementer: std::sync::Arc<cedian_omp::EventRouter>,
+    channel: std::sync::Arc<cedian_workflow::WorkflowChannel>,
 ) -> HostTool {
     let params = json!({
         "type": "object",
@@ -240,9 +357,15 @@ pub fn review_request_tool(
          task's changes. A separate read-only reviewer runs and reports findings on your hunks; \
          blockers must be fixed before the work is done. Returns the findings.",
         params,
-        move |args, _ctx| {
+        move |args, ctx| {
             let focus = args.get("focus").and_then(Value::as_str).unwrap_or("");
-            run_review(&workdir, &session_dir, &settings, focus, Some(&live))
+            let requester = Requester {
+                live: Some(&live),
+                implementer_models: implementer.answered_models(),
+                tool_call_id: Some(ctx.tool_call_id().to_string()),
+                channel: Some(&channel),
+            };
+            run_review(&workdir, &session_dir, &settings, focus, requester)
                 .map(Into::into)
                 .map_err(Into::into)
         },
@@ -284,6 +407,41 @@ mod tests {
             "notes.txt hunk 0: lines 2-2\n-beta\n+BETA\n",
             "accepted hunks are not reviewed"
         );
+    }
+
+    #[test]
+    fn the_role_picks_the_model_and_falls_back_to_default() {
+        let roles = json!({"default": "opencode-go/muse", "review": "opencode-go/glm-5.3"});
+        assert_eq!(
+            role_model(&roles, "review"),
+            (Some("opencode-go/glm-5.3".into()), None)
+        );
+        let (model, note) = role_model(&roles, "review-alt");
+        assert_eq!(model.as_deref(), Some("opencode-go/muse"));
+        assert!(note.unwrap().contains("runs on `default`"));
+        assert_eq!(role_model(&json!({}), "review").0, None);
+    }
+
+    #[test]
+    fn only_a_review_by_another_model_is_independent_and_can_pass() {
+        let editors: BTreeSet<String> = ["opencode-go/muse".to_string()].into();
+        assert!(independent(&["opencode-go/glm".into()], &editors));
+        assert!(
+            !independent(&["opencode-go/muse".into()], &editors),
+            "same model"
+        );
+        assert!(!independent(
+            &["opencode-go/glm".into(), "opencode-go/muse".into()],
+            &editors
+        ));
+        assert!(!independent(&[], &editors), "reviewer unknown");
+        assert!(
+            !independent(&["opencode-go/glm".into()], &BTreeSet::new()),
+            "editors unknown"
+        );
+        assert_eq!(review_outcome(false, false), Outcome::Inconclusive);
+        assert_eq!(review_outcome(true, true), Outcome::Fail);
+        assert_eq!(review_outcome(true, false), Outcome::Pass);
     }
 
     #[test]

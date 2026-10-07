@@ -19,6 +19,16 @@ use std::path::{Path, PathBuf};
 /// Current settings schema (P3). Required in the file. Bump on any breaking
 /// shape change.
 pub const SETTINGS_SCHEMA: u32 = 1;
+
+/// An OMP model role name (`modelRoles` key). Defaults to `review`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewRole(pub String);
+
+impl Default for ReviewRole {
+    fn default() -> Self {
+        Self("review".to_string())
+    }
+}
 pub const SETTINGS_FILE: &str = "cedian.toml";
 /// Env override for the settings path. Set but missing is an error.
 pub const CONFIG_ENV: &str = "CEDIAN_CONFIG";
@@ -96,9 +106,10 @@ pub struct Settings {
     pub permissions: Permissions,
     /// Reviewer allow-list: shell commands reviewers may run (S3).
     pub reviewer_allow_list: Vec<String>,
-    /// `[review] model`: the reviewer's model (ADR-0011: a different model
-    /// from the implementer where OMP routing allows). `None` = OMP's own.
-    pub review_model: Option<String>,
+    /// `[review] role`: the OMP model role reviewers run on (ADR-0039).
+    /// cedian stores role names only; OMP's `modelRoles` maps them to
+    /// models. Default `review`.
+    pub review_role: ReviewRole,
     pub update_channel: UpdateChannel,
     /// Gates cedian requires per task kind × risk. Empty = fast lane
     /// (ADR-0026).
@@ -184,7 +195,7 @@ struct RawSettings {
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawReview {
-    model: Option<String>,
+    role: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -291,7 +302,13 @@ pub fn parse_settings(toml_src: &str) -> Result<Settings, SettingsError> {
     Ok(Settings {
         permissions: raw.permissions,
         reviewer_allow_list: raw.reviewer_allow_list,
-        review_model: raw.review.model.filter(|m| !m.trim().is_empty()),
+        review_role: raw
+            .review
+            .role
+            .map(|r| r.trim().to_string())
+            .filter(|r| !r.is_empty())
+            .map(ReviewRole)
+            .unwrap_or_default(),
         update_channel: raw.update_channel,
         floor: GateFloor::from_specs(raw.workflow.floor).map_err(SettingsError::BadFloor)?,
         projects: raw
@@ -376,9 +393,9 @@ pub fn default_settings_toml() -> String {
          project_write = \"allow\"\n\
          dangerous = \"ask\"\n\
          \n\
-         # The reviewer's model; set one other than your OMP default (S3).\n\
+         # The OMP model role reviewers run on (map it in OMP's modelRoles).\n\
          # [review]\n\
-         # model = \"provider/model\"\n\
+         # role = \"review\"\n\
          \n\
          # Gates cedian requires per task kind and risk. None = fast lane.\n\
          # [[workflow.floor]]\n\
@@ -407,11 +424,14 @@ mod tests {
     }
 
     #[test]
-    fn review_model_is_read_and_unknown_review_keys_refused() {
-        let s = parse("schema = 1\n[review]\nmodel = \"opencode-go/glm-5.3\"\n").unwrap();
-        assert_eq!(s.review_model.as_deref(), Some("opencode-go/glm-5.3"));
-        assert_eq!(parse("schema = 1").unwrap().review_model, None);
-        assert!(parse("schema = 1\n[review]\nmodle = \"x\"\n").is_err());
+    fn review_role_defaults_to_review_and_a_model_id_is_refused() {
+        assert_eq!(parse("schema = 1").unwrap().review_role.0, "review");
+        let s = parse("schema = 1\n[review]\nrole = \"review-alt\"\n").unwrap();
+        assert_eq!(s.review_role.0, "review-alt");
+        assert!(
+            parse("schema = 1\n[review]\nmodel = \"opencode-go/glm-5.3\"\n").is_err(),
+            "cedian.toml names roles, never model ids (ADR-0039)"
+        );
     }
 
     #[test]

@@ -34,6 +34,10 @@ pub struct ReviewStore {
     pub statuses: Vec<StatusRecord>,
     /// Every turn that changed files, oldest first (P6: revert turn).
     pub turns: Vec<TurnRecord>,
+    /// `provider/model` of every model that answered in a turn of this task
+    /// (ADR-0039: a review is independent only of all of them).
+    #[serde(default)]
+    pub models: std::collections::BTreeSet<String>,
 }
 
 /// What produced a turn.
@@ -83,6 +87,7 @@ impl ReviewStore {
             provenance: Vec::new(),
             statuses: Vec::new(),
             turns: Vec::new(),
+            models: Default::default(),
         }
     }
 

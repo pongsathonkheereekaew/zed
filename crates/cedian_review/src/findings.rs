@@ -40,6 +40,12 @@ pub struct AttachedFinding {
     pub hunk_text: String,
     /// `Some(reason)` once a person dismissed it (recorded in the audit log).
     pub dismissed: Option<String>,
+    /// The model that reported it and the models that edited the task
+    /// (ADR-0039 decision 4: both identities are kept).
+    #[serde(default)]
+    pub reviewer_model: Option<String>,
+    #[serde(default)]
+    pub implementer_models: Vec<String>,
 }
 
 fn after_text(diff: &FileDiff, hunk: &Hunk) -> String {
@@ -74,6 +80,8 @@ pub fn attach(
             hunk_text: after_text(diff, h),
             finding,
             dismissed: None,
+            reviewer_model: None,
+            implementer_models: Vec::new(),
         }),
         None => {
             let hunks: Vec<String> = diff

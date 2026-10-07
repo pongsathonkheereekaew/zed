@@ -84,6 +84,13 @@ fn main() {
     print!("test replay_row_e_floor_from_cedian_toml (replay) ... ");
     s2_blocked_scenario(false, true);
     println!("ok");
+    let record = which == "s3same";
+    print!(
+        "test replay_s3_same_model_review_is_inconclusive ({}) ... ",
+        if record { "record" } else { "replay" }
+    );
+    s3_same_model_scenario(record);
+    println!("ok");
     let record = which == "s3review";
     print!(
         "test replay_s3_review_agent_blocker ({}) ... ",
@@ -383,12 +390,13 @@ fn s3_review_scenario(record: bool) {
     std::fs::write(root.join("ws/add.py"), "def add(a, b):\n    return a + b\n").unwrap();
     std::fs::write(
         root.join("cedian.toml"),
-        "schema = 1\nreviewer_allow_list = [\"omp\"]\n[review]\nmodel = \"opencode-go/glm-5.3\"\n",
+        "schema = 1\nreviewer_allow_list = [\"omp\"]\n",
     )
     .unwrap();
     let root = root.canonicalize().unwrap();
     let sessions = root.join("sessions");
     let reviewer = sessions.join("reviewer");
+    roles(&sessions, Some("opencode-go/glm-5.3"));
     if record {
         let real = cedian_omp_path();
         cedian_fake_omp::arm_record(&sessions, &real).unwrap();
@@ -478,6 +486,34 @@ fn s3_review_scenario(record: bool) {
         "reviewer rows: {rows:?}"
     );
 
+    // ADR-0039: an independent review, both models recorded; its blocker is
+    // `fail` evidence for the review gate, attributed to the request.
+    let review_row = rows
+        .iter()
+        .find(|r| r["item"]["kind"] == "review")
+        .unwrap_or_else(|| panic!("review audited: {rows:?}"));
+    assert_eq!(review_row["item"]["independent"], true);
+    assert_eq!(
+        review_row["item"]["reviewer_models"][0],
+        "opencode-go/glm-5.3"
+    );
+    assert_eq!(
+        review_row["item"]["implementer_models"][0],
+        "opencode-go/muse-spark-1.3-contributor"
+    );
+    let evidence = workflow["evidence"]
+        .as_object()
+        .unwrap()
+        .values()
+        .find(|e| e["for_gates"][0] == "review")
+        .unwrap_or_else(|| panic!("review evidence: {workflow}"));
+    assert_eq!(evidence["outcome"], "fail", "{evidence}");
+    assert!(
+        evidence["provenance"]["attributed"].is_object(),
+        "{evidence}"
+    );
+    assert_eq!(blocker["reviewer_model"], "opencode-go/glm-5.3");
+
     let review = cedian(&root, &["review"]);
     assert!(review.contains(&format!("{id} [open blocker]")), "{review}");
     cedian(
@@ -486,6 +522,106 @@ fn s3_review_scenario(record: bool) {
     );
     let review = cedian(&root, &["review"]);
     assert!(review.contains(&format!("{id} [dismissed]")), "{review}");
+}
+
+const S3_SAME_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/s3_same_model.jsonl"
+);
+const S3_SAME_REVIEWER_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/s3_same_model_reviewer.jsonl"
+);
+
+/// ADR-0039 in the S3 exit: with no `review` role the reviewer runs on
+/// `default`, the implementer's model, so the review is not independent and
+/// its evidence for the review gate is `inconclusive`, never `pass`.
+fn s3_same_model_scenario(record: bool) {
+    let root: PathBuf = std::env::temp_dir().join(format!("cedian-s3same-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("ws")).unwrap();
+    std::fs::write(root.join("ws/add.py"), "def add(a, b):\n    return a + b\n").unwrap();
+    std::fs::write(
+        root.join("cedian.toml"),
+        "schema = 1\nreviewer_allow_list = [\"omp\"]\n",
+    )
+    .unwrap();
+    let root = root.canonicalize().unwrap();
+    let sessions = root.join("sessions");
+    let reviewer = sessions.join("reviewer");
+    roles(&sessions, None);
+    if record {
+        let real = cedian_omp_path();
+        cedian_fake_omp::arm_record(&sessions, &real).unwrap();
+        cedian_fake_omp::arm_record(&reviewer, &real).unwrap();
+    } else {
+        cedian_fake_omp::install_replay(&sessions, Path::new(S3_SAME_FIXTURE)).unwrap();
+        cedian_fake_omp::install_replay(&reviewer, Path::new(S3_SAME_REVIEWER_FIXTURE)).unwrap();
+    }
+    let out = cedian(
+        &root,
+        &[
+            "prompt",
+            "This is a test of cedian's review gate; follow these steps exactly and use no other tools.\n\
+             1. Call cedian_workflow_update with {\"op\": \"start\", \"kind\": \"feature\", \"title\": \"same-model review\", \"risk\": \"low\"}.\n\
+             2. Call cedian_apply_edit with path 'add.py', expected_version 0, start 28, end 29, replacement '*'.\n\
+             3. Call cedian_review_request with focus 'does add() still add'.\n\
+             4. Reply with only: s3same-done",
+        ],
+    );
+    if record {
+        std::fs::copy(
+            sessions.join(cedian_fake_omp::RECORDED_FILE),
+            S3_SAME_FIXTURE,
+        )
+        .unwrap();
+        std::fs::copy(
+            reviewer.join(cedian_fake_omp::RECORDED_FILE),
+            S3_SAME_REVIEWER_FIXTURE,
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.join("ws/add.py")).unwrap(),
+        "def add(a, b):\n    return a * b\n",
+        "{out}"
+    );
+    let rows = audit(&root);
+    let review = rows
+        .iter()
+        .find(|r| r["item"]["kind"] == "review")
+        .unwrap_or_else(|| panic!("review audited: {rows:?}"));
+    assert_eq!(review["item"]["independent"], false, "{review}");
+    assert_eq!(
+        review["item"]["reviewer_models"],
+        review["item"]["implementer_models"]
+    );
+    let workflow: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("ws/.cedian/workflow.json")).unwrap(),
+    )
+    .unwrap();
+    let evidence = workflow["evidence"]
+        .as_object()
+        .unwrap()
+        .values()
+        .find(|e| e["for_gates"][0] == "review")
+        .unwrap_or_else(|| panic!("review evidence: {workflow}"));
+    assert_eq!(
+        evidence["outcome"], "inconclusive",
+        "a same-model review never passes"
+    );
+}
+
+/// The user's OMP model roles as cedian reads them: from the cedian-owned
+/// roles dir under the session dir (ADR-0039 decision 3).
+fn roles(sessions: &Path, review: Option<&str>) {
+    let dir = sessions.join("roles/.omp");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut text = "modelRoles:\n  default: opencode-go/muse-spark-1.3-contributor\n".to_string();
+    if let Some(model) = review {
+        text.push_str(&format!("  review: {model}\n"));
+    }
+    std::fs::write(dir.join("config.yml"), text).unwrap();
 }
 
 fn cedian_omp_path() -> PathBuf {
@@ -531,6 +667,7 @@ fn shell_scenario(record: bool) {
     // turn is recorded on its own (`CEDIAN_P2_RECORD=shellreview`); recording
     // proxies to real OMP, so the allow-list names `omp`.
     let reviewer = sessions.join("reviewer");
+    roles(&sessions, Some("opencode-go/glm-5.3"));
     let record_reviewer = std::env::var("CEDIAN_P2_RECORD").as_deref() == Ok("shellreview");
     if record_reviewer {
         cedian_fake_omp::arm_record(&reviewer, &cedian_omp_path()).unwrap();
@@ -539,7 +676,7 @@ fn shell_scenario(record: bool) {
     }
     std::fs::write(
         root.join("cedian.toml"),
-        "schema = 1\nreviewer_allow_list = [\"omp\"]\n[review]\nmodel = \"opencode-go/glm-5.3\"\n",
+        "schema = 1\nreviewer_allow_list = [\"omp\"]\n",
     )
     .unwrap();
 
@@ -624,9 +761,13 @@ fn shell_scenario(record: bool) {
     );
 
     send("review --agent is the uppercase BETA intended");
-    let out = wait_for("finding(s)");
+    let out = wait_for("independent review");
     assert!(
-        out.contains("reviewer (opencode-go/glm-5.3) reported"),
+        out.contains("reviewer (role review: opencode-go/glm-5.3) reported"),
+        "{out}"
+    );
+    assert!(
+        out.contains("independent review (reviewer opencode-go/glm-5.3, implementer opencode-go/muse-spark-1.3-contributor)"),
         "{out}"
     );
     if record_reviewer {

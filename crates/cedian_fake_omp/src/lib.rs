@@ -95,6 +95,23 @@ pub fn config_get(args: &[String]) -> i32 {
         "computer.enabled" => {
             serde_json::json!(field("computer", "enabled").as_deref() == Some("true"))
         }
+        "modelRoles" => {
+            let mut record = serde_json::Map::new();
+            let mut inside = false;
+            for line in config.lines() {
+                if !line.starts_with(' ') {
+                    inside = line.trim_end() == "modelRoles:";
+                } else if inside {
+                    if let Some((k, v)) = line.trim().split_once(':') {
+                        record.insert(
+                            k.trim().into(),
+                            serde_json::json!(v.trim().trim_matches('"')),
+                        );
+                    }
+                }
+            }
+            serde_json::Value::Object(record)
+        }
         "tools.approval" => {
             let mut record = serde_json::Map::new();
             let (mut in_tools, mut in_approval) = (false, false);

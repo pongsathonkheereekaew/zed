@@ -10,9 +10,9 @@
 //! protocol forward-compat. Classification is a pure typed `match`, never
 //! Debug-string parsing.
 
-use omp_rpc::wire::{AssistantMessageEvent, RpcAgentEvent, RpcNotification};
+use omp_rpc::wire::{AgentMessage, AssistantMessageEvent, RpcAgentEvent, RpcNotification};
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, mpsc};
 
 /// Classified view of one OMP frame for cedian consumers.
@@ -118,6 +118,8 @@ struct Inner {
     next_seq: u64,
     subscribers: HashMap<u64, mpsc::Sender<RouterEvent>>,
     next_sub: u64,
+    /// `provider/model` of every assistant message this session finished.
+    answered: BTreeSet<String>,
 }
 
 impl EventRouter {
@@ -129,6 +131,7 @@ impl EventRouter {
                 next_seq: 0,
                 subscribers: HashMap::new(),
                 next_sub: 0,
+                answered: BTreeSet::new(),
             })),
         }
     }
@@ -136,8 +139,25 @@ impl EventRouter {
     /// Classify one notification frame, append to the log, broadcast. Dead
     /// subscribers are pruned. Never fails on unknown input.
     pub fn dispatch_notification(&self, frame: &RpcNotification) {
+        if let RpcNotification::RpcAgentEvent(RpcAgentEvent::MessageEnd(end)) = frame {
+            if let AgentMessage::Assistant(message) = &end.message {
+                if let Some(model) = &message.model {
+                    let id = match &message.provider {
+                        Some(provider) => format!("{provider}/{model}"),
+                        None => model.clone(),
+                    };
+                    self.inner.lock().answered.insert(id);
+                }
+            }
+        }
         let classified = classify_notification(frame);
         self.push(classified);
+    }
+
+    /// The models that actually answered in this session, as
+    /// `provider/model`, sorted (ADR-0039: independence is measured).
+    pub fn answered_models(&self) -> Vec<String> {
+        self.inner.lock().answered.iter().cloned().collect()
     }
 
     /// Subscribe to classified events. Returns (id, receiver); drop the
@@ -505,6 +525,27 @@ mod tests {
             classify_agent_event(&end),
             RouterEvent::MessageEnd { message_id } if message_id == "m1"
         ));
+    }
+
+    #[test]
+    fn models_that_answered_are_recorded_from_assistant_messages() {
+        let router = EventRouter::new();
+        let end = |role: &str, provider: &str, model: &str| {
+            RpcNotification::RpcAgentEvent(agent_event(serde_json::json!({
+                "type": "message_end",
+                "messageId": "m1",
+                "message": {"role": role, "content": [], "timestamp": 0,
+                            "provider": provider, "model": model},
+            })))
+        };
+        router.dispatch_notification(&end("assistant", "opencode-go", "muse-spark-1.3"));
+        router.dispatch_notification(&end("assistant", "opencode-go", "muse-spark-1.3"));
+        router.dispatch_notification(&end("assistant", "opencode-go", "glm-5.3"));
+        assert_eq!(
+            router.answered_models(),
+            ["opencode-go/glm-5.3", "opencode-go/muse-spark-1.3"],
+            "each model once, sorted"
+        );
     }
 
     #[test]

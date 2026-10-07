@@ -487,6 +487,40 @@ impl WorkflowChannel {
         }))
     }
 
+    /// Evidence cedian produced itself, such as a review it ran (ADR-0039):
+    /// attributed to the host-tool call that asked for it, unattributed
+    /// when a person ran it from the CLI. `None` without an active workflow.
+    pub fn cedian_evidence(
+        &self,
+        gate: &str,
+        outcome: Outcome,
+        summary: &str,
+        tool_call_id: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(mut state) = self.store.load()? else {
+            return Ok(None);
+        };
+        let id = format!("e{}", state.evidence.len() + 1);
+        let current = (self.current)();
+        let item = match tool_call_id {
+            Some(call) => Evidence::attributed(
+                &id,
+                EvidenceKind::Custom,
+                &[gate],
+                summary,
+                outcome,
+                &self.task_id,
+                call,
+            ),
+            None => Evidence::unattributed(&id, EvidenceKind::Custom, &[gate], summary, outcome),
+        }
+        .with_code_state(current.bind(&[]));
+        state.attach(item).map_err(|e| e.to_string())?;
+        self.store.save(&state)?;
+        Ok(Some(id))
+    }
+
     fn active(&self) -> Result<WorkflowState, String> {
         self.store.load()?.ok_or_else(|| {
             format!("no cedian workflow is active; start one with {WORKFLOW_UPDATE_TOOL} op=start")
@@ -858,6 +892,52 @@ mod tests {
         );
         open.lock().unwrap().clear();
         assert!(ch.complete(&Map::new()).unwrap().starts_with("complete"));
+    }
+
+    #[test]
+    fn a_review_cedian_ran_is_evidence_for_the_review_gate() {
+        let (ch, store, _) = channel();
+        assert_eq!(
+            ch.cedian_evidence("review", Outcome::Pass, "no workflow", Some("call-1"))
+                .unwrap(),
+            None,
+            "nothing to attach to without a workflow"
+        );
+        start(&ch);
+        let same = ch
+            .cedian_evidence(
+                "review",
+                Outcome::Inconclusive,
+                "same model",
+                Some("call-2"),
+            )
+            .unwrap()
+            .unwrap();
+        let state = store.load().unwrap().unwrap();
+        let item = &state.evidence[&same];
+        assert_eq!(item.outcome, Outcome::Inconclusive);
+        assert!(matches!(
+            &item.provenance,
+            crate::Provenance::Attributed { tool_call_id, .. } if tool_call_id == "call-2"
+        ));
+        let gate = state.gate_result("review", &files("beta")).unwrap();
+        assert_ne!(
+            gate.status,
+            GateStatus::Passed,
+            "a same-model review never passes"
+        );
+        ch.cedian_evidence(
+            "review",
+            Outcome::Pass,
+            "independent, no blocker",
+            Some("call-3"),
+        )
+        .unwrap();
+        let state = store.load().unwrap().unwrap();
+        assert_eq!(
+            state.gate_result("review", &files("beta")).unwrap().status,
+            GateStatus::Passed
+        );
     }
 
     #[test]

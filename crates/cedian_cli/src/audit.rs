@@ -102,6 +102,23 @@ impl AuditLog {
         self.append(item, Some(refusal.at_ms))
     }
 
+    /// One review cedian ran: the role, both sides' models and whether it
+    /// was independent (ADR-0039 decision 4).
+    pub fn review(
+        &mut self,
+        role: &str,
+        reviewer: &[String],
+        implementer: &[String],
+        independent: bool,
+    ) -> Result<(), String> {
+        let item = json!({
+            "kind": "review", "tool": "cedian_review_request", "role": role,
+            "reviewer_models": reviewer, "implementer_models": implementer,
+            "independent": independent,
+        });
+        self.append(item, None)
+    }
+
     /// A person dismissed a review finding: they let the change through
     /// over it, with a reason (ADR-0011).
     pub fn dismissal(&mut self, finding: &str, reason: &str) -> Result<(), String> {

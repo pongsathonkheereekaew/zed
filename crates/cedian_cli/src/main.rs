@@ -116,8 +116,13 @@ pub(crate) fn dispatch(args: Vec<String>, in_shell: bool) -> Result<(), String> 
             }
             Some("--agent") => {
                 let focus = args[2.min(args.len())..].join(" ");
+                let channel = workflow_channel(&workdir, &settings, |_, _| None);
+                let requester = review_agent::Requester {
+                    channel: Some(&channel),
+                    ..Default::default()
+                };
                 let reply =
-                    review_agent::run_review(&workdir, &session_dir, &settings, &focus, None)?;
+                    review_agent::run_review(&workdir, &session_dir, &settings, &focus, requester)?;
                 println!("{reply}");
                 Ok(())
             }
@@ -232,6 +237,25 @@ fn host_tool_names(settings: &cedian_shell::Settings) -> Vec<&'static str> {
         names.push(cedian_worker::WORKTREE_REQUEST_TOOL);
     }
     names
+}
+
+/// The workflow channel over `workdir`'s store, with the user's floor and
+/// the project's verification profiles. `resolve` binds reported evidence
+/// to a finished tool call; the CLI's own paths pass one that binds none.
+fn workflow_channel(
+    workdir: &Path,
+    settings: &cedian_shell::Settings,
+    resolve: impl Fn(&str, &str) -> Option<cedian_workflow::BoundCall> + Send + Sync + 'static,
+) -> std::sync::Arc<cedian_workflow::WorkflowChannel> {
+    let root = workdir.to_path_buf();
+    cedian_workflow::WorkflowChannel::with_policy(
+        "cli",
+        Box::new(DiskWorkflowStore(workdir.to_path_buf())),
+        resolve,
+        move || current_state(&root),
+        settings.floor.clone(),
+        Box::new(verify_store::DiskProfileStore(workdir.to_path_buf())),
+    )
 }
 
 /// Turn boundary (ADR-0036): a refused `cedian_complete` in this turn
@@ -356,15 +380,7 @@ fn host_tools(
             mutated_after,
         })
     };
-    let root = workdir.to_path_buf();
-    let channel = cedian_workflow::WorkflowChannel::with_policy(
-        "cli",
-        Box::new(DiskWorkflowStore(workdir.to_path_buf())),
-        resolve,
-        move || current_state(&root),
-        settings.floor.clone(),
-        Box::new(verify_store::DiskProfileStore(workdir.to_path_buf())),
-    );
+    let channel = workflow_channel(workdir, settings, resolve);
     let root = workdir.to_path_buf();
     let live = std::sync::Arc::clone(host);
     channel.set_blockers(move || {
@@ -382,6 +398,8 @@ fn host_tools(
         session_dir.to_path_buf(),
         settings.clone(),
         host.clone(),
+        rt.router(),
+        std::sync::Arc::clone(&channel),
     ));
     let class_root = workdir.to_path_buf();
     tools.push(corrections::correction_class_tool(
@@ -818,6 +836,7 @@ pub(crate) fn run_turn(
     if let Some(n) = store.record_turn(kind, label, turn_files) {
         println!("(turn {n} recorded — `revert-turn {n}` puts it back)");
     }
+    store.models.extend(rt.router().answered_models());
     let saved = session::save(workdir, &store);
     let total_ms = timing::ms(turn_started.elapsed());
     timing::record(serde_json::json!({

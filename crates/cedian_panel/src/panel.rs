@@ -365,3 +365,123 @@ impl Panel for CedianPanel {
         20
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Live S9a exit check (T2 + T5) without a visible window: the real panel
+    //! code, real OMP through the spawn profile, real disk, real Zed buffer
+    //! undo. Needs OMP auth:
+    //! `cargo test -p cedian_panel -- --ignored --nocapture live_`
+    use super::*;
+    use gpui::TestAppContext;
+    use settings::SettingsStore;
+    use std::time::Instant;
+
+    fn init(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+        });
+    }
+
+    /// Pump the test executor while real OS threads (OMP) make progress.
+    fn wait_until(
+        cx: &mut TestAppContext,
+        what: &str,
+        mut done: impl FnMut(&mut TestAppContext) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(300);
+        loop {
+            cx.run_until_parked();
+            if done(cx) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    fn texts(panel: &CedianPanel) -> String {
+        let (messages, cards) = cedian_agent_ui::render_thread(panel.thread.events());
+        let mut out: Vec<String> = messages
+            .iter()
+            .map(|m| format!("{:?}: {}", m.role, m.text))
+            .collect();
+        out.extend(cards.iter().map(|c| format!("card {:?} {}", c.status, c.display_line())));
+        out.join("\n")
+    }
+
+    #[gpui::test]
+    #[ignore]
+    async fn live_panel_streams_and_imports_one_undoable_omp_edit(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init(cx);
+        let dir = std::env::temp_dir().join(format!("cedian-s9a-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("notes.txt"), "alpha\nbeta\ngamma\n").unwrap();
+        let dir = dir.canonicalize().unwrap();
+
+        let fs = fs::RealFs::new(None, cx.executor());
+        let project = Project::test(fs, [dir.as_path()], cx).await;
+        let buffer = project
+            .update(cx, |p, cx| p.open_local_buffer(dir.join("notes.txt"), cx))
+            .await
+            .unwrap();
+        let window = cx.add_window(|window, cx| CedianPanel::new(project.clone(), window, cx));
+
+        let send = |cx: &mut TestAppContext, text: &'static str| {
+            window
+                .update(cx, |panel, window, cx| {
+                    panel
+                        .input
+                        .update(cx, |editor, cx| editor.set_text(text, window, cx));
+                    panel.send(window, cx);
+                    assert!(!panel.status.starts_with("error"), "{}", panel.status);
+                })
+                .unwrap();
+        };
+        let read = |cx: &mut TestAppContext| {
+            window
+                .update(cx, |panel, _, _| (panel.status.clone(), texts(panel), panel.imported.len(), panel.stale))
+                .unwrap()
+        };
+
+        // T2: a prompt typed into the panel streams a reply into the thread.
+        send(cx, "Reply with exactly this word and nothing else: hello-cedian");
+        wait_until(cx, "streamed reply", |cx| {
+            let (status, text, _, _) = read(cx);
+            status == "idle" && text.contains("hello-cedian")
+        });
+        eprintln!("--- after T2 ---\n{}", read(cx).1);
+
+        // T5: OMP's own edit tool writes disk → one imported transaction.
+        send(
+            cx,
+            "Use your edit tool (not bash, not a host tool) to change the line `beta` to `BETA` \
+             in notes.txt in the current workspace. Then reply with only: done",
+        );
+        wait_until(cx, "imported agent edit", |cx| {
+            let (status, _, imported, _) = read(cx);
+            status == "idle" && imported >= 1
+        });
+        let (_, text, imported, stale) = read(cx);
+        eprintln!("--- after T5 ---\n{text}\nimported={imported} stale={stale}");
+        assert_eq!(imported, 1, "exactly one agent transaction");
+        assert_eq!(stale, 0);
+        let call_id = window
+            .update(cx, |panel, _, _| panel.imported[0].tool_call_id.clone())
+            .unwrap();
+        assert!(!call_id.is_empty(), "keyed by tool_call_id");
+
+        buffer.update(cx, |b, cx| {
+            assert_eq!(b.text(), "alpha\nBETA\ngamma\n", "buffer shows OMP's write");
+            assert!(!b.is_dirty());
+            b.undo(cx);
+            assert_eq!(b.text(), "alpha\nbeta\ngamma\n", "ONE native undo reverts it");
+        });
+        eprintln!("tool_call_id={call_id}: OMP edit imported and reverted by one undo");
+    }
+}

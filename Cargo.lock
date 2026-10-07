@@ -2890,6 +2890,7 @@ dependencies = [
  "cedian_fake_omp",
  "cedian_omp",
  "cedian_panel",
+ "cedian_review",
  "cedian_shell",
  "cedian_workspace",
  "clock",

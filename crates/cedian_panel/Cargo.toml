@@ -23,6 +23,7 @@ anyhow.workspace = true
 cedian_agent = { path = "../cedian_agent" }
 cedian_agent_ui = { path = "../cedian_agent_ui" }
 cedian_omp = { path = "../cedian_omp" }
+cedian_review = { path = "../cedian_review" }
 cedian_shell = { path = "../cedian_shell" }
 cedian_workspace = { path = "../cedian_workspace" }
 clock.workspace = true

@@ -17,10 +17,18 @@ use language::Buffer;
 use text::TransactionId;
 
 /// Buffer state captured when an edit-class tool starts.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Mark {
-    start_version: clock::Global,
+    start: text::BufferSnapshot,
     start_top: Option<TransactionId>,
+}
+
+impl Mark {
+    /// The buffer as it was when the tool started: a file's review baseline
+    /// on the task's first edit to it.
+    pub fn start(&self) -> &text::BufferSnapshot {
+        &self.start
+    }
 }
 
 /// What [`finish`] did to one buffer.
@@ -42,7 +50,7 @@ fn top(buffer: &Buffer) -> Option<TransactionId> {
 pub fn begin(buffer: &mut Buffer) -> Mark {
     buffer.finalize_last_transaction();
     Mark {
-        start_version: buffer.version(),
+        start: buffer.text_snapshot(),
         start_top: top(buffer),
     }
 }
@@ -78,7 +86,7 @@ pub async fn finish(
             (None, None) => None,
         };
         Ok(match id {
-            Some(id) if b.version() != mark.start_version => {
+            Some(id) if b.version() != *mark.start.version() => {
                 b.finalize_last_transaction();
                 ImportOutcome::Imported(id)
             }

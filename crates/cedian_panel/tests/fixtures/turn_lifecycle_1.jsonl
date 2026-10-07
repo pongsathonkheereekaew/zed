@@ -1,0 +1,34 @@
+{"dir":"out","frame":{"maxFrameBytes":1048576,"maxReassembledFrameBytes":67108864,"protocolVersion":1,"supportedProtocolVersions":[1,2],"type":"ready"}}
+{"dir":"in","frame":{"id":"req_1","protocolVersion":2,"type":"negotiate_protocol"}}
+{"dir":"out","frame":{"command":"negotiate_protocol","data":{"protocolVersion":2},"id":"req_1","success":true,"type":"response"}}
+{"dir":"in","frame":{"enabled":true,"id":"req_2","type":"set_ask_dialog"}}
+{"dir":"out","frame":{"command":"set_ask_dialog","data":{"enabled":true},"id":"req_2","success":true,"type":"response"}}
+{"dir":"in","frame":{"id":"req_3","type":"get_state"}}
+{"dir":"out","frame":{"command":"get_state","id":"req_3","success":true,"type":"response","data":{"sessionId":"7e1f0000-0000-7000-8000-000000000001","sessionFile":"${CEDIAN_CWD}/session.jsonl"}}}
+{"dir":"in","frame":{"id":"req_4","sessionDir":"${CEDIAN_CWD}","type":"open_session"}}
+{"dir":"out","frame":{"command":"open_session","data":{"cancelled":false,"resumed":true,"sessionFile":"${CEDIAN_CWD}/session.jsonl","sessionId":"7e1f0000-0000-7000-8000-000000000001"},"id":"req_4","success":true,"type":"response"}}
+{"dir":"in","frame":{"id":"req_5","message":"one","type":"prompt"}}
+{"dir":"out","frame":{"command":"prompt","id":"req_5","success":true,"type":"response"}}
+{"dir":"out","frame":{"type":"agent_start"}}
+{"dir":"in","frame":{"id":"req_6","type":"abort"}}
+{"dir":"out","frame":{"command":"abort","id":"req_6","success":true,"type":"response"}}
+{"dir":"out","frame":{"agentInvoked":true,"id":"req_5","sessionSettled":true,"status":"aborted","type":"prompt_result"}}
+{"dir":"out","frame":{"type":"session_settled"}}
+{"dir":"in","frame":{"id":"req_7","message":"three","type":"prompt"}}
+{"dir":"out","frame":{"command":"prompt","id":"req_7","success":false,"type":"response","error":"rejected by the test"}}
+{"dir":"in","frame":{"id":"req_8","message":"audit","type":"prompt"}}
+{"dir":"out","frame":{"command":"prompt","id":"req_8","success":true,"type":"response"}}
+{"dir":"out","frame":{"type":"agent_start"}}
+{"dir":"out","frame":{"id":"u4-audit","method":"select","options":["Approve","Deny"],"title":"Allow tool: bash\nCommand: ls","type":"extension_ui_request"}}
+{"dir":"in","frame":{"id":"u4-audit","type":"extension_ui_response","value":"Approve"}}
+{"dir":"in","frame":{"id":"req_9","type":"abort"}}
+{"dir":"out","frame":{"command":"abort","id":"req_9","success":true,"type":"response"}}
+{"dir":"out","frame":{"agentInvoked":true,"id":"req_8","sessionSettled":true,"status":"aborted","type":"prompt_result"}}
+{"dir":"out","frame":{"type":"session_settled"}}
+{"dir":"in","frame":{"id":"req_10","message":"after the audit","type":"prompt"}}
+{"dir":"out","frame":{"command":"prompt","id":"req_10","success":true,"type":"response"}}
+{"dir":"out","frame":{"type":"agent_start"}}
+{"dir":"out","frame":{"agentInvoked":true,"id":"req_10","sessionSettled":true,"status":"completed","type":"prompt_result"}}
+{"dir":"out","frame":{"type":"session_settled"}}
+{"dir":"in","frame":{"id":"req_11","message":"four","type":"prompt"}}
+{"dir":"fs","frame":{"type":"fs_write","path":"old-omp-got-four","content":""}}

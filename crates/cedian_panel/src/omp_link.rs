@@ -22,7 +22,7 @@ use futures::channel::mpsc::UnboundedSender;
 use omp_rpc::{ExtensionUiRequest, ExtensionUiResponse, ImageContent};
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock, mpsc};
 use std::time::Duration;
 
@@ -47,6 +47,12 @@ pub enum LinkEvent {
     /// Another process drives the session, or whether one does could not be
     /// checked: the app sends it no prompt (ADR-0040 decision 5).
     Taken { session_id: String, reason: String },
+    /// The prompt was stopped before OMP got it.
+    PromptCancelled,
+    /// OMP did not run the prompt: it refused it, or the call failed.
+    PromptFailed(String),
+    /// Stop's abort did not reach OMP.
+    AbortFailed(String),
 }
 
 /// What the panel asks of the OMP thread, in order.
@@ -112,7 +118,18 @@ pub struct OmpLink {
     commands: mpsc::Sender<Command>,
     pid: Arc<AtomicU32>,
     gate: Arc<Gate>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
+
+/// A dropped link's OMP thread and process, which the next link waits on.
+struct Previous {
+    thread: std::thread::JoinHandle<()>,
+    pid: Option<u32>,
+}
+
+/// How long a restart waits for the previous OMP to let go of the session
+/// before it kills it.
+const PREVIOUS_EXIT: Duration = Duration::from_secs(10);
 
 /// Why [`OmpLink::answer`] failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,18 +143,74 @@ pub enum AnswerError {
 
 /// Shared by the panel (answers), the event thread (tool rows, dialogs
 /// opening and closing) and the OMP thread (control, once spawned).
-#[derive(Default)]
 struct Gate {
     control: OnceLock<RuntimeControl>,
-    /// Set while OMP runs a prompt.
-    turn: AtomicBool,
+    turn: Mutex<TurnState>,
     state: Mutex<GateState>,
+    events: UnboundedSender<LinkEvent>,
+}
+
+/// The one prompt in flight, shared by the panel (send, Stop, Drop), the OMP
+/// thread (which sends it) and the event thread (which sees it start), so a
+/// Stop or Drop at any point ends it exactly once: before OMP has it, the
+/// OMP thread drops it; once OMP started it, one abort goes out.
+#[derive(Default)]
+struct TurnState {
+    phase: Phase,
+    /// Stop or an audit failure: the current prompt must not run.
+    cancelled: bool,
+    /// The link was dropped: no further command runs.
+    closed: bool,
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+enum Phase {
+    #[default]
+    Idle,
+    /// Waiting in the queue or in the driver check.
+    Queued,
+    /// Written to OMP, not started yet.
+    Sent,
+    Started,
 }
 
 impl Gate {
     fn send(&self, reply: ExtensionUiResponse) -> Result<(), String> {
         let control = self.control.get().ok_or("OMP is not running")?;
         control.respond(reply).map_err(|e| e.to_string())
+    }
+
+    /// Cancel the current prompt; with `close`, every later one too.
+    fn cancel(&self, close: bool) {
+        let mut turn = self.turn.lock();
+        turn.cancelled = true;
+        turn.closed |= close;
+        if turn.phase == Phase::Started {
+            self.abort();
+        }
+    }
+
+    /// OMP started the prompt it was sent: abort it at once if cancelled.
+    fn started(&self) {
+        let mut turn = self.turn.lock();
+        if turn.phase == Phase::Sent {
+            turn.phase = Phase::Started;
+            if turn.cancelled {
+                self.abort();
+            }
+        }
+    }
+
+    fn abort(&self) {
+        let Some(control) = self.control.get().cloned() else {
+            return;
+        };
+        let events = self.events.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = control.abort() {
+                let _ = events.unbounded_send(LinkEvent::AbortFailed(e.to_string()));
+            }
+        });
     }
 }
 
@@ -237,27 +310,66 @@ impl GateState {
 impl OmpLink {
     /// Start OMP on its own thread; everything it reports goes to `events`.
     /// Prompts sent before it is ready wait in order.
-    pub fn start(spec: LaunchSpec, events: UnboundedSender<LinkEvent>) -> Self {
+    /// `previous`, the link this one replaces, is dropped here; the new OMP
+    /// opens its session only once the old one has ended.
+    pub fn start(
+        spec: LaunchSpec,
+        events: UnboundedSender<LinkEvent>,
+        previous: Option<OmpLink>,
+    ) -> Self {
+        let previous = previous.and_then(|mut link| {
+            let pid = link.pid();
+            link.thread.take().map(|thread| Previous { thread, pid })
+        });
         let (commands, command_rx) = mpsc::channel::<Command>();
         let pid = Arc::new(AtomicU32::new(0));
-        let gate = Arc::new(Gate::default());
+        let gate = Arc::new(Gate {
+            control: OnceLock::new(),
+            turn: Mutex::default(),
+            state: Mutex::default(),
+            events: events.clone(),
+        });
         let thread_pid = Arc::clone(&pid);
         let thread_gate = Arc::clone(&gate);
-        let spawned = std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("cedian-omp".to_string())
-            .spawn(move || run(spec, command_rx, events, thread_pid, thread_gate));
-        if let Err(e) = spawned {
-            log::error!("cedian: cannot start the OMP thread: {e}");
-        }
+            .spawn(move || run(spec, command_rx, events, thread_pid, thread_gate, previous))
+            .inspect_err(|e| log::error!("cedian: cannot start the OMP thread: {e}"))
+            .ok();
         Self {
             commands,
             pid,
             gate,
+            thread,
         }
     }
 
+    /// Send a prompt. One runs at a time: the panel sends the next only
+    /// once this one has settled, failed, been refused or cancelled.
     pub fn send(&self, prompt: Prompt) -> Result<(), String> {
+        {
+            let mut turn = self.gate.turn.lock();
+            turn.phase = Phase::Queued;
+            turn.cancelled = false;
+        }
         self.command(Command::Prompt(prompt))
+    }
+
+    /// Stop the current prompt: dropped if OMP does not have it yet,
+    /// aborted if it does.
+    pub fn cancel(&self) {
+        self.gate.cancel(false);
+    }
+
+    /// Whether OMP still waits on dialog `request_id`.
+    pub fn is_open(&self, request_id: &str) -> bool {
+        self.gate.state.lock().open.contains_key(request_id)
+    }
+
+    /// Make every later audit row fail, as a full disk would.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn break_audit(&self) {
+        self.gate.state.lock().audit = None;
     }
 
     /// Check a taken session again; `Ready` or `Taken` follows.
@@ -319,15 +431,7 @@ impl Drop for OmpLink {
         if let Err(e) = self.close_dialogs() {
             log::error!("cedian: {e}");
         }
-        if self.gate.turn.load(Ordering::Relaxed)
-            && let Some(control) = self.control()
-        {
-            std::thread::spawn(move || {
-                if let Err(e) = control.abort() {
-                    log::warn!("cedian: abort on shutdown: {e}");
-                }
-            });
-        }
+        self.gate.cancel(true);
     }
 }
 
@@ -337,6 +441,7 @@ fn run(
     events: UnboundedSender<LinkEvent>,
     pid: Arc<AtomicU32>,
     gate: Arc<Gate>,
+    previous: Option<Previous>,
 ) {
     match AuditLog::open(&spec.state_dir, spec.policy.approvals) {
         Ok(audit) => gate.state.lock().audit = Some(audit),
@@ -370,6 +475,9 @@ fn run(
     let forward_gate = Arc::clone(&gate);
     std::thread::spawn(move || {
         for event in router_events {
+            if matches!(event, RouterEvent::AgentStart) {
+                forward_gate.started();
+            }
             if let Err(e) = forward_gate.state.lock().observe(&event) {
                 let _ = forward.unbounded_send(LinkEvent::AuditFailed(e));
             }
@@ -378,6 +486,9 @@ fn run(
             }
         }
     });
+    if let Some(previous) = previous {
+        wait_for(previous);
+    }
     let mut session = match runtime.open_session("app") {
         Ok(opened) => Session {
             id: opened.session_id,
@@ -428,18 +539,40 @@ fn run(
         None
     };
     let _ = events.unbounded_send(first.unwrap_or_else(|| ready(&session)));
+    let idle = |turn: &mut TurnState| turn.phase = Phase::Idle;
     for command in commands {
+        if gate.turn.lock().closed {
+            break;
+        }
         match command {
             Command::Prompt(prompt) => {
                 if let Some(refusal) = taken(&session) {
+                    idle(&mut gate.turn.lock());
                     let _ = events.unbounded_send(refusal);
                     continue;
                 }
-                gate.turn.store(true, Ordering::Relaxed);
-                if let Err(e) = runtime.prompt(&prompt.text, prompt.images) {
-                    log::error!("cedian: OMP turn failed: {e}");
+                {
+                    let mut turn = gate.turn.lock();
+                    if turn.cancelled || turn.closed {
+                        idle(&mut turn);
+                        let _ = events.unbounded_send(LinkEvent::PromptCancelled);
+                        continue;
+                    }
+                    turn.phase = Phase::Sent;
                 }
-                gate.turn.store(false, Ordering::Relaxed);
+                let result = runtime.prompt(&prompt.text, prompt.images);
+                let cancelled = {
+                    let mut turn = gate.turn.lock();
+                    idle(&mut turn);
+                    turn.cancelled
+                };
+                if let Err(e) = result {
+                    let _ = events.unbounded_send(if cancelled {
+                        LinkEvent::PromptCancelled
+                    } else {
+                        LinkEvent::PromptFailed(e.to_string())
+                    });
+                }
             }
             Command::Retry => {
                 let _ = events.unbounded_send(taken(&session).unwrap_or_else(|| ready(&session)));
@@ -471,6 +604,22 @@ fn run(
         }
     }
     let _ = runtime.shutdown();
+}
+
+/// Wait for the previous link's OMP to end, so it no longer holds the
+/// session; it is ours, so one that does not end in time is killed.
+fn wait_for(previous: Previous) {
+    let deadline = std::time::Instant::now() + PREVIOUS_EXIT;
+    while !previous.thread.is_finished() {
+        if std::time::Instant::now() >= deadline {
+            log::warn!("cedian: the previous OMP did not exit; killing it");
+            if let Some(pid) = previous.pid {
+                cedian_omp::driver::kill(pid);
+            }
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 struct Session {
@@ -641,7 +790,7 @@ mod tests {
                         ..
                     } => return (session_id, resumed, session_file),
                     LinkEvent::Failed(e) => panic!("{e}"),
-                    LinkEvent::Event(_) | LinkEvent::AuditFailed(_) | LinkEvent::Taken { .. } => {}
+                    _ => {}
                 }
             }
             panic!("OMP thread ended without a session")
@@ -670,7 +819,7 @@ mod tests {
             omp_state: cedian_omp::driver::state_root(),
         };
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
-        let link = OmpLink::start(spec(), tx);
+        let link = OmpLink::start(spec(), tx, None);
         let (first, resumed, file) = ready(&mut rx);
         assert!(!resumed);
         let file = PathBuf::from(file.expect("OMP names the session file"));
@@ -694,9 +843,8 @@ mod tests {
                 }
             }
         });
-        drop(link);
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
-        let _link = OmpLink::start(spec(), tx);
+        let _link = OmpLink::start(spec(), tx, Some(link));
         let (again, resumed, _) = ready(&mut rx);
         assert_eq!((again.as_str(), resumed), (first.as_str(), true));
         let _ = std::fs::remove_dir_all(file.parent().unwrap());

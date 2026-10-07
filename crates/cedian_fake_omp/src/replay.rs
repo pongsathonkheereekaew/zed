@@ -2,8 +2,8 @@
 //!
 //! Server (`out`) frames are emitted in recorded order. At each recorded host
 //! (`in`) frame, replay blocks for the host's next line and checks its `type`
-//! matches, and a dialog answer (and a prompt's recorded images) matches
-//! whole; the host's fresh request id is mapped onto the recorded one so the
+//! matches, and a dialog answer (and a prompt's text and recorded images)
+//! matches whole; the host's fresh request id is mapped onto the recorded one so the
 //! recorded `response` frames correlate.
 //! Any divergence exits with [`crate::EXIT_DIVERGED`] — the host sees a
 //! closed transport, never a hang.
@@ -34,6 +34,19 @@ pub(crate) fn run(fixture: &Path, cwd: &Path, placeholders: &Placeholders) -> i3
         match record.dir {
             Dir::Fs => {
                 let frame = placeholders.expand_value(&record.frame);
+                match frame.get("type").and_then(Value::as_str) {
+                    Some("fs_hold") => {
+                        hold(cwd, &frame);
+                        continue;
+                    }
+                    // A slow OMP: the next frame comes this much later.
+                    Some("fs_sleep") => {
+                        let ms = frame.get("ms").and_then(Value::as_u64).unwrap_or(0);
+                        std::thread::sleep(std::time::Duration::from_millis(ms));
+                        continue;
+                    }
+                    _ => {}
+                }
                 if let Err(e) = crate::fs_effects::apply(cwd, &frame) {
                     eprintln!("fake-omp replay: record {n}: {e}");
                     return crate::EXIT_DIVERGED;
@@ -84,6 +97,16 @@ pub(crate) fn run(fixture: &Path, cwd: &Path, placeholders: &Placeholders) -> i3
                         return crate::EXIT_DIVERGED;
                     }
                 }
+                // A prompt must be the recorded one, not merely a prompt.
+                let expected = placeholders.expand_value(&record.frame);
+                if got_type == Some("prompt") && got.get("message") != expected.get("message") {
+                    eprintln!(
+                        "fake-omp replay: divergence at record {n}: expected prompt {:?}, host sent {:?}",
+                        expected.get("message"),
+                        got.get("message")
+                    );
+                    return crate::EXIT_DIVERGED;
+                }
                 // Images the recording prompted with must reach OMP too.
                 let expected = record.frame.get("images");
                 if expected.is_some() && got.get("images") != expected {
@@ -127,6 +150,26 @@ pub(crate) fn run(fixture: &Path, cwd: &Path, placeholders: &Placeholders) -> i3
         }
     }
     0
+}
+
+/// `fs_hold`: a child in this process's group keeps `path` open for writing
+/// and ignores SIGTERM, as an OMP slow to exit holds its session until the
+/// host's SIGKILL.
+fn hold(cwd: &Path, frame: &Value) {
+    let Some(path) = frame.get("path").and_then(Value::as_str) else {
+        return;
+    };
+    let spawned = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg("trap '' TERM; exec 3>>\"$0\"; exec sleep 60")
+        .arg(cwd.join(path))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    if let Err(e) = spawned {
+        eprintln!("fake-omp replay: fs_hold: {e}");
+    }
 }
 
 fn remap_id(frame: &mut Value, ids: &HashMap<String, String>) {

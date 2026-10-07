@@ -122,6 +122,14 @@ pub fn holders_with(
     Err(format!("lsof failed ({}): {}", out.status, stderr.trim()))
 }
 
+/// SIGKILL `pid`, a driver of the app's own that did not exit.
+pub fn kill(pid: u32) {
+    let _ = std::process::Command::new("/bin/kill")
+        .args(["-KILL", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .status();
+}
+
 /// `Ok(pids)` of the other drivers of the session (empty when cedian may
 /// drive it), or why it could not be checked: `own` (the app's OMP) is
 /// unknown, `lsof` failed, or `must_see` is set and none of `files` exists

@@ -81,6 +81,17 @@ impl Thread {
         });
     }
 
+    /// Take back the newest user prompt: OMP never ran it.
+    pub fn withdraw_user(&mut self) {
+        if let Some(n) = self
+            .events
+            .iter()
+            .rposition(|e| matches!(e, ThreadEvent::User { .. }))
+        {
+            self.events.remove(n);
+        }
+    }
+
     /// Apply one router classification. Pure state transition.
     pub fn apply(&mut self, event: &RouterEvent) {
         match event {

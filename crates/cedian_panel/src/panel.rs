@@ -246,6 +246,14 @@ impl CedianPanel {
         self.link.as_ref().and_then(OmpLink::pid)
     }
 
+    /// Make the link's audit rows fail from now on.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn break_audit(&self) {
+        if let Some(link) = &self.link {
+            link.break_audit();
+        }
+    }
+
     /// Agent edits imported so far (newest last).
     pub fn imported(&self) -> &[ImportedEdit] {
         &self.imported
@@ -274,8 +282,10 @@ impl CedianPanel {
 
     /// Start (or restart) OMP for the open folder.
     fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.link = None;
+        let previous = self.link.take();
         self.dialogs.clear();
+        self.turn = Turn::Idle;
+        self.notice = None;
         let Some(root) = self.workspace_root(cx) else {
             self.connection = Connection::Stopped("open a folder first".to_string());
             return;
@@ -289,7 +299,7 @@ impl CedianPanel {
             }
         };
         let (event_tx, mut event_rx) = mpsc::unbounded::<LinkEvent>();
-        self.link = Some(OmpLink::start(spec, event_tx));
+        self.link = Some(OmpLink::start(spec, event_tx, previous));
         self.connection = Connection::Starting;
         self._events = Some(cx.spawn_in(window, async move |this, cx| {
             while let Some(event) = event_rx.next().await {
@@ -341,8 +351,24 @@ impl CedianPanel {
             }
             LinkEvent::Failed(reason) => self.stop(reason),
             LinkEvent::Taken { session_id, reason } => {
-                self.turn = Turn::Idle;
+                if self.turn != Turn::Idle {
+                    self.thread.withdraw_user();
+                    self.turn = Turn::Idle;
+                }
                 self.connection = Connection::Taken { session_id, reason };
+            }
+            LinkEvent::PromptCancelled => {
+                self.thread.withdraw_user();
+                self.turn = Turn::Idle;
+            }
+            LinkEvent::PromptFailed(e) => {
+                self.turn = Turn::Idle;
+                self.notice = Some(format!("OMP did not run the prompt: {e}"));
+            }
+            LinkEvent::AbortFailed(e) => {
+                if self.turn != Turn::Idle {
+                    self.turn = Turn::Failed(format!("stop: {e}"));
+                }
             }
             LinkEvent::AuditFailed(e) => self.audit_failed(e, cx),
             LinkEvent::Event(RouterEvent::UiRequest(ExtensionUiRequest::Cancel(cancel))) => {
@@ -351,6 +377,7 @@ impl CedianPanel {
             LinkEvent::Event(RouterEvent::UiRequest(request)) => {
                 let id = cedian_omp::dialog::dialog(&request).map(|(id, _)| id.to_string());
                 if let Some(id) = id
+                    && self.link.as_ref().is_some_and(|link| link.is_open(&id))
                     && let Some(mut dialog) = OpenDialog::new(request, window, cx)
                 {
                     let expiring = id.clone();
@@ -388,6 +415,11 @@ impl CedianPanel {
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.input.read(cx).text(cx);
         if text.trim().is_empty() {
+            return;
+        }
+        if self.turn != Turn::Idle {
+            self.notice = Some("a turn is running; stop it first".to_string());
+            cx.notify();
             return;
         }
         if self.connection == Connection::NotStarted {
@@ -466,12 +498,15 @@ impl CedianPanel {
     /// The Stop button: close the dialogs OMP waits on and abort the
     /// running turn. The turn goes idle when OMP reports the session settled.
     pub fn stop_turn(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.turn, Turn::Queued | Turn::Streaming) {
+            return;
+        }
         self.turn = Turn::Stopping;
         let closed = self.link.as_ref().map(OmpLink::close_dialogs);
         self.dialogs.clear();
         match closed {
             Some(Err(e)) => self.audit_failed(e, cx),
-            _ => self.abort(cx),
+            _ => self.cancel(),
         }
         cx.notify();
     }
@@ -485,32 +520,16 @@ impl CedianPanel {
             Turn::Idle => self.notice = Some(reason),
             Turn::Queued | Turn::Streaming | Turn::Stopping => {
                 self.turn = Turn::Failed(reason);
-                self.abort(cx);
+                self.cancel();
             }
         }
         cx.notify();
     }
 
-    fn abort(&mut self, cx: &mut Context<Self>) {
-        if !matches!(self.connection, Connection::Ready { .. }) {
-            return;
+    fn cancel(&self) {
+        if let Some(link) = &self.link {
+            link.cancel();
         }
-        let Some(control) = self.link.as_ref().and_then(OmpLink::control) else {
-            return;
-        };
-        let aborted = cx.background_spawn(async move { control.abort() });
-        cx.spawn(async move |this, cx| {
-            if let Err(e) = aborted.await {
-                this.update(cx, |this, cx| {
-                    if this.turn != Turn::Idle {
-                        this.turn = Turn::Failed(format!("stop: {e}"));
-                    }
-                    cx.notify();
-                })
-                .ok();
-            }
-        })
-        .detach();
     }
 
     /// Answer dialog `id` as its buttons do. An answer OMP did not get
@@ -728,10 +747,15 @@ impl Focusable for CedianPanel {
 
 impl Render for CedianPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let rows = self
-            .transcript()
+        let (messages, cards) = cedian_agent_ui::render_thread(self.thread.events());
+        let rows = messages
             .into_iter()
-            .map(|line| Label::new(line).into_any_element());
+            .map(|m| Label::new(format!("{:?}: {}", m.role, m.text)).into_any_element())
+            .chain(cards.into_iter().map(|c| {
+                Label::new(format!("[{:?}] {}", c.status, c.display_line()))
+                    .color(Color::Muted)
+                    .into_any_element()
+            }));
         let connection = match &self.connection {
             Connection::NotStarted => "OMP not started".to_string(),
             Connection::Starting => "starting OMP…".to_string(),
@@ -761,7 +785,8 @@ impl Render for CedianPanel {
             .iter()
             .map(|(id, dialog)| self.render_dialog(id, dialog, cx))
             .collect();
-        let stoppable = matches!(self.turn, Turn::Queued | Turn::Streaming | Turn::Failed(_));
+        let stoppable = matches!(self.turn, Turn::Queued | Turn::Streaming);
+        let idle = self.turn == Turn::Idle;
         let images = self.images.len();
         let footer = format!(
             "{} · {} · imported {} agent edit(s){}",
@@ -842,6 +867,7 @@ impl Render for CedianPanel {
                     .child(div().flex_1().child(self.input.clone()))
                     .child(
                         Button::new("cedian-send", "Send")
+                            .disabled(!idle)
                             .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
                     )
                     .when(stoppable, |row| {

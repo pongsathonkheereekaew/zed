@@ -49,7 +49,7 @@ task() {
   b9) BASE=3d66849^ REF=3d66849
       PROMPT="Write crates/cedian_omp/tests/omp_parity.rs: a test that parses the vendored vendor/omp-rpc/src/wire.rs for every RPC command, server notification and extension UI request (by wire name) and fails, naming each feature, when docs/OMP_PARITY.md has no row mentioning it in backticks. It must also fail when the parser finds fewer than 60 commands, 40 notifications or 10 UI requests (the parser no longer matching the generated file). Add any missing ledger rows so it passes." ;;
   b10) BASE=09e88b6^ REF=09e88b6
-      PROMPT="The browser store (.cedian/browser.json, crates/cedian_cli/src/browser_store.rs) has no snapshot_version. Add one; loading a file whose version is missing or different must fail with an error that says the state is too old and names the reset command, cedian browser open <url>. Add tests." ;;
+      PROMPT="The browser store (.cedian/browser.json, crates/cedian_cli/src/browser_store.rs) has no snapshot_version. Add one; loading a file whose version is missing or different must fail with an error that says the state is too old and names the reset command, cedian browser open <url>. Keep BrowserHead's fields as they are (port, ws_url, url, seq): the version lives only in the file. Add tests." ;;
   *) echo "unknown task $1" >&2; exit 2 ;;
   esac
 }

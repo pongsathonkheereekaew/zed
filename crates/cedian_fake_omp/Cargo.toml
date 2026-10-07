@@ -1,0 +1,27 @@
+[package]
+name = "cedian_fake_omp"
+version = "0.1.0"
+edition = "2021"
+
+# P2 hermetic harness (ARCHITECTURE §86): a fake `omp --mode rpc-ui` that
+# replays recorded RPC frames, plus the recording proxy that captures them
+# from a real OMP turn. Test-support only — never bundled into cedian.app.
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "fake-omp"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = { workspace = true }
+
+[dev-dependencies]
+cedian_agent = { path = "../cedian_agent" }
+cedian_agent_ui = { path = "../cedian_agent_ui" }
+cedian_omp = { path = "../cedian_omp" }
+omp-rpc = { path = "../../vendor/omp-rpc" }
+
+[lints]
+workspace = true

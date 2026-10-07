@@ -1,0 +1,211 @@
+diff --git a/crates/cedian_omp/tests/omp_parity.rs b/crates/cedian_omp/tests/omp_parity.rs
+new file mode 100644
+index 0000000..6eb5612
+--- /dev/null
++++ b/crates/cedian_omp/tests/omp_parity.rs
+@@ -0,0 +1,150 @@
++//! OMP parity ledger gate: every wire name in the generated
++//! `vendor/omp-rpc/src/wire.rs` must have a backticked row in
++//! `docs/OMP_PARITY.md`, so an OMP pin bump that adds RPC surface fails here
++//! until the ledger gains rows for it.
++//!
++//! Counts are floor-guarded so a generator-shape change that silently breaks
++//! the parser below fails loudly instead of passing vacuously.
++
++use std::collections::BTreeSet;
++
++const WIRE_RS: &str = concat!(
++    env!("CARGO_MANIFEST_DIR"),
++    "/../../vendor/omp-rpc/src/wire.rs"
++);
++const LEDGER_MD: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/OMP_PARITY.md");
++
++const MIN_COMMANDS: usize = 60;
++const MIN_NOTIFICATIONS: usize = 40;
++const MIN_UI_REQUESTS: usize = 10;
++
++/// Wire names from `impl Command for ... { const NAME: ... = "<name>"; }`.
++fn parse_commands(src: &str) -> Vec<String> {
++    let mut out = Vec::new();
++    let mut rest = src;
++    while let Some(i) = rest.find("impl Command for") {
++        rest = &rest[i + "impl Command for".len()..];
++        let Some(name_kw) = rest.find("const NAME") else {
++            break;
++        };
++        let after = &rest[name_kw..];
++        let Some(q0) = after.find('"') else { break };
++        let after_q0 = &after[q0 + 1..];
++        let Some(q1) = after_q0.find('"') else { break };
++        out.push(after_q0[..q1].to_string());
++    }
++    out.sort();
++    out.dedup();
++    out
++}
++
++/// Single-pattern `Some("<name>")` match arms inside one `impl X` block
++/// (up to its `impl Serialize for X`): the `type`/`method` discriminator
++/// values decoded by `from_value`. Multi-pattern arms such as
++/// `Some("agent_start" | "message_start" | ...)` are skipped: the closing
++/// quote must be followed immediately by `)`.
++fn parse_dispatch_names(src: &str, impl_marker: &str, end_marker: &str) -> Vec<String> {
++    let start = src
++        .find(impl_marker)
++        .unwrap_or_else(|| panic!("wire.rs: missing block {impl_marker}"));
++    let after = &src[start + impl_marker.len()..];
++    let end = after
++        .find(end_marker)
++        .unwrap_or_else(|| panic!("wire.rs: missing block {end_marker}"));
++    let block = &after[..end];
++    let mut out = BTreeSet::new();
++    let mut rest = block;
++    while let Some(i) = rest.find("Some(\"") {
++        rest = &rest[i + "Some(\"".len()..];
++        let Some(q) = rest.find('"') else { break };
++        let name = &rest[..q];
++        rest = &rest[q + 1..];
++        if rest.starts_with(')') && !name.is_empty() {
++            out.insert(name.to_string());
++        }
++    }
++    out.into_iter().collect()
++}
++
++fn missing<'a>(names: &'a [String], ledger: &str) -> Vec<&'a str> {
++    names
++        .iter()
++        .filter(|n| !ledger.contains(&format!("`{n}`")))
++        .map(String::as_str)
++        .collect()
++}
++
++#[test]
++fn omp_parity_ledger_covers_wire() {
++    let src = std::fs::read_to_string(WIRE_RS).expect("read vendor/omp-rpc/src/wire.rs");
++    let ledger = std::fs::read_to_string(LEDGER_MD).expect("read docs/OMP_PARITY.md");
++
++    let commands = parse_commands(&src);
++    // Server notifications are both layers of server->client `type`
++    // frames: transport-level `RpcNotification` and the session-event
++    // payloads in `RpcAgentEvent` (carried by its arm).
++    let mut notifications = parse_dispatch_names(
++        &src,
++        "impl RpcNotification {",
++        "impl Serialize for RpcNotification",
++    );
++    notifications.extend(parse_dispatch_names(
++        &src,
++        "impl RpcAgentEvent {",
++        "impl Serialize for RpcAgentEvent",
++    ));
++    notifications.sort();
++    notifications.dedup();
++    let ui_requests = parse_dispatch_names(
++        &src,
++        "impl ExtensionUiRequest {",
++        "impl Serialize for ExtensionUiRequest",
++    );
++
++    assert!(
++        commands.len() >= MIN_COMMANDS,
++        "wire.rs parser found only {} commands (< {MIN_COMMANDS}): \
++         the generated file shape changed, fix `parse_commands`",
++        commands.len()
++    );
++    assert!(
++        notifications.len() >= MIN_NOTIFICATIONS,
++        "wire.rs parser found only {} notifications (< {MIN_NOTIFICATIONS}): \
++         the generated file shape changed, fix the notification parsing",
++        notifications.len()
++    );
++    assert!(
++        ui_requests.len() >= MIN_UI_REQUESTS,
++        "wire.rs parser found only {} UI requests (< {MIN_UI_REQUESTS}): \
++         the generated file shape changed, fix the UI-request parsing",
++        ui_requests.len()
++    );
++
++    let mut failures = Vec::new();
++    let unledgered_commands = missing(&commands, &ledger);
++    if !unledgered_commands.is_empty() {
++        failures.push(format!(
++            "commands without a `name` row in docs/OMP_PARITY.md: {}",
++            unledgered_commands.join(", ")
++        ));
++    }
++    let unledgered_notifications = missing(&notifications, &ledger);
++    if !unledgered_notifications.is_empty() {
++        failures.push(format!(
++            "notifications without a `type` row in docs/OMP_PARITY.md: {}",
++            unledgered_notifications.join(", ")
++        ));
++    }
++    let unledgered_ui = missing(&ui_requests, &ledger);
++    if !unledgered_ui.is_empty() {
++        failures.push(format!(
++            "UI requests without a `method` row in docs/OMP_PARITY.md: {}",
++            unledgered_ui.join(", ")
++        ));
++    }
++    assert!(
++        failures.is_empty(),
++        "OMP parity ledger is missing rows:\n- {}",
++        failures.join("\n- ")
++    );
++}
+diff --git a/docs/OMP_PARITY.md b/docs/OMP_PARITY.md
+index 32471c9..6deed53 100644
+--- a/docs/OMP_PARITY.md
++++ b/docs/OMP_PARITY.md
+@@ -5,7 +5,7 @@ The one home for **per-feature OMP coverage** ([ADR-0034](decisions/0034-identit
+ - **Pinned OMP:** `vendor/omp-revision.json` (RPC client generated from it: `vendor/omp-rpc/src/wire.rs`).
+ - **Statuses:** `native` (GPUI surface) · `headless` (wired in cedian crates; GPUI surface at S9) · `planned Sx` · `gated ADR-xxxx` (off by default, opt-in named) · `upstream-blocked` (upstream PR link).
+ - **No permanent cuts.** Removing a row needs an ADR.
+-- **Enforced:** the P7 test fails if a command, agent event or UI request in `wire.rs` is missing here. On every pin bump, regenerate `wire.rs`, add rows, and review the tool and config tables by hand.
++- **Enforced:** the P7 test (`crates/cedian_omp/tests/omp_parity.rs`) fails if a command, server notification (transport `RpcNotification` or session `RpcAgentEvent` type) or extension UI request (`method`) in `wire.rs` has no backticked row here. On every pin bump, regenerate `wire.rs`, add rows, and review the tool and config tables by hand.
+ - Superseded history: `spike/CAPABILITY_TABLE.md` (OMP 18.6.1, frozen).
+ 
+ ## RPC commands (65)
+@@ -65,13 +65,32 @@ The one home for **per-feature OMP coverage** ([ADR-0034](decisions/0034-identit
+ | `irc_message` | inter-agent message in subagent view | planned S5 |
+ | `notice` | toast | planned S9 |
+ 
++## Server notifications (19)
++
++| Notification (`type`) | cedian surface | Status |
++|---|---|---|
++| `ready` | runtime handshake (v2) | headless |
++| `prompt_result` | composer send completes | headless |
++| `session_settled` | runtime state / status line | headless |
++| `extension_error` | toast | planned S9 |
++| `extension_ui_request` | native dialogs envelope ([§63](ARCHITECTURE.md)) | headless (fail-closed answers) |
++| `available_commands_update` | slash commands in palette and composer | planned S9 |
++| `subagent_lifecycle`, `subagent_progress`, `subagent_event` | subagent tree | planned S5 |
++| `live_phase`, `live_levels`, `live_transcript`, `live_end` | live (voice) session | planned S9 |
++| `btw_delta`, `btw_record` | side question without disturbing the turn | planned S9 |
++| `command_output` | builtin slash-command output in thread | planned S9 |
++| `session_info_update` | session manager (title) | planned S9 |
++| `config_update` | model picker state | planned S9 |
++| `rpc_frame_error` | dropped-frame notice in thread | planned S9 |
++
++
+ ## UI requests (12)
+ 
+ | Request(s) | cedian surface | Status |
+ |---|---|---|
+ | `select`, `confirm`, `input`, `editor`, `ask`, `cancel` | native dialogs ([§63](ARCHITECTURE.md)) | headless (fail-closed answers) |
+ | `notify` | toast | planned S9 |
+-| `set_status`, `set_widget`, `set_title` | status line, panel widget, window title | planned S9 |
++| `set_status` (`setStatus`), `set_widget` (`setWidget`), `set_title` (`setTitle`) | status line, panel widget, window title | planned S9 |
+ | `set_editor_text` | composer text | planned S9 |
+ | `open_url` | open in cedian browser or system browser | planned S9 |
+ 
+@@ -86,7 +105,6 @@ The one home for **per-feature OMP coverage** ([ADR-0034](decisions/0034-identit
+ | `task`, `hub`/`wait`, `vibe_spawn`/`vibe_send` | subagent tree | planned S5 |
+ | `todo` | Workflow UI | planned S2 |
+ | `ask` | native dialog | headless |
+-| `browser` | shared Chromium + browser pane | headless stand-in (row D); native S4/S9 |
+ | `computer` (`eval` prelude) | OMP prelude by opt-in; CUA driver later | gated [ADR-0035](decisions/0035-omp-native-approval-opt-in.md) (`computer = "omp"`) |
+ | `gh` | PR workspace | planned S6 |
+ | MCP and extension tools | generic tool card ([§68](ARCHITECTURE.md)) | headless |

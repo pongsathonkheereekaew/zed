@@ -1,0 +1,18 @@
+[package]
+name = "cedian_agent"
+version = "0.1.0"
+edition = "2021"
+
+# Phase 2: headless agent model — task/thread/state over cedian_omp.
+# No GPUI here: pure state machines fed by EventRouter, rendered by
+# cedian_agent_ui models (GPUI views land when the Zed fork does).
+
+[dependencies]
+cedian_omp = { path = "../cedian_omp" }
+omp-rpc = { path = "../../vendor/omp-rpc" }
+parking_lot = "0.12"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

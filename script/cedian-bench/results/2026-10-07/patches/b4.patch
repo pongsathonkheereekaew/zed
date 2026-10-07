@@ -1,0 +1,87 @@
+diff --git a/crates/cedian_workspace/src/host.rs b/crates/cedian_workspace/src/host.rs
+index a78a8a6..09dfa4f 100644
+--- a/crates/cedian_workspace/src/host.rs
++++ b/crates/cedian_workspace/src/host.rs
+@@ -287,11 +287,21 @@ impl HostTools {
+     /// Attach a live LSP bridge (S1). Replaces any previous bridge.
+     /// Also syncs every currently-open buffer into the server.
+     pub fn attach_lsp(&self, bridge: Arc<crate::LspBridge>) {
+-        for key in self.store.lock().open_paths() {
+-            if let Some((text, _)) = self.store.lock().read(&key) {
+-                let local = self.workdir.join(key.strip_prefix("/").unwrap_or(&key));
+-                bridge.sync_buffer(&local, &text);
+-            }
++        // Snapshot under one brief lock; sync AFTER release. `for key in
++        // self.store.lock().open_paths()` keeps the guard temporary alive
++        // for the whole loop, and `read` re-locks the non-reentrant store
++        // mutex -> deadlock once any buffer is open.
++        let open: Vec<(PathBuf, String)> = {
++            let store = self.store.lock();
++            store
++                .open_paths()
++                .iter()
++                .filter_map(|key| store.read(key).map(|(text, _)| (key.clone(), text)))
++                .collect()
++        };
++        for (key, text) in &open {
++            let local = self.workdir.join(key.strip_prefix("/").unwrap_or(key));
++            bridge.sync_buffer(&local, text);
+         }
+         *self.lsp.lock() = Some(bridge);
+     }
+diff --git a/crates/cedian_workspace/tests/fake_lsp_bridge.rs b/crates/cedian_workspace/tests/fake_lsp_bridge.rs
+index 74d9427..76177a6 100644
+--- a/crates/cedian_workspace/tests/fake_lsp_bridge.rs
++++ b/crates/cedian_workspace/tests/fake_lsp_bridge.rs
+@@ -16,32 +16,25 @@ fn fake_bridge_publishes_diagnostics() {
+     let host = HostTools::shared(workdir);
+     host.open(Path::new("/fake.rs"), "fn main() {}");
+ 
+-    let dir = env!("CARGO_MANIFEST_DIR").to_string();
+-    let _ = dir;
+-    // Bridge::spawn hardcodes the server cmd — spawn the client directly and
+-    // drive the pump path manually: attach via HostTools::attach_lsp needs a
+-    // bridge. Instead: build a bridge against the fake by spawning the fake
+-    // through a wrapper argv. LspBridge::spawn takes a bare command; use `sh`
+-    // wrapper? No — simplest: test pump logic via LspClient + manual publish.
+-    //
+-    // Full fake-bridge path needs LspBridge::spawn_argv — added below if missing.
+-    let fake = "/tmp/fake-lsp-entry.sh";
+-    std::fs::write(
+-        fake,
+-        "#!/bin/sh\nexec python3 /Users/pond/cedian/crates/cedian_lsp/tests/fake-lsp-server.py\n",
+-    )
+-    .unwrap();
+-    #[cfg(unix)]
+-    {
+-        use std::os::unix::fs::PermissionsExt;
+-        std::fs::set_permissions(fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+-    }
+-    let argv = [
+-        "python3",
+-        "/Users/pond/cedian/crates/cedian_lsp/tests/fake-lsp-server.py",
+-    ];
+-    let bridge = LspBridge::spawn_argv(&argv, workdir, &host).expect("fake bridge");
+-    bridge.sync_buffer(&workdir.join("fake.rs"), "fn main() {}");
++    // Fake server lives beside cedian_lsp's tests (manifest-relative: CI-safe).
++    let fake = format!(
++        "{}/../cedian_lsp/tests/fake-lsp-server.py",
++        env!("CARGO_MANIFEST_DIR")
++    );
++    let argv = ["python3", fake.as_str()];
++    let bridge =
++        std::sync::Arc::new(LspBridge::spawn_argv(&argv, workdir, &host).expect("fake bridge"));
++    // attach_lsp syncs every open buffer (didOpen) — with a buffer open this
++    // used to deadlock on the store lock; must return promptly now.
++    let (tx, rx) = std::sync::mpsc::channel();
++    let attach_host = std::sync::Arc::clone(&host);
++    let attach_bridge = std::sync::Arc::clone(&bridge);
++    std::thread::spawn(move || {
++        attach_host.attach_lsp(attach_bridge);
++        let _ = tx.send(());
++    });
++    rx.recv_timeout(Duration::from_secs(5))
++        .expect("attach_lsp with an open buffer must not deadlock");
+ 
+     let deadline = std::time::Instant::now() + Duration::from_secs(30);
+     let mut found = Vec::new();

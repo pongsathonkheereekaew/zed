@@ -54,7 +54,10 @@ mod tests {
         buffer.update(cx, |b, cx| {
             b.undo(cx);
         });
-        assert_eq!(map.observe(&buffer.read_with(cx, |b, _| b.version())), Version(2));
+        assert_eq!(
+            map.observe(&buffer.read_with(cx, |b, _| b.version())),
+            Version(2)
+        );
         assert_ne!(map.global(v0), map.global(Version(2)));
     }
 }

@@ -1,0 +1,163 @@
+diff --git a/crates/cedian_worker/src/worktree.rs b/crates/cedian_worker/src/worktree.rs
+index bd5a10b..55ebac4 100644
+--- a/crates/cedian_worker/src/worktree.rs
++++ b/crates/cedian_worker/src/worktree.rs
+@@ -63,20 +63,49 @@ pub fn spawn(repo: &Path, id: &str, base: &str) -> Result<WorkerHead, WorkerErro
+     })
+ }
+ 
+-/// Remove a worker: plain `worktree remove` first (no `--force`, so a
+-/// dirty tree fails loud and the branch is kept), then `branch -D`.
+-///
+-/// `-D` (not `-d`): teardown must succeed even when the worker was never
+-/// merged — the committed-conflict test removes after a refused
+-/// `merge_back`, and `-d` would fail there on the unmerged branch.
+-/// Uncommitted work is still safe: plain `worktree remove` already fails
+-/// loud on a dirty tree before the branch is touched.
++/// Remove a worker: refuse when the worker branch holds commits `HEAD`
++/// cannot reach (returns `Err`, keeps the worktree AND the branch, so no
++/// commit is ever destroyed), otherwise plain `worktree remove` first (no
++/// `--force`, so a dirty tree fails loud and the branch is kept), then
++/// `branch -d` (lowercase: belt-and-braces behind the pre-check, never
++/// force-deletes).
+ pub fn remove(repo: &Path, head: &WorkerHead) -> Result<(), WorkerError> {
++    if !is_merged(repo, &head.branch)? {
++        return Err(WorkerError::Git(format!(
++            "worker branch {:?} has unmerged commits; merge it back first",
++            head.branch
++        )));
++    }
+     git(repo, &["worktree", "remove", &head.worktree])?;
+-    git(repo, &["branch", "-D", &head.branch])?;
++    git(repo, &["branch", "-d", &head.branch])?;
+     Ok(())
+ }
+ 
++/// True when every commit on `branch` is reachable from `HEAD`.
++/// `merge-base --is-ancestor` exits 1 (not failure) for unmerged, so this
++/// needs the raw status instead of the `git` helper.
++fn is_merged(repo: &Path, branch: &str) -> Result<bool, WorkerError> {
++    let out = Command::new("git")
++        .arg("-C")
++        .arg(repo)
++        .arg("merge-base")
++        .arg("--is-ancestor")
++        .arg(branch)
++        .arg("HEAD")
++        .env_remove("GIT_DIR")
++        .env_remove("GIT_INDEX_FILE")
++        .env_remove("GIT_WORK_TREE")
++        .output()
++        .map_err(|e| WorkerError::Git(e.to_string()))?;
++    match out.status.code() {
++        Some(0) => Ok(true),
++        Some(1) => Ok(false),
++        _ => Err(WorkerError::Git(
++            String::from_utf8_lossy(&out.stderr).trim().to_string(),
++        )),
++    }
++}
++
+ /// What merging the worker branch into `base` would do.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct MergePlan {
+@@ -235,9 +264,42 @@ mod tests {
+             merge_back(&repo, &head, "main"),
+             Err(WorkerError::Conflicted(_))
+         ));
++        // Unmerged branch: `remove` must refuse and keep the commits.
++        let sha = git(&repo, &["rev-parse", &head.branch]).unwrap();
++        assert!(matches!(remove(&repo, &head), Err(WorkerError::Git(_))));
++        assert_eq!(git(&repo, &["rev-parse", &head.branch]).unwrap(), sha);
++        assert!(repo.join(".worktrees/w1").exists());
++        // Teardown: force-remove, the branch is intentionally unmerged.
++        git(&repo, &["worktree", "remove", "--force", &head.worktree]).unwrap();
++        git(&repo, &["branch", "-D", &head.branch]).unwrap();
++        std::fs::remove_dir_all(&repo).unwrap();
++    }
++
++    #[test]
++    fn remove_refuses_unmerged_keeps_branch() {
++        let repo = fixture();
++        let head = spawn(&repo, "w1", "main").unwrap();
++        std::fs::write(repo.join(".worktrees/w1/b.txt"), "worker\n").unwrap();
++        git(&repo.join(".worktrees/w1"), &["add", "."]).unwrap();
++        git(&repo.join(".worktrees/w1"), &["commit", "-m", "w"]).unwrap();
++        let sha = git(&repo, &["rev-parse", &head.branch]).unwrap();
++        assert!(matches!(remove(&repo, &head), Err(WorkerError::Git(_))));
++        // Branch, worktree, and commit all survive the refused remove.
++        assert_eq!(git(&repo, &["rev-parse", &head.branch]).unwrap(), sha);
++        assert!(repo.join(".worktrees/w1").exists());
++        assert!(git(&repo, &["branch", "--list", &head.branch])
++            .unwrap()
++            .contains(&head.branch));
++        // After merging, removal succeeds.
++        merge_back(&repo, &head, "main").unwrap();
+         remove(&repo, &head).unwrap();
++        assert!(git(&repo, &["branch", "--list", &head.branch])
++            .unwrap()
++            .is_empty());
++        assert!(!repo.join(".worktrees/w1").exists());
+         std::fs::remove_dir_all(&repo).unwrap();
+     }
++
+     /// Regression: `spawn` works when the parent env carries hook-inherited
+     /// `GIT_*` (the `git commit` hook exports relative `GIT_DIR`, which used
+     /// to break `git -C <other-dir>` with "Not a directory").
+diff --git a/crates/cedian_worker/tests/bench_b3.rs b/crates/cedian_worker/tests/bench_b3.rs
+new file mode 100644
+index 0000000..2387807
+--- /dev/null
++++ b/crates/cedian_worker/tests/bench_b3.rs
+@@ -0,0 +1,51 @@
++//! B3 hidden test: removing a worker never destroys unmerged work.
++use cedian_worker::worktree;
++use std::path::{Path, PathBuf};
++use std::process::Command;
++
++fn git(dir: &Path, args: &[&str]) {
++    let ok = Command::new("git").args(args).current_dir(dir).status().unwrap().success();
++    assert!(ok, "git {args:?}");
++}
++
++fn repo(tag: &str) -> PathBuf {
++    let dir = std::env::temp_dir().join(format!("bench-b3-{tag}-{}", std::process::id()));
++    let _ = std::fs::remove_dir_all(&dir);
++    std::fs::create_dir_all(&dir).unwrap();
++    git(&dir, &["init", "-q", "-b", "main"]);
++    git(&dir, &["config", "user.email", "b@b"]);
++    git(&dir, &["config", "user.name", "b"]);
++    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
++    git(&dir, &["add", "."]);
++    git(&dir, &["commit", "-qm", "init"]);
++    dir.canonicalize().unwrap()
++}
++
++fn branch_exists(dir: &Path, branch: &str) -> bool {
++    Command::new("git")
++        .args(["rev-parse", "--verify", "--quiet", branch])
++        .current_dir(dir)
++        .status()
++        .unwrap()
++        .success()
++}
++
++#[test]
++fn unmerged_worker_is_kept() {
++    let dir = repo("unmerged");
++    let head = worktree::spawn(&dir, "w1", "main").unwrap();
++    let wt = dir.join(&head.worktree);
++    std::fs::write(wt.join("b.txt"), "b\n").unwrap();
++    git(&wt, &["add", "."]);
++    git(&wt, &["commit", "-qm", "work"]);
++    assert!(worktree::remove(&dir, &head).is_err(), "unmerged remove must fail");
++    assert!(branch_exists(&dir, &head.branch), "branch and its commit kept");
++}
++
++#[test]
++fn merged_worker_is_removed() {
++    let dir = repo("merged");
++    let head = worktree::spawn(&dir, "w2", "main").unwrap();
++    worktree::remove(&dir, &head).unwrap();
++    assert!(!branch_exists(&dir, &head.branch));
++}

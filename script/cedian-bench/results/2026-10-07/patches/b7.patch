@@ -1,0 +1,183 @@
+diff --git a/crates/cedian_cli/src/main.rs b/crates/cedian_cli/src/main.rs
+index 661116c..b58f698 100644
+--- a/crates/cedian_cli/src/main.rs
++++ b/crates/cedian_cli/src/main.rs
+@@ -888,7 +888,7 @@ fn cmd_worker(workdir: &Path, args: &[String]) -> Result<(), String> {
+             let kind = args.get(2).ok_or(usage)?;
+             let title = args.get(3).ok_or(usage)?;
+             let base = worker_base(args, 4)?;
+-            let (mut reg, _) = cedian_worker::Registry::open(workdir);
++            let (mut reg, _) = cedian_worker::Registry::open(workdir).map_err(|e| e.to_string())?;
+             let mut head = cedian_worker::spawn(workdir, id, &base).map_err(|e| e.to_string())?;
+             head.status = cedian_worker::WorkerStatus::Running;
+             head.task_title = title.clone();
+@@ -903,7 +903,7 @@ fn cmd_worker(workdir: &Path, args: &[String]) -> Result<(), String> {
+             if args.len() > 1 {
+                 return Err("usage: cedian worker list".to_string());
+             }
+-            let (reg, _) = cedian_worker::Registry::open(workdir);
++            let (reg, _) = cedian_worker::Registry::open(workdir).map_err(|e| e.to_string())?;
+             let mut any = false;
+             for head in reg.all() {
+                 any = true;
+@@ -925,7 +925,7 @@ fn cmd_worker(workdir: &Path, args: &[String]) -> Result<(), String> {
+                 return Err(usage.to_string());
+             }
+             let note = args[2..].join(" ");
+-            let (mut reg, _) = cedian_worker::Registry::open(workdir);
++            let (mut reg, _) = cedian_worker::Registry::open(workdir).map_err(|e| e.to_string())?;
+             let head = reg
+                 .get(id)
+                 .cloned()
+@@ -946,7 +946,7 @@ fn cmd_worker(workdir: &Path, args: &[String]) -> Result<(), String> {
+                 .get(1)
+                 .ok_or("usage: cedian worker preview <id> [--base <branch>]")?;
+             let base = worker_base(args, 2)?;
+-            let (reg, _) = cedian_worker::Registry::open(workdir);
++            let (reg, _) = cedian_worker::Registry::open(workdir).map_err(|e| e.to_string())?;
+             let head = reg
+                 .get(id)
+                 .cloned()
+@@ -968,7 +968,7 @@ fn cmd_worker(workdir: &Path, args: &[String]) -> Result<(), String> {
+                 .get(1)
+                 .ok_or("usage: cedian worker merge-back <id> [--base <branch>]")?;
+             let base = worker_base(args, 2)?;
+-            let (mut reg, _) = cedian_worker::Registry::open(workdir);
++            let (mut reg, _) = cedian_worker::Registry::open(workdir).map_err(|e| e.to_string())?;
+             let head = reg
+                 .get(id)
+                 .cloned()
+@@ -996,7 +996,7 @@ fn cmd_worker(workdir: &Path, args: &[String]) -> Result<(), String> {
+             if args.len() > 2 {
+                 return Err("usage: cedian worker remove <id>".to_string());
+             }
+-            let (mut reg, _) = cedian_worker::Registry::open(workdir);
++            let (mut reg, _) = cedian_worker::Registry::open(workdir).map_err(|e| e.to_string())?;
+             let head = reg
+                 .get(id)
+                 .cloned()
+diff --git a/crates/cedian_worker/src/registry.rs b/crates/cedian_worker/src/registry.rs
+index f556d71..a4e683f 100644
+--- a/crates/cedian_worker/src/registry.rs
++++ b/crates/cedian_worker/src/registry.rs
+@@ -49,6 +49,8 @@ pub enum WorkerError {
+         base: String,
+         checked_out: String,
+     },
++    /// Registry file is corrupt or has an unknown snapshot version.
++    Snapshot(String),
+ }
+ 
+ impl std::fmt::Display for WorkerError {
+@@ -73,6 +75,7 @@ impl std::fmt::Display for WorkerError {
+                 f,
+                 "merge base {base:?} is not checked out (main checkout is on {checked_out:?})"
+             ),
++            Self::Snapshot(e) => write!(f, "worker registry snapshot: {e}"),
+         }
+     }
+ }
+@@ -80,24 +83,47 @@ impl std::fmt::Display for WorkerError {
+ fn registry_path(repo: &Path) -> PathBuf {
+     repo.join(".cedian").join("workers.json")
+ }
++/// Schema version for `workers.json` — bump on any shape change; older or
++/// corrupt files fail closed via [`WorkerError::Snapshot`], never empty.
++pub const REGISTRY_SNAPSHOT_VERSION: u32 = 1;
+ 
+-/// Persisted worker heads, shaped `{"workers": {id: head}}`.
+-#[derive(Debug, Default, Serialize, Deserialize)]
++/// Persisted worker heads, shaped `{"snapshot_version": 1, "workers": {id: head}}`.
++#[derive(Debug, Serialize, Deserialize)]
+ pub struct Registry {
++    pub snapshot_version: u32,
+     workers: BTreeMap<String, WorkerHead>,
+ }
+ 
++impl Default for Registry {
++    fn default() -> Self {
++        Self {
++            snapshot_version: REGISTRY_SNAPSHOT_VERSION,
++            workers: BTreeMap::new(),
++        }
++    }
++}
++
+ impl Registry {
+-    /// Open the registry; a missing/unreadable file yields an empty one.
+-    /// Returns the registry plus whether the file already existed.
+-    pub fn open(repo: &Path) -> (Self, bool) {
++    /// Open the registry. A missing file yields an empty one; a corrupt
++    /// file, a missing version, or a version mismatch fails with
++    /// [`WorkerError::Snapshot`]. Returns the registry plus whether the
++    /// file already existed.
++    pub fn open(repo: &Path) -> Result<(Self, bool), WorkerError> {
+         let path = registry_path(repo);
+         if !path.exists() {
+-            return (Self::default(), false);
++            return Ok((Self::default(), false));
++        }
++        let raw = std::fs::read_to_string(&path)
++            .map_err(|e| WorkerError::Snapshot(format!("cannot read {}: {e}", path.display())))?;
++        let reg: Self = serde_json::from_str(&raw)
++            .map_err(|e| WorkerError::Snapshot(format!("corrupt {}: {e}", path.display())))?;
++        if reg.snapshot_version != REGISTRY_SNAPSHOT_VERSION {
++            return Err(WorkerError::Snapshot(format!(
++                "workers.json version mismatch (got v{}, want v{REGISTRY_SNAPSHOT_VERSION})",
++                reg.snapshot_version
++            )));
+         }
+-        let raw = std::fs::read_to_string(&path).unwrap_or_default();
+-        let reg: Self = serde_json::from_str(&raw).unwrap_or_default();
+-        (reg, true)
++        Ok((reg, true))
+     }
+ 
+     /// Persist (creates `.cedian/`).
+@@ -158,7 +184,7 @@ mod tests {
+     fn registry_roundtrip() {
+         let repo = std::env::temp_dir().join(format!("cedian-reg-test-{}", std::process::id()));
+         std::fs::create_dir_all(repo.join(".cedian")).unwrap();
+-        let (mut reg, existed) = Registry::open(&repo);
++        let (mut reg, existed) = Registry::open(&repo).unwrap();
+         assert!(!existed);
+         reg.insert(WorkerHead {
+             id: "w1".into(),
+@@ -182,9 +208,36 @@ mod tests {
+             })
+             .is_err());
+         reg.save(&repo).unwrap();
+-        let (reg2, existed2) = Registry::open(&repo);
++        let (reg2, existed2) = Registry::open(&repo).unwrap();
+         assert!(existed2);
+         assert_eq!(reg2.get("w1").unwrap().task_title, "fix login");
+         std::fs::remove_dir_all(&repo).unwrap();
+     }
++
++    #[test]
++    fn stale_or_corrupt_registry_fails_closed() {
++        let repo = std::env::temp_dir().join(format!("cedian-reg-stale-{}", std::process::id()));
++        std::fs::create_dir_all(repo.join(".cedian")).unwrap();
++        // Pre-P3 shape: no snapshot_version.
++        std::fs::write(registry_path(&repo), r#"{"workers":{}}"#).unwrap();
++        assert!(matches!(
++            Registry::open(&repo),
++            Err(WorkerError::Snapshot(_))
++        ));
++        std::fs::write(
++            registry_path(&repo),
++            r#"{"snapshot_version":99,"workers":{}}"#,
++        )
++        .unwrap();
++        assert!(matches!(
++            Registry::open(&repo),
++            Err(WorkerError::Snapshot(_))
++        ));
++        std::fs::write(registry_path(&repo), "{not json").unwrap();
++        assert!(matches!(
++            Registry::open(&repo),
++            Err(WorkerError::Snapshot(_))
++        ));
++        let _ = std::fs::remove_dir_all(&repo);
++    }
+ }

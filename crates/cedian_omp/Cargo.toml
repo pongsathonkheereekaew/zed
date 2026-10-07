@@ -1,0 +1,21 @@
+[package]
+name = "cedian_omp"
+version = "0.1.0"
+edition = "2021"
+
+# Phase 1: OMP runtime boundary — spawn bundled `omp --mode rpc-ui`,
+# typed RPC over the vendored upstream client, EventRouter fan-out.
+# Blocking `omp_rpc::Client` lives on a dedicated I/O thread; async/GPUI
+# bridging lands with the panel (Phase 2). Never touch UI threads here.
+
+[dependencies]
+omp-rpc = { path = "../../vendor/omp-rpc" }
+parking_lot = "0.12"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+base64 = "0.22"
+
+[dev-dependencies]
+
+[lints]
+workspace = true

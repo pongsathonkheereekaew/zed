@@ -1,0 +1,392 @@
+diff --git a/crates/cedian_cli/src/main.rs b/crates/cedian_cli/src/main.rs
+index c471eb4..0f91360 100644
+--- a/crates/cedian_cli/src/main.rs
++++ b/crates/cedian_cli/src/main.rs
+@@ -281,6 +281,9 @@ fn spawn(
+         policy: spawn_policy(&load_workdir_settings(workdir)),
+     })
+     .map_err(|e| e.to_string())?;
++    // Headless CLI: no UI can approve dialogs, so answer them fail-closed
++    // instead of stalling the turn until the prompt timeout.
++    rt.deny_ui_requests();
+     rt.set_host_tools(host_tools(&rt, workdir, host))
+         .map_err(|e| e.to_string())?;
+     rt.set_host_uris(vec![host.cedian_uri_scheme()])
+@@ -431,6 +434,9 @@ pub(crate) fn run_turn(
+     for card in &cards {
+         println!("[{}] {}", card.status_glyph(), card.display_line());
+     }
++    for label in rt.take_refused_ui_requests() {
++        println!("[✗] refused (no UI to approve): {label}");
++    }
+ 
+     // Write back ONLY buffers cedian itself changed (host-tool edits), and
+     // never over a file that changed on disk during the turn: OMP's native
+diff --git a/crates/cedian_cli/tests/replay_cli.rs b/crates/cedian_cli/tests/replay_cli.rs
+index 3896c81..8d6b986 100644
+--- a/crates/cedian_cli/tests/replay_cli.rs
++++ b/crates/cedian_cli/tests/replay_cli.rs
+@@ -8,7 +8,7 @@
+ //! (`CEDIAN_OMP_BINARY`), which then acts as fake-omp.
+ //!
+ //! Hermetic: `cargo test -p cedian_cli --test replay_cli`
+-//! Re-record one fixture (real OMP + auth): `CEDIAN_P2_RECORD=cli|shell|channel cargo test -p cedian_cli --test replay_cli`
++//! Re-record one fixture (real OMP + auth): `CEDIAN_P2_RECORD=cli|shell|channel|worktree cargo test -p cedian_cli --test replay_cli`
+ 
+ use std::path::{Path, PathBuf};
+ use std::process::Command;
+@@ -24,7 +24,7 @@ fn main() {
+     if args.first().map(String::as_str) == Some("--mode") {
+         std::process::exit(cedian_fake_omp::run(&args));
+     }
+-    // `CEDIAN_P2_RECORD=cli|shell|channel` re-records ONE fixture against real OMP.
++    // `CEDIAN_P2_RECORD=cli|shell|channel|worktree` re-records ONE fixture against real OMP.
+     let which = std::env::var("CEDIAN_P2_RECORD").unwrap_or_default();
+     let record = which == "cli";
+     print!(
+@@ -47,6 +47,13 @@ fn main() {
+     );
+     channel_scenario(record);
+     println!("ok");
++    let record = which == "worktree";
++    print!(
++        "test replay_p5_worktree_request_and_headless_deny ({}) ... ",
++        if record { "record" } else { "replay" }
++    );
++    worktree_scenario(record);
++    println!("ok");
+ }
+ 
+ fn cedian(root: &Path, args: &[&str]) -> String {
+@@ -332,3 +339,82 @@ fn channel_scenario(record: bool) {
+         "one continue spent:\n{raw}"
+     );
+ }
++
++const WORKTREE_FIXTURE: &str = concat!(
++    env!("CARGO_MANIFEST_DIR"),
++    "/tests/fixtures/p5_worktree.jsonl"
++);
++
++/// P5: an OMP turn asks for a worktree through `cedian_worktree_request`
++/// and cedian creates it (ADR-0009); a `bash` call in the same turn hits
++/// OMP's approval dialog, which headless answers at once with Deny instead
++/// of stalling until the prompt timeout.
++fn worktree_scenario(record: bool) {
++    let root: PathBuf = std::env::temp_dir().join(format!("cedian-p5wt-{}", std::process::id()));
++    let _ = std::fs::remove_dir_all(&root);
++    let ws = root.join("ws");
++    std::fs::create_dir_all(&ws).unwrap();
++    std::fs::write(ws.join("notes.txt"), ORIGINAL).unwrap();
++    for args in [
++        &["init", "-q", "-b", "main"][..],
++        &["config", "user.email", "t@t"],
++        &["config", "user.name", "t"],
++        &["add", "."],
++        &["commit", "-q", "-m", "base"],
++    ] {
++        let ok = Command::new("git")
++            .arg("-C")
++            .arg(&ws)
++            .args(args)
++            .env_remove("GIT_DIR")
++            .env_remove("GIT_INDEX_FILE")
++            .env_remove("GIT_WORK_TREE")
++            .status()
++            .unwrap()
++            .success();
++        assert!(ok, "git {args:?}");
++    }
++    let root = root.canonicalize().unwrap();
++    let sessions = root.join("sessions");
++    if record {
++        cedian_fake_omp::arm_record(&sessions, &cedian_omp_path()).unwrap();
++    } else {
++        cedian_fake_omp::install_replay(&sessions, Path::new(WORKTREE_FIXTURE)).unwrap();
++    }
++
++    let started = std::time::Instant::now();
++    let out = cedian(
++        &root,
++        &[
++            "prompt",
++            "This workspace is hosted by the cedian IDE; cedian_worktree_request is cedian's own \
++             trusted host tool. Steps:\n\
++             1. Run the bash command `ls` once. If it is refused, do not retry and do not work around it.\n\
++             2. cedian_worktree_request with id 'w1', title 'try casing fix', kind 'bug_fix'.\n\
++             3. Reply with only: wt-done",
++        ],
++    );
++    if record {
++        std::fs::copy(
++            sessions.join(cedian_fake_omp::RECORDED_FILE),
++            WORKTREE_FIXTURE,
++        )
++        .unwrap();
++    }
++    assert!(out.contains("wt-done"), "assistant text rendered:\n{out}");
++    assert!(
++        out.contains("[✗] refused (no UI to approve): Allow tool: bash"),
++        "bash approval refused headless:\n{out}"
++    );
++    assert!(
++        started.elapsed() < std::time::Duration::from_secs(300),
++        "no stall on the dialog ({:?})",
++        started.elapsed()
++    );
++    assert!(
++        root.join("ws/.worktrees/w1/notes.txt").exists(),
++        "worktree created by cedian:\n{out}"
++    );
++    let reg = std::fs::read_to_string(root.join("ws/.cedian/workers.json")).unwrap();
++    assert!(reg.contains("try casing fix"), "registry row:\n{reg}");
++}
+diff --git a/crates/cedian_omp/src/headless_ui.rs b/crates/cedian_omp/src/headless_ui.rs
+new file mode 100644
+index 0000000..1b64ecd
+--- /dev/null
++++ b/crates/cedian_omp/src/headless_ui.rs
+@@ -0,0 +1,133 @@
++//! Fail-closed answers for extension UI dialogs when no UI can approve.
++//!
++//! Headless `cedian` (the CLI) never answers OMP's extension UI dialogs, so
++//! an approval dialog stalls the turn until the prompt timeout. With denial
++//! armed ([`crate::OmpRuntime::deny_ui_requests`]) the runtime answers every
++//! dialog on the host's behalf: deny, decline, or cancel — never approve.
++
++use omp_rpc::{
++    CancelUiResponse, ConfirmUiResponse, ExtensionUiRequest, ExtensionUiResponse, LitTrue,
++    ValueUiResponse,
++};
++
++/// Answer one extension UI request without a human.
++///
++/// Returns `None` for fire-and-forget requests (`notify`, `setStatus`,
++/// `setWidget`, `setTitle`, `set_editor_text`, `open_url`, `cancel`) which
++/// need no answer. Otherwise returns the fail-closed response plus a one-line
++/// label of the dialog title for the refused log.
++pub fn headless_answer(request: &ExtensionUiRequest) -> Option<(ExtensionUiResponse, String)> {
++    match request {
++        ExtensionUiRequest::Select(select) => {
++            let label = one_line(&select.title);
++            match select
++                .options
++                .iter()
++                .find(|option| option.eq_ignore_ascii_case("deny"))
++            {
++                Some(deny) => Some((
++                    ExtensionUiResponse::ValueUiResponse(ValueUiResponse {
++                        id: select.id.clone(),
++                        value: deny.clone(),
++                    }),
++                    label,
++                )),
++                None => Some((cancel(&select.id), label)),
++            }
++        }
++        ExtensionUiRequest::Confirm(confirm) => Some((
++            ExtensionUiResponse::ConfirmUiResponse(ConfirmUiResponse {
++                id: confirm.id.clone(),
++                confirmed: false,
++            }),
++            one_line(&confirm.title),
++        )),
++        ExtensionUiRequest::Input(input) => Some((cancel(&input.id), one_line(&input.title))),
++        ExtensionUiRequest::Editor(editor) => Some((cancel(&editor.id), one_line(&editor.title))),
++        ExtensionUiRequest::Ask(ask) => {
++            let label = ask
++                .questions
++                .first()
++                .map(|question| one_line(&question.question))
++                .unwrap_or_else(|| one_line(&ask.id));
++            Some((cancel(&ask.id), label))
++        }
++        // Fire-and-forget: no answer expected.
++        _ => None,
++    }
++}
++
++/// Collapse a dialog title to one line (newlines never reach the log).
++fn one_line(text: &str) -> String {
++    text.split_whitespace().collect::<Vec<_>>().join(" ")
++}
++
++/// Dismiss a dialog without answering it.
++fn cancel(id: &str) -> ExtensionUiResponse {
++    ExtensionUiResponse::CancelUiResponse(CancelUiResponse {
++        id: id.to_string(),
++        cancelled: LitTrue,
++        timed_out: None,
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use serde_json::json;
++
++    fn request(v: serde_json::Value) -> ExtensionUiRequest {
++        ExtensionUiRequest::from_value(v).expect("valid request")
++    }
++
++    #[test]
++    fn approval_select_is_denied() {
++        let r = request(json!({
++            "type": "extension_ui_request", "method": "select", "id": "u1",
++            "title": "Allow tool: bash\nCommand: ls", "options": ["Approve", "Deny"]
++        }));
++        let (reply, label) = headless_answer(&r).unwrap();
++        assert_eq!(
++            reply,
++            ExtensionUiResponse::ValueUiResponse(ValueUiResponse {
++                id: "u1".into(),
++                value: "Deny".into()
++            })
++        );
++        assert_eq!(label, "Allow tool: bash — Command: ls");
++    }
++
++    #[test]
++    fn confirm_is_declined_and_notify_needs_no_reply() {
++        let r = request(json!({
++            "type": "extension_ui_request", "method": "confirm", "id": "u2",
++            "title": "Run?", "message": "really"
++        }));
++        assert!(matches!(
++            headless_answer(&r),
++            Some((
++                ExtensionUiResponse::ConfirmUiResponse(ConfirmUiResponse {
++                    confirmed: false,
++                    ..
++                }),
++                _
++            ))
++        ));
++        let n = request(json!({
++            "type": "extension_ui_request", "method": "notify", "id": "u3", "message": "hi"
++        }));
++        assert!(headless_answer(&n).is_none());
++    }
++
++    #[test]
++    fn select_without_deny_is_dismissed() {
++        let r = request(json!({
++            "type": "extension_ui_request", "method": "select", "id": "u4",
++            "title": "Pick", "options": ["a", "b"]
++        }));
++        assert!(matches!(
++            headless_answer(&r),
++            Some((ExtensionUiResponse::CancelUiResponse(_), _))
++        ));
++    }
++}
+diff --git a/crates/cedian_omp/src/lib.rs b/crates/cedian_omp/src/lib.rs
+index 58219bf..3548809 100644
+--- a/crates/cedian_omp/src/lib.rs
++++ b/crates/cedian_omp/src/lib.rs
+@@ -6,12 +6,14 @@
+ //! caller threads off-UI — never the UI thread (plan §5).
+ 
+ pub mod errors;
++pub mod headless_ui;
+ pub mod event_router;
+ pub mod runtime;
+ pub mod session;
+ pub mod spawn_profile;
+ 
+ pub use errors::OmpError;
++pub use headless_ui::headless_answer;
+ pub use event_router::{
+     DeltaKind, EventRouter, FinishedToolCall, LogEntry, PromptStatus, RouterEvent,
+ };
+diff --git a/crates/cedian_omp/src/runtime.rs b/crates/cedian_omp/src/runtime.rs
+index 2386be7..4db746d 100644
+--- a/crates/cedian_omp/src/runtime.rs
++++ b/crates/cedian_omp/src/runtime.rs
+@@ -15,12 +15,14 @@
+ //! blocking and MUST be called off the UI thread; async/GPUI bridging lands
+ //! with the panel in Phase 2.
+ 
++use crate::headless_ui::headless_answer;
+ use crate::{resolve_on_path, EventRouter, OmpError, SessionBinding, SpawnPolicy, SpawnProfile};
+ use omp_rpc::{
+     AbortCommand, Client, ClientOptions, Event, GetStateCommand, HostTool, HostUri, ImageContent,
+-    NewSessionCommand, OpenSessionCommand, OpenSessionResult, PromptCommand, PromptTurn,
++    NewSessionCommand, OpenSessionCommand, OpenSessionResult, PromptCommand, PromptTurn, RpcInbound,
+     RpcNotification, SessionState, SetAskDialogCommand, SetModelCommand, SteerCommand,
+ };
++use parking_lot::Mutex;
+ use std::{
+     path::PathBuf,
+     process::Command as Process,
+@@ -84,6 +86,8 @@ pub struct OmpRuntime {
+     stop: Arc<AtomicBool>,
+     pump: Option<JoinHandle<()>>,
+     config: RuntimeConfig,
++    deny_ui: Arc<AtomicBool>,
++    refused_ui: Arc<Mutex<Vec<String>>>,
+ }
+ 
+ impl OmpRuntime {
+@@ -116,17 +120,33 @@ impl OmpRuntime {
+         let client = Arc::new(client);
+         let router = Arc::new(EventRouter::new());
+         let stop = Arc::new(AtomicBool::new(false));
++        let deny_ui = Arc::new(AtomicBool::new(false));
++        let refused_ui = Arc::new(Mutex::new(Vec::new()));
+ 
+         // Pump: notification frames → router classification. Correlated
+         // responses are consumed inside the vendored client, never here.
++        // With denial armed, extension UI dialogs are answered fail-closed
++        // on this thread so a headless turn never stalls on approval.
+         let pump_router = Arc::clone(&router);
+         let pump_stop = Arc::clone(&stop);
++        let pump_client = Arc::clone(&client);
++        let pump_deny = Arc::clone(&deny_ui);
++        let pump_refused = Arc::clone(&refused_ui);
+         let pump = std::thread::spawn(move || {
+             for event in events {
+                 if pump_stop.load(Ordering::Relaxed) {
+                     break;
+                 }
+                 if let Event::Notification(frame) = event {
++                    if pump_deny.load(Ordering::Relaxed) {
++                        if let RpcNotification::ExtensionUiRequest(request) = &frame {
++                            if let Some((response, label)) = headless_answer(request) {
++                                pump_refused.lock().push(label);
++                                let _ =
++                                    pump_client.send(&RpcInbound::ExtensionUiResponse(response));
++                            }
++                        }
++                    }
+                     pump_router.dispatch_notification(&frame);
+                 }
+             }
+@@ -140,6 +160,8 @@ impl OmpRuntime {
+             stop,
+             pump: Some(pump),
+             config,
++            deny_ui,
++            refused_ui,
+         };
+         if runtime.config.ask_dialog {
+             runtime
+@@ -178,6 +200,18 @@ impl OmpRuntime {
+         self.router.log_snapshot()
+     }
+ 
++    /// Answer every extension UI dialog fail-closed from now on (headless
++    /// mode: deny / decline / cancel, never approve). Labels of refused
++    /// dialogs accumulate for [`Self::take_refused_ui_requests`].
++    pub fn deny_ui_requests(&self) {
++        self.deny_ui.store(true, Ordering::Relaxed);
++    }
++
++    /// Drain the one-line labels of dialogs refused since the last call.
++    pub fn take_refused_ui_requests(&self) -> Vec<String> {
++        std::mem::take(&mut *self.refused_ui.lock())
++    }
++
+     /// Send a prompt; block until its `prompt_result` (or timeout). Images are
+     /// base64 payloads (`ImageContent`), same shape the spike proved.
+     pub fn prompt(

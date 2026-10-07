@@ -1,0 +1,125 @@
+diff --git a/crates/cedian_omp/src/event_router.rs b/crates/cedian_omp/src/event_router.rs
+index d33fb82..6cc1e50 100644
+--- a/crates/cedian_omp/src/event_router.rs
++++ b/crates/cedian_omp/src/event_router.rs
+@@ -89,6 +89,20 @@ impl From<omp_rpc::wire::PromptStatus> for PromptStatus {
+     }
+ }
+ 
++/// A tool call that ran to completion: name and arg summary from its
++/// `ToolStart`, error flag from its `ToolEnd`. Enters the finished log only
++/// when the `ToolEnd` arrives — a `ToolStart` alone never records one.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct FinishedToolCall {
++    /// Tool name from the `ToolStart` (falls back to the `ToolEnd` name when
++    /// no start was seen).
++    pub tool_name: String,
++    /// One-line arg summary from the `ToolStart` (empty when no start seen).
++    pub args_preview: String,
++    /// Error flag from the `ToolEnd`.
++    pub is_error: bool,
++}
++
+ /// Append-only router log entry: sequence number + event.
+ #[derive(Debug, Clone)]
+ pub struct LogEntry {
+@@ -171,6 +185,45 @@ impl EventRouter {
+             .collect()
+     }
+ 
++    /// Finished tool call by id, or `None` until its `ToolEnd` arrives (a
++    /// `ToolStart` alone never records one). `tool_name`/`args_preview` come
++    /// from the matching `ToolStart` — falling back to the `ToolEnd` name and
++    /// an empty preview when no start was seen; `is_error` comes from the
++    /// `ToolEnd`. Derived from the append-only log: no extra state to drift.
++    pub fn finished_tool_call(&self, tool_call_id: &str) -> Option<FinishedToolCall> {
++        let log = self.inner.lock().log.clone();
++        let mut start: Option<(String, String)> = None;
++        let mut end: Option<(String, bool)> = None;
++        for entry in &log {
++            match &entry.event {
++                RouterEvent::ToolStart {
++                    tool_call_id: id,
++                    tool_name,
++                    args_preview,
++                } if id.as_str() == tool_call_id => {
++                    start = Some((tool_name.clone(), args_preview.clone()));
++                }
++                RouterEvent::ToolEnd {
++                    tool_call_id: id,
++                    tool_name,
++                    is_error,
++                    ..
++                } if id.as_str() == tool_call_id => {
++                    end = Some((tool_name.clone(), *is_error));
++                }
++                _ => {}
++            }
++        }
++        end.map(|(end_name, is_error)| {
++            let (tool_name, args_preview) = start.unwrap_or_else(|| (end_name, String::new()));
++            FinishedToolCall {
++                tool_name,
++                args_preview,
++                is_error,
++            }
++        })
++    }
++
+     fn push(&self, event: RouterEvent) {
+         let mut inner = self.inner.lock();
+         let seq = inner.next_seq;
+@@ -394,6 +447,38 @@ mod tests {
+         RpcAgentEvent::from_value(json).expect("valid agent event")
+     }
+ 
++    #[test]
++    fn finished_tool_call_needs_a_tool_end() {
++        let router = EventRouter::new();
++        let start = |id: &str, name: &str| RouterEvent::ToolStart {
++            tool_call_id: id.into(),
++            tool_name: name.into(),
++            args_preview: format!("{name} args"),
++        };
++        let end = |id: &str, name: &str, is_error| RouterEvent::ToolEnd {
++            tool_call_id: id.into(),
++            tool_name: name.into(),
++            result_summary: String::new(),
++            is_error,
++        };
++        router.push(start("ok", "bash"));
++        router.push(start("bad", "bash"));
++        router.push(start("open", "bash"));
++        router.push(end("ok", "bash", false));
++        router.push(end("bad", "bash", true));
++        assert_eq!(
++            router.finished_tool_call("ok"),
++            Some(FinishedToolCall {
++                tool_name: "bash".into(),
++                args_preview: "bash args".into(),
++                is_error: false,
++            })
++        );
++        assert!(router.finished_tool_call("bad").unwrap().is_error);
++        assert_eq!(router.finished_tool_call("open"), None);
++        assert_eq!(router.finished_tool_call("nope"), None);
++    }
++
+     #[test]
+     fn text_delta_carries_text_and_message_end_classified() {
+         let message = serde_json::json!({"role": "assistant", "content": [], "timestamp": 0});
+diff --git a/crates/cedian_omp/src/lib.rs b/crates/cedian_omp/src/lib.rs
+index 98b5092..58219bf 100644
+--- a/crates/cedian_omp/src/lib.rs
++++ b/crates/cedian_omp/src/lib.rs
+@@ -12,7 +12,9 @@ pub mod session;
+ pub mod spawn_profile;
+ 
+ pub use errors::OmpError;
+-pub use event_router::{DeltaKind, EventRouter, LogEntry, PromptStatus, RouterEvent};
++pub use event_router::{
++    DeltaKind, EventRouter, FinishedToolCall, LogEntry, PromptStatus, RouterEvent,
++};
+ pub use runtime::{
+     image_content, last_text, OmpBinary, OmpRuntime, RuntimeConfig, RuntimeControl, RuntimeState,
+ };

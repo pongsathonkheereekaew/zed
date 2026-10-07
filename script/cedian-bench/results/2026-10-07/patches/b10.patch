@@ -1,0 +1,110 @@
+diff --git a/crates/cedian_cli/src/browser_store.rs b/crates/cedian_cli/src/browser_store.rs
+index 94498aa..ca4374c 100644
+--- a/crates/cedian_cli/src/browser_store.rs
++++ b/crates/cedian_cli/src/browser_store.rs
+@@ -26,12 +26,17 @@ pub const CHROME_EXE: &str = "/Applications/Google Chrome.app/Contents/MacOS/Goo
+ #[cfg(not(target_os = "macos"))]
+ pub const CHROME_EXE: &str = "google-chrome";
+ 
++/// Schema version: bump on any format change — older files fail closed.
++pub const BROWSER_SNAPSHOT_VERSION: u32 = 1;
++
+ /// Last browser action: where the saved page lives and its frame seq.
+ /// Persisted as JSON at `.cedian/browser.json` so CLI invocations share it
+ /// (same pattern as `workflow_store`; hand-rolled `serde_json::Value`
+ /// mapping so this harness needs no `serde` derive dependency).
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct BrowserHead {
++    /// Schema version written by `save`; `load` rejects missing/mismatch.
++    pub snapshot_version: u32,
+     /// Debug port of the spawn that wrote this head (stale after exit).
+     pub port: u16,
+     /// Page-level CDP URL of the spawn that wrote this head (stale after exit).
+@@ -52,6 +57,19 @@ pub fn load(workdir: &Path) -> Result<BrowserHead, String> {
+         .map_err(|_| "no browser session: run `cedian browser open <url>` first".to_string())?;
+     let v: serde_json::Value =
+         serde_json::from_str(&raw).map_err(|e| format!("corrupt browser.json: {e}"))?;
++    match v.get("snapshot_version").and_then(serde_json::Value::as_u64) {
++        Some(got) if got == u64::from(BROWSER_SNAPSHOT_VERSION) => {}
++        Some(got) => {
++            return Err(format!(
++                "browser state too old (got v{got}, want v{BROWSER_SNAPSHOT_VERSION}), reset: run `cedian browser open <url>`"
++            ));
++        }
++        None => {
++            return Err(format!(
++                "browser state too old (missing snapshot_version, want v{BROWSER_SNAPSHOT_VERSION}), reset: run `cedian browser open <url>`"
++            ));
++        }
++    }
+     let port = v
+         .get("port")
+         .and_then(serde_json::Value::as_u64)
+@@ -64,6 +82,7 @@ pub fn load(workdir: &Path) -> Result<BrowserHead, String> {
+             .ok_or_else(|| format!("corrupt browser.json: bad `{key}`"))
+     };
+     Ok(BrowserHead {
++        snapshot_version: BROWSER_SNAPSHOT_VERSION,
+         port,
+         ws_url: str_field("ws_url")?,
+         url: str_field("url")?,
+@@ -78,6 +97,7 @@ pub fn load(workdir: &Path) -> Result<BrowserHead, String> {
+ pub fn save(workdir: &Path, head: &BrowserHead) -> Result<(), String> {
+     std::fs::create_dir_all(workdir.join(".cedian")).map_err(|e| e.to_string())?;
+     let raw = serde_json::to_string_pretty(&serde_json::json!({
++        "snapshot_version": BROWSER_SNAPSHOT_VERSION,
+         "port": head.port,
+         "ws_url": head.ws_url,
+         "url": head.url,
+@@ -150,4 +170,31 @@ mod tests {
+         clear(&dir);
+         assert!(load(&dir).is_err());
+     }
++
++    #[test]
++    fn unversioned_head_fails_closed() {
++        let dir = std::env::temp_dir().join(format!("cedian-browser-stale-{}", std::process::id()));
++        std::fs::create_dir_all(dir.join(".cedian")).unwrap();
++        std::fs::write(
++            browser_path(&dir),
++            r#"{"port":9222,"ws_url":"ws://x","url":"about:blank","seq":1}"#,
++        )
++        .unwrap();
++        assert!(load(&dir).unwrap_err().contains("too old"));
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn bench_b10_old_store_names_the_reset_command() {
++        let dir = std::env::temp_dir().join(format!("bench-b10-{}", std::process::id()));
++        std::fs::create_dir_all(dir.join(".cedian")).unwrap();
++        std::fs::write(
++            dir.join(".cedian/browser.json"),
++            r#"{"port":9222,"ws_url":"ws://x","url":"about:blank","seq":1}"#,
++        )
++        .unwrap();
++        let err = load(&dir).unwrap_err();
++        assert!(err.contains("too old") && err.contains("cedian browser open"), "{err}");
++        let _ = std::fs::remove_dir_all(&dir);
++    }
+ }
+diff --git a/crates/cedian_cli/src/main.rs b/crates/cedian_cli/src/main.rs
+index 661116c..84b8bbb 100644
+--- a/crates/cedian_cli/src/main.rs
++++ b/crates/cedian_cli/src/main.rs
+@@ -724,6 +724,7 @@ fn cmd_browser(workdir: &Path, args: &[String]) -> Result<(), String> {
+             browser_store::save(
+                 workdir,
+                 &browser_store::BrowserHead {
++                    snapshot_version: browser_store::BROWSER_SNAPSHOT_VERSION,
+                     port: proc.port,
+                     ws_url,
+                     url: url.clone(),
+@@ -772,6 +773,7 @@ fn cmd_browser(workdir: &Path, args: &[String]) -> Result<(), String> {
+             browser_store::save(
+                 workdir,
+                 &browser_store::BrowserHead {
++                    snapshot_version: browser_store::BROWSER_SNAPSHOT_VERSION,
+                     port: proc.port,
+                     ws_url,
+                     url: head.url,

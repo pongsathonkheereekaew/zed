@@ -1,0 +1,17 @@
+[package]
+name = "cedian_workflow"
+version = "0.1.0"
+edition = "2021"
+
+# S2: workflow engine core (plan §§46–56, Phase 10) — TaskProfile, Playbook,
+# Evidence, Gate, WorkflowState as PURE functions. The gate engine NEVER
+# performs I/O (§54 R2 fix): it reads the already-stored evidence map only.
+# OMP's agent/tool loop produces evidence; cedian only evaluates.
+
+[dependencies]
+omp-rpc = { path = "../../vendor/omp-rpc" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

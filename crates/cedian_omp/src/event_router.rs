@@ -1,0 +1,581 @@
+//! EventRouter: the single fan-out point for OMP session events.
+//!
+//! Plan §§5, 71–73: `OMP stdout → background reader → frame decode →
+//! EventRouter → channel → batched GPUI updates`. The vendored client's reader
+//! thread decodes frames; this router classifies them into [`RouterEvent`]s,
+//! keeps the append-only event log (crash-during-stream reconciliation reads
+//! this log, plan §74 R3), and forwards to subscribers.
+//!
+//! Unknown event kinds are tolerated (forwarded as `Unknown`), never fatal —
+//! protocol forward-compat. Classification is a pure typed `match`, never
+//! Debug-string parsing.
+
+use omp_rpc::wire::{AssistantMessageEvent, RpcAgentEvent, RpcNotification};
+use parking_lot::Mutex;
+use std::collections::HashMap;
+use std::sync::{Arc, mpsc};
+
+/// Classified view of one OMP frame for cedian consumers.
+#[derive(Debug, Clone)]
+pub enum RouterEvent {
+    /// Agent turn started.
+    AgentStart,
+    /// Agent turn ended (terminal or continuation — check flags).
+    AgentEnd { yielded: bool, is_terminal: bool },
+    /// Streaming text/thinking/toolcall delta with the RPC message id.
+    /// `delta` carries the new text for `Text`/`Thinking` (empty otherwise).
+    MessageDelta {
+        message_id: String,
+        kind: DeltaKind,
+        delta: String,
+    },
+    /// One message completed (full content in payload).
+    MessageEnd { message_id: String },
+    /// Tool execution lifecycle from OMP's own tools. `args_preview` is a
+    /// one-line human summary (never raw JSON); `result_summary` likewise,
+    /// filled at end. Phase 3 registry renders both.
+    ToolStart {
+        tool_call_id: String,
+        tool_name: String,
+        args_preview: String,
+    },
+    /// Tool execution finished.
+    ToolEnd {
+        tool_call_id: String,
+        tool_name: String,
+        result_summary: String,
+        is_error: bool,
+    },
+    /// A prompt ticket completed.
+    PromptResult {
+        prompt_id: String,
+        status: PromptStatus,
+    },
+    /// Session quiescent — safe to tear down / recycle.
+    Settled,
+    /// Queue snapshot changed (steering/follow-up chips).
+    Queue {
+        steering: Vec<String>,
+        follow_up: Vec<String>,
+    },
+    /// Forward-compat: recognized frame, unmodeled kind — never fatal.
+    Unknown { frame_type: String },
+}
+
+/// Streaming delta kinds (coarse — Phase 2 panel refines rendering).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaKind {
+    Text,
+    Thinking,
+    ToolCall,
+    Other,
+}
+
+/// Terminal status of one prompt ticket. Mirrors the wire enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptStatus {
+    Completed,
+    Aborted,
+    Error,
+}
+
+impl From<omp_rpc::wire::PromptStatus> for PromptStatus {
+    fn from(s: omp_rpc::wire::PromptStatus) -> Self {
+        match s {
+            omp_rpc::wire::PromptStatus::Completed => Self::Completed,
+            omp_rpc::wire::PromptStatus::Aborted => Self::Aborted,
+            omp_rpc::wire::PromptStatus::Error => Self::Error,
+        }
+    }
+}
+
+/// Append-only router log entry: sequence number + event.
+#[derive(Debug, Clone)]
+pub struct LogEntry {
+    /// Monotonic sequence within this router.
+    pub seq: u64,
+    /// Classified event.
+    pub event: RouterEvent,
+}
+
+/// A tool call the log saw start and end; see [`EventRouter::finished_tool_calls`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinishedToolCall {
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub args_preview: String,
+    pub is_error: bool,
+}
+
+/// Single fan-out point: classifies session events, appends to the log, and
+/// broadcasts to subscribers. Reader-thread safe (`parking_lot::Mutex`, no await).
+pub struct EventRouter {
+    inner: Arc<Mutex<Inner>>,
+}
+
+struct Inner {
+    log: Vec<LogEntry>,
+    next_seq: u64,
+    subscribers: HashMap<u64, mpsc::Sender<RouterEvent>>,
+    next_sub: u64,
+}
+
+impl EventRouter {
+    /// Empty router with no subscribers.
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Inner {
+                log: Vec::new(),
+                next_seq: 0,
+                subscribers: HashMap::new(),
+                next_sub: 0,
+            })),
+        }
+    }
+
+    /// Classify one notification frame, append to the log, broadcast. Dead
+    /// subscribers are pruned. Never fails on unknown input.
+    pub fn dispatch_notification(&self, frame: &RpcNotification) {
+        let classified = classify_notification(frame);
+        self.push(classified);
+    }
+
+    /// Subscribe to classified events. Returns (id, receiver); drop the
+    /// receiver to unsubscribe (pruned on next dispatch).
+    pub fn subscribe(&self) -> (u64, mpsc::Receiver<RouterEvent>) {
+        let (tx, rx) = mpsc::channel();
+        let mut inner = self.inner.lock();
+        let id = inner.next_sub;
+        inner.next_sub += 1;
+        inner.subscribers.insert(id, tx);
+        (id, rx)
+    }
+
+    /// Explicit unsubscribe.
+    pub fn unsubscribe(&self, id: u64) {
+        self.inner.lock().subscribers.remove(&id);
+    }
+
+    /// Full log snapshot for crash reconciliation (plan §74: `tool.started`
+    /// without `tool.completed` → `INTERRUPTED`).
+    pub fn log_snapshot(&self) -> Vec<LogEntry> {
+        self.inner.lock().log.clone()
+    }
+
+    /// Tool calls started but not ended in log order — the INTERRUPTED set.
+    pub fn interrupted_tool_calls(&self) -> Vec<String> {
+        let log = self.inner.lock().log.clone();
+        let mut started: Vec<String> = Vec::new();
+        let mut ended: Vec<String> = Vec::new();
+        for entry in &log {
+            match &entry.event {
+                RouterEvent::ToolStart { tool_call_id, .. } => started.push(tool_call_id.clone()),
+                RouterEvent::ToolEnd { tool_call_id, .. } => ended.push(tool_call_id.clone()),
+                _ => {}
+            }
+        }
+        started
+            .into_iter()
+            .filter(|id| !ended.contains(id))
+            .collect()
+    }
+
+    /// Every call the log saw start and end, in completion order: name and
+    /// args preview from its `ToolStart`, `is_error` from its `ToolEnd`.
+    /// Host-tool evidence binds to these (P5, ADR-0031) — the log is the
+    /// only witness, never the agent.
+    pub fn finished_tool_calls(&self) -> Vec<FinishedToolCall> {
+        let inner = self.inner.lock();
+        let mut started: HashMap<&str, (&str, &str)> = HashMap::new();
+        let mut done = Vec::new();
+        for entry in &inner.log {
+            match &entry.event {
+                RouterEvent::ToolStart {
+                    tool_call_id,
+                    tool_name,
+                    args_preview,
+                } => {
+                    started.insert(tool_call_id, (tool_name, args_preview));
+                }
+                RouterEvent::ToolEnd {
+                    tool_call_id,
+                    tool_name,
+                    is_error,
+                    ..
+                } => {
+                    let (name, preview) = started
+                        .remove(tool_call_id.as_str())
+                        .unwrap_or((tool_name, ""));
+                    done.push(FinishedToolCall {
+                        tool_call_id: tool_call_id.clone(),
+                        tool_name: name.to_string(),
+                        args_preview: preview.to_string(),
+                        is_error: *is_error,
+                    });
+                }
+                _ => {}
+            }
+        }
+        done
+    }
+
+    fn push(&self, event: RouterEvent) {
+        let mut inner = self.inner.lock();
+        let seq = inner.next_seq;
+        inner.next_seq += 1;
+        inner.log.push(LogEntry {
+            seq,
+            event: event.clone(),
+        });
+        inner
+            .subscribers
+            .retain(|_, tx| tx.send(event.clone()).is_ok());
+    }
+}
+
+impl Default for EventRouter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Pure classifier: notification frame → router event. Typed `match` over the
+/// generated unions; unknown variants stay `Unknown`, never panic.
+fn classify_notification(frame: &RpcNotification) -> RouterEvent {
+    match frame {
+        RpcNotification::RpcAgentEvent(event) => classify_agent_event(event),
+        RpcNotification::PromptResult(result) => RouterEvent::PromptResult {
+            prompt_id: result.id.clone().unwrap_or_default(),
+            status: result.status.into(),
+        },
+        RpcNotification::SessionSettled(_) => RouterEvent::Settled,
+        RpcNotification::Unknown(raw) => RouterEvent::Unknown {
+            frame_type: raw
+                .get("type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("?")
+                .to_string(),
+        },
+        other => RouterEvent::Unknown {
+            frame_type: notification_name(other).to_string(),
+        },
+    }
+}
+
+fn notification_name(frame: &RpcNotification) -> &'static str {
+    match frame {
+        RpcNotification::Ready(_) => "ready",
+        RpcNotification::ExtensionError(_) => "extension_error",
+        RpcNotification::ExtensionUiRequest(_) => "extension_ui_request",
+        RpcNotification::AvailableCommandsUpdate(_) => "available_commands_update",
+        RpcNotification::SubagentLifecycle(_) => "subagent_lifecycle",
+        RpcNotification::SubagentProgress(_) => "subagent_progress",
+        RpcNotification::SubagentEvent(_) => "subagent_event",
+        RpcNotification::CommandOutput(_) => "command_output",
+        RpcNotification::SessionInfoUpdate(_) => "session_info_update",
+        RpcNotification::ConfigUpdate(_) => "config_update",
+        RpcNotification::RpcFrameError(_) => "rpc_frame_error",
+        _ => "other",
+    }
+}
+
+/// Pure classifier: session event → router event.
+fn classify_agent_event(event: &RpcAgentEvent) -> RouterEvent {
+    match event {
+        RpcAgentEvent::AgentStart(_) => RouterEvent::AgentStart,
+        RpcAgentEvent::AgentEnd(end) => RouterEvent::AgentEnd {
+            yielded: end.yielded.unwrap_or(true),
+            is_terminal: end.is_terminal.unwrap_or(true),
+        },
+        RpcAgentEvent::MessageUpdate(update) => {
+            let (kind, delta) = match &update.assistant_message_event {
+                AssistantMessageEvent::TextDelta(d) => {
+                    (DeltaKind::Text, d.delta.clone().unwrap_or_default())
+                }
+                AssistantMessageEvent::TextStart(_) | AssistantMessageEvent::TextEnd(_) => {
+                    (DeltaKind::Text, String::new())
+                }
+                AssistantMessageEvent::ThinkingDelta(d) => {
+                    (DeltaKind::Thinking, d.delta.clone().unwrap_or_default())
+                }
+                AssistantMessageEvent::ThinkingStart(_) | AssistantMessageEvent::ThinkingEnd(_) => {
+                    (DeltaKind::Thinking, String::new())
+                }
+                AssistantMessageEvent::ToolcallStart(_)
+                | AssistantMessageEvent::ToolcallDelta(_)
+                | AssistantMessageEvent::ToolcallEnd(_) => (DeltaKind::ToolCall, String::new()),
+                _ => (DeltaKind::Other, String::new()),
+            };
+            RouterEvent::MessageDelta {
+                message_id: update.message_id.clone().unwrap_or_default(),
+                kind,
+                delta,
+            }
+        }
+        RpcAgentEvent::MessageEnd(end) => RouterEvent::MessageEnd {
+            message_id: end.message_id.clone().unwrap_or_default(),
+        },
+        RpcAgentEvent::ToolExecutionStart(start) => RouterEvent::ToolStart {
+            tool_call_id: start.tool_call_id.clone(),
+            tool_name: start.tool_name.clone(),
+            args_preview: summarize_args(&start.tool_name, start.args.as_ref()),
+        },
+        RpcAgentEvent::ToolExecutionEnd(end) => RouterEvent::ToolEnd {
+            tool_call_id: end.tool_call_id.clone(),
+            tool_name: end.tool_name.clone(),
+            result_summary: summarize_result(&end.tool_name, end.result.as_ref()),
+            is_error: end.is_error.unwrap_or(false),
+        },
+        RpcAgentEvent::QueueUpdate(queue) => RouterEvent::Queue {
+            steering: queue.steering.clone(),
+            follow_up: queue.follow_up.clone(),
+        },
+        _ => RouterEvent::Unknown {
+            frame_type: "agent_event".to_string(),
+        },
+    }
+}
+/// One-line human summary of tool args — never raw JSON. Per-tool shapes from
+/// `get_state.dumpTools` parameters; unknown tools fall back to key names.
+fn summarize_args(name: &str, args: Option<&serde_json::Value>) -> String {
+    let Some(args) = args else {
+        return String::new();
+    };
+    let get = |key: &str| args.get(key).and_then(|v| v.as_str()).unwrap_or("");
+    // One display line, ~120 chars: long paths (e.g. $TMPDIR) must survive.
+    let first_line = |s: &str| {
+        s.lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(120)
+            .collect::<String>()
+    };
+    let preview: String = match name {
+        "read" | "write" | "glob" | "cedian_apply_edit" => get("path").to_string(),
+        "edit" => get("input")
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(60)
+            .collect(),
+        "bash" => first_line(get("command")),
+        "grep" => format!("{} in {}", get("pattern"), get("path")),
+        "find" => get("query").chars().take(80).collect(),
+        "eval" => format!("{}: {}", get("language"), first_line(get("code"))),
+        "todo" => format!("{} {}", get("op"), get("task")),
+        "web_search" => get("query").chars().take(80).collect(),
+        _ => args
+            .as_object()
+            .map(|o| o.keys().take(3).cloned().collect::<Vec<_>>().join(", "))
+            .unwrap_or_default(),
+    };
+    preview.trim().to_string()
+}
+
+/// One-line human summary of a tool result — never raw JSON. Prefers counts
+/// and first lines over dumps; truncates to one line.
+fn summarize_result(name: &str, result: Option<&serde_json::Value>) -> String {
+    let Some(result) = result else {
+        return String::new();
+    };
+    let content_texts: Vec<&str> = result
+        .get("content")
+        .and_then(|c| c.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|i| i.get("text").and_then(|t| t.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let joined = content_texts.join("\n");
+    let line_count = joined.lines().count();
+    match name {
+        "bash" | "eval" => {
+            if line_count > 1 {
+                format!(
+                    "{} lines, last: {}",
+                    line_count,
+                    joined.lines().last().unwrap_or("")
+                )
+            } else {
+                joined
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(100)
+                    .collect()
+            }
+        }
+        "grep" | "glob" | "find" => {
+            if line_count > 1 {
+                format!("{line_count} matches")
+            } else {
+                joined
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(100)
+                    .collect()
+            }
+        }
+        _ => joined
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(100)
+            .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use omp_rpc::wire::{PromptResultEvent, SessionSettledEvent};
+
+    fn agent_event(json: serde_json::Value) -> RpcAgentEvent {
+        RpcAgentEvent::from_value(json).expect("valid agent event")
+    }
+
+    #[test]
+    fn finished_tool_call_needs_a_tool_end() {
+        let router = EventRouter::new();
+        let start = |id: &str, name: &str| RouterEvent::ToolStart {
+            tool_call_id: id.into(),
+            tool_name: name.into(),
+            args_preview: format!("{name} args"),
+        };
+        let end = |id: &str, name: &str, is_error| RouterEvent::ToolEnd {
+            tool_call_id: id.into(),
+            tool_name: name.into(),
+            result_summary: String::new(),
+            is_error,
+        };
+        router.push(start("ok", "bash"));
+        router.push(start("bad", "bash"));
+        router.push(start("open", "bash"));
+        router.push(end("ok", "bash", false));
+        router.push(end("bad", "bash", true));
+        let done = router.finished_tool_calls();
+        assert_eq!(
+            done[0],
+            FinishedToolCall {
+                tool_call_id: "ok".into(),
+                tool_name: "bash".into(),
+                args_preview: "bash args".into(),
+                is_error: false,
+            }
+        );
+        assert!(done[1].is_error);
+        assert_eq!(done.len(), 2, "a started-only call is not finished");
+    }
+
+    #[test]
+    fn text_delta_carries_text_and_message_end_classified() {
+        let message = serde_json::json!({"role": "assistant", "content": [], "timestamp": 0});
+        let update = agent_event(serde_json::json!({
+            "type": "message_update",
+            "messageId": "m1",
+            "message": message,
+            "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0, "delta": "hel"},
+        }));
+        match classify_agent_event(&update) {
+            RouterEvent::MessageDelta {
+                message_id,
+                kind,
+                delta,
+            } => {
+                assert_eq!(message_id, "m1");
+                assert_eq!(kind, DeltaKind::Text);
+                assert_eq!(delta, "hel");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let end = agent_event(serde_json::json!({
+            "type": "message_end",
+            "messageId": "m1",
+            "message": message,
+        }));
+        assert!(matches!(
+            classify_agent_event(&end),
+            RouterEvent::MessageEnd { message_id } if message_id == "m1"
+        ));
+    }
+
+    #[test]
+    fn interrupted_set_empty_when_balanced() {
+        let r = EventRouter::new();
+        assert!(r.interrupted_tool_calls().is_empty());
+    }
+
+    #[test]
+    fn prompt_result_classified() {
+        let r = EventRouter::new();
+        let (_id, rx) = r.subscribe();
+        r.dispatch_notification(&RpcNotification::PromptResult(PromptResultEvent {
+            agent_invoked: true,
+            status: omp_rpc::wire::PromptStatus::Aborted,
+            session_settled: true,
+            id: Some("p1".to_string()),
+            error: None,
+        }));
+        match rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap() {
+            RouterEvent::PromptResult { prompt_id, status } => {
+                assert_eq!(prompt_id, "p1");
+                assert_eq!(status, PromptStatus::Aborted);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn settled_classified() {
+        let r = EventRouter::new();
+        let (_id, rx) = r.subscribe();
+        r.dispatch_notification(&RpcNotification::SessionSettled(SessionSettledEvent {}));
+        assert!(matches!(
+            rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(),
+            RouterEvent::Settled
+        ));
+    }
+
+    #[test]
+    fn dead_subscriber_pruned() {
+        let r = EventRouter::new();
+        let (_id, rx) = r.subscribe();
+        drop(rx);
+        r.dispatch_notification(&RpcNotification::SessionSettled(SessionSettledEvent {}));
+        assert_eq!(r.inner.lock().subscribers.len(), 0);
+    }
+    #[test]
+    fn args_preview_never_raw_json() {
+        let args = serde_json::json!({"command": "cargo test --workspace", "cwd": "/w"});
+        assert_eq!(
+            summarize_args("bash", Some(&args)),
+            "cargo test --workspace"
+        );
+        let args = serde_json::json!({"path": "src/main.rs:10-20"});
+        assert_eq!(summarize_args("read", Some(&args)), "src/main.rs:10-20");
+        let args = serde_json::json!({"pattern": "TODO", "path": "src/"});
+        assert_eq!(summarize_args("grep", Some(&args)), "TODO in src/");
+        // Unknown tool: key names, never a JSON dump.
+        let args = serde_json::json!({"zzz": 1, "aaa": 2});
+        let preview = summarize_args("future_tool", Some(&args));
+        assert!(!preview.contains('{'), "got {preview:?}");
+        assert!(summarize_args("read", None).is_empty());
+    }
+
+    #[test]
+    fn result_summary_prefers_counts() {
+        let multi = serde_json::json!({"content": [{"type": "text", "text": "a\nb\nc"}]});
+        assert_eq!(summarize_result("grep", Some(&multi)), "3 matches");
+        let single = serde_json::json!({"content": [{"type": "text", "text": "hello"}]});
+        assert_eq!(summarize_result("read", Some(&single)), "hello");
+        assert!(summarize_result("bash", None).is_empty());
+    }
+}

@@ -1,0 +1,94 @@
+diff --git a/crates/cedian_workspace/src/host.rs b/crates/cedian_workspace/src/host.rs
+index c468b6a..1c3320c 100644
+--- a/crates/cedian_workspace/src/host.rs
++++ b/crates/cedian_workspace/src/host.rs
+@@ -144,21 +144,51 @@ impl HostTools {
+                 path.to_path_buf()
+             }
+         });
+-        let rel = if canon.is_absolute() {
+-            canon
+-                .strip_prefix(&self.workdir)
+-                .map(|r| r.to_path_buf())
+-                .map_err(|_| format!("path escapes workspace: {}", path.display()))?
++        if canon.is_absolute() {
++            match canon.strip_prefix(&self.workdir).map(|r| r.to_path_buf()) {
++                Ok(rel) => {
++                    if rel
++                        .components()
++                        .any(|c| matches!(c, std::path::Component::ParentDir))
++                    {
++                        return Err(format!("path escapes workspace: {}", path.display()));
++                    }
++                    Ok(PathBuf::from(format!("/{}", rel.display())))
++                }
++                // Absolute-shaped but outside workdir: may be an OMP `/`-key.
++                Err(_) => self.resolve_slash_key(path),
++            }
+         } else {
+-            path.strip_prefix("/").unwrap_or(path).to_path_buf()
+-        };
++            let rel = path.strip_prefix("/").unwrap_or(path).to_path_buf();
++            if rel
++                .components()
++                .any(|c| matches!(c, std::path::Component::ParentDir))
++            {
++                return Err(format!("path escapes workspace: {}", path.display()));
++            }
++            Ok(PathBuf::from(format!("/{}", rel.display())))
++        }
++    }
++
++    /// OMP 18.6 sends buffer keys in `/`-form (`/notes.txt`): absolute-shaped
++    /// but workspace-relative. Accept such a key when it names an open buffer
++    /// or a file inside the workspace; real absolute paths outside the
++    /// workspace stay rejected (fail closed, never a jailbreak).
++    fn resolve_slash_key(&self, path: &Path) -> Result<PathBuf, String> {
++        let rel = path.strip_prefix("/").unwrap_or(path).to_path_buf();
+         if rel
+             .components()
+             .any(|c| matches!(c, std::path::Component::ParentDir))
+         {
+             return Err(format!("path escapes workspace: {}", path.display()));
+         }
+-        Ok(PathBuf::from(format!("/{}", rel.display())))
++        let key = PathBuf::from(format!("/{}", rel.display()));
++        let open = self.store.lock().version(&key).is_some();
++        if open || self.workdir.join(&rel).is_file() {
++            Ok(key)
++        } else {
++            Err(format!("path escapes workspace: {}", path.display()))
++        }
+     }
+     /// Ensure a buffer is open for a key, loading from disk on first use.
+     /// Returns `false` when there is nothing to open (no disk file either) —
+@@ -537,4 +567,29 @@ mod tests {
+             .expect("resolves");
+         assert_eq!(key, PathBuf::from("/fake.rs"));
+     }
++
++    #[test]
++    fn slash_key_resolves_only_inside_workspace() {
++        let ws = std::env::temp_dir().join(format!("cedian-ws-slashkey-{}", std::process::id()));
++        std::fs::create_dir_all(&ws).unwrap();
++        std::fs::write(ws.join("notes.txt"), "x\n").unwrap();
++        let ws = ws.canonicalize().unwrap();
++        let h = HostTools::new(&ws);
++        // `/`-key naming a workspace file (what models copy from buffer keys).
++        assert_eq!(
++            h.resolve(Path::new("/notes.txt")).unwrap(),
++            PathBuf::from("/notes.txt")
++        );
++        // `/`-key naming an open (unsaved) buffer.
++        h.open(Path::new("/draft.rs"), "fn main() {}\n");
++        assert_eq!(
++            h.resolve(Path::new("/draft.rs")).unwrap(),
++            PathBuf::from("/draft.rs")
++        );
++        // Real absolute paths outside the workspace stay rejected.
++        assert!(h.resolve(Path::new("/etc/hosts")).is_err());
++        assert!(h.resolve(Path::new("/nope.txt")).is_err());
++        assert!(h.resolve(Path::new("/../etc/hosts")).is_err());
++        let _ = std::fs::remove_dir_all(&ws);
++    }
+ }

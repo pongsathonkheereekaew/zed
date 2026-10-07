@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Format, lint and test the cedian crates only (ADR-0040), so a check never
+# builds all of Zed. `script/cedian-check check` stops after `cargo check`.
+set -euo pipefail
+cd "$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
+export PATH="$HOME/.cargo/bin:$PATH"
+export CARGO_PROFILE_DEV_DEBUG=${CARGO_PROFILE_DEV_DEBUG:-line-tables-only}
+
+crates=(omp-rpc)
+for dir in crates/cedian_*; do
+  name=$(basename "$dir")
+  [ "$name" = cedian_panel ] && continue # GPUI: built with the app
+  crates+=("$name")
+done
+pkgs=()
+for c in "${crates[@]}"; do pkgs+=(-p "$c"); done
+
+files=()
+while IFS= read -r f; do files+=("$f"); done < <(find crates/cedian_* -name '*.rs' -not -path '*/target/*')
+rustfmt --edition 2024 --check "${files[@]}"
+if [ "${1:-}" = check ]; then
+  cargo check -j4 --all-targets "${pkgs[@]}"
+  exit 0
+fi
+# Vendored upstream code is built and tested, not linted.
+lint=("${pkgs[@]:2}")
+cargo clippy -j4 --all-targets --no-deps "${lint[@]}" -- -D warnings
+cargo test -j4 "${pkgs[@]}"

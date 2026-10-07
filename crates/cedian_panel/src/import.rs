@@ -48,7 +48,11 @@ pub fn begin(buffer: &mut Buffer) -> Mark {
 }
 
 /// Reload from disk and fold everything since [`begin`] into one transaction.
-pub async fn finish(buffer: Entity<Buffer>, mark: Mark, cx: &mut AsyncApp) -> Result<ImportOutcome> {
+pub async fn finish(
+    buffer: Entity<Buffer>,
+    mark: Mark,
+    cx: &mut AsyncApp,
+) -> Result<ImportOutcome> {
     let (dirty, watcher_txn) = buffer.read_with(cx, |b, _| {
         let raced = (top(b) != mark.start_top).then(|| top(b)).flatten();
         (b.is_dirty(), raced)
@@ -64,9 +68,7 @@ pub async fn finish(buffer: Entity<Buffer>, mark: Mark, cx: &mut AsyncApp) -> Re
     buffer.update(cx, |b, _| {
         // `reload` returns the previous top when its diff was empty, so only a
         // version change proves it applied something.
-        let ours = reloaded
-            .map(|txn| txn.id)
-            .filter(|_| b.version() != before);
+        let ours = reloaded.map(|txn| txn.id).filter(|_| b.version() != before);
         let id = match (watcher_txn, ours) {
             (Some(watcher), Some(ours)) => {
                 b.merge_transactions(ours, watcher);
@@ -131,7 +133,9 @@ mod tests {
         let (fs, _project, buffer) = setup(cx).await;
         let mark = buffer.update(cx, |b, _| begin(b));
         omp_writes(&fs, "alpha\nBETA\ngamma\n").await;
-        let outcome = finish(buffer.clone(), mark, &mut cx.to_async()).await.unwrap();
+        let outcome = finish(buffer.clone(), mark, &mut cx.to_async())
+            .await
+            .unwrap();
         cx.run_until_parked(); // the watcher's own reload must be a no-op now
         let ImportOutcome::Imported(txn) = outcome else {
             panic!("expected one imported transaction, got {outcome:?}");
@@ -150,8 +154,13 @@ mod tests {
         let mark = buffer.update(cx, |b, _| begin(b));
         omp_writes(&fs, "alpha\nBETA\ngamma\n").await;
         cx.run_until_parked(); // watcher reloads first
-        assert_eq!(buffer.read_with(cx, |b, _| b.text()), "alpha\nBETA\ngamma\n");
-        let outcome = finish(buffer.clone(), mark, &mut cx.to_async()).await.unwrap();
+        assert_eq!(
+            buffer.read_with(cx, |b, _| b.text()),
+            "alpha\nBETA\ngamma\n"
+        );
+        let outcome = finish(buffer.clone(), mark, &mut cx.to_async())
+            .await
+            .unwrap();
         assert!(matches!(outcome, ImportOutcome::Imported(_)), "{outcome:?}");
         buffer.update(cx, |b, cx| {
             b.undo(cx);
@@ -165,7 +174,9 @@ mod tests {
         let mark = buffer.update(cx, |b, _| begin(b));
         buffer.update(cx, |b, cx| b.edit([(0..0, "USER ")], None, cx));
         omp_writes(&fs, "alpha\nBETA\ngamma\n").await;
-        let outcome = finish(buffer.clone(), mark, &mut cx.to_async()).await.unwrap();
+        let outcome = finish(buffer.clone(), mark, &mut cx.to_async())
+            .await
+            .unwrap();
         assert_eq!(outcome, ImportOutcome::Stale);
         assert_eq!(
             buffer.read_with(cx, |b, _| b.text()),
@@ -180,9 +191,13 @@ mod tests {
         let (fs, _project, buffer) = setup(cx).await;
         let mark = buffer.update(cx, |b, _| begin(b));
         omp_writes(&fs, "alpha\nBETA\ngamma\n").await;
-        finish(buffer.clone(), mark, &mut cx.to_async()).await.unwrap();
+        finish(buffer.clone(), mark, &mut cx.to_async())
+            .await
+            .unwrap();
         let mark = buffer.update(cx, |b, _| begin(b));
-        let outcome = finish(buffer.clone(), mark, &mut cx.to_async()).await.unwrap();
+        let outcome = finish(buffer.clone(), mark, &mut cx.to_async())
+            .await
+            .unwrap();
         assert_eq!(outcome, ImportOutcome::Unchanged);
     }
 }

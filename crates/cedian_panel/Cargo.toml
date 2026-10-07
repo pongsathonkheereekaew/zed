@@ -17,10 +17,10 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
-cedian_agent = { path = "../../../../cedian/crates/cedian_agent" }
-cedian_agent_ui = { path = "../../../../cedian/crates/cedian_agent_ui" }
-cedian_omp = { path = "../../../../cedian/crates/cedian_omp" }
-cedian_workspace = { path = "../../../../cedian/crates/cedian_workspace" }
+cedian_agent = { path = "../cedian_agent" }
+cedian_agent_ui = { path = "../cedian_agent_ui" }
+cedian_omp = { path = "../cedian_omp" }
+cedian_workspace = { path = "../cedian_workspace" }
 clock.workspace = true
 collections.workspace = true
 editor.workspace = true

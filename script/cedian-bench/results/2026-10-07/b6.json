@@ -1,0 +1,17 @@
+{
+  "task": "b6",
+  "predicate": "fail",
+  "wall_ms": 601856,
+  "time_to_usable_result_ms": null,
+  "claimed_done": false,
+  "false_done": false,
+  "omp_version": "omp/18.6.1",
+  "omp_binary": "/Users/pond/.local/bin/omp",
+  "model": "opencode-go/muse-spark-1.3-contributor",
+  "timing": [
+    {
+      "event": "spawn",
+      "ms": 1109
+    }
+  ]
+}

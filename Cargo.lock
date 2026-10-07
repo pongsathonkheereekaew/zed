@@ -2811,6 +2811,55 @@ dependencies = [
 ]
 
 [[package]]
+name = "cedian_browser"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "serde",
+ "serde_json",
+ "tungstenite 0.26.2",
+]
+
+[[package]]
+name = "cedian_cli"
+version = "0.1.0"
+dependencies = [
+ "cedian_agent",
+ "cedian_agent_ui",
+ "cedian_browser",
+ "cedian_fake_omp",
+ "cedian_omp",
+ "cedian_review",
+ "cedian_shell",
+ "cedian_worker",
+ "cedian_workflow",
+ "cedian_workspace",
+ "omp-rpc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "cedian_dap"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "cedian_fake_omp"
+version = "0.1.0"
+dependencies = [
+ "cedian_agent",
+ "cedian_agent_ui",
+ "cedian_omp",
+ "omp-rpc",
+ "serde_json",
+]
+
+[[package]]
 name = "cedian_lsp"
 version = "0.1.0"
 dependencies = [
@@ -2855,6 +2904,45 @@ dependencies = [
  "theme_settings",
  "ui",
  "workspace",
+]
+
+[[package]]
+name = "cedian_review"
+version = "0.1.0"
+dependencies = [
+ "cedian_agent",
+ "cedian_omp",
+ "cedian_workspace",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "cedian_shell"
+version = "0.1.0"
+dependencies = [
+ "cedian_workflow",
+ "serde",
+ "serde_json",
+ "toml 0.8.23",
+]
+
+[[package]]
+name = "cedian_worker"
+version = "0.1.0"
+dependencies = [
+ "omp-rpc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "cedian_workflow"
+version = "0.1.0"
+dependencies = [
+ "omp-rpc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -19221,6 +19309,23 @@ dependencies = [
  "sha1",
  "thiserror 1.0.69",
  "url",
+ "utf-8",
+]
+
+[[package]]
+name = "tungstenite"
+version = "0.26.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4793cb5e56680ecbb1d843515b23b6de9a75eb04b66643e256a396d43be33c13"
+dependencies = [
+ "bytes 1.11.1",
+ "data-encoding",
+ "http 1.3.1",
+ "httparse",
+ "log",
+ "rand 0.9.4",
+ "sha1",
+ "thiserror 2.0.17",
  "utf-8",
 ]
 

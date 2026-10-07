@@ -1,0 +1,17 @@
+[package]
+name = "cedian_lsp"
+version = "0.1.0"
+edition = "2021"
+
+# S1: headless LSP client — spawn rust-analyzer (or any LSP server) over
+# stdio with Content-Length framing, request diagnostics/hover/definition/
+# symbols. Feeds HostTools.publish_diagnostics + cedian://symbols.
+# Blocking API (own thread), same discipline as cedian_omp.
+
+[dependencies]
+parking_lot = "0.12"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

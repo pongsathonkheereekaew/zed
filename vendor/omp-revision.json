@@ -1,0 +1,18 @@
+{
+  "repo": "https://github.com/can1357/oh-my-pi",
+  "commit": "fc6c0c90dab012a0b7edea731af92f5bbd09cff0",
+  "commitDate": "2026-10-06T02:38:52Z",
+  "subject": "Merge pull request #14547 from H4vC/chore/bazel-lock-refresh",
+  "sourceTreeHash": "TODO: fill on build-omp run (normalized `git archive` sha256 of the pinned commit)",
+  "builder": "TODO: fill on build-omp run (machine/user that produced the bundled binary)",
+  "spikeVerified": {
+    "ompVersion": "18.6.1",
+    "date": "2026-10-06",
+    "result": "SPIKE-RESULT: PASS (14/14), see spike/CAPABILITY_TABLE.md"
+  },
+  "vendored": {
+    "path": "vendor/omp-rpc",
+    "upstream": "sdk/rust/omp-rpc",
+    "staleness": "CI-enforced upstream (`bun check`, `test/rpc-wire`); re-run generation + refresh this pin on bump"
+  }
+}

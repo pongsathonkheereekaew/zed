@@ -1,0 +1,150 @@
+diff --git a/crates/cedian_agent_ui/src/lib.rs b/crates/cedian_agent_ui/src/lib.rs
+index e641ea0..3219597 100644
+--- a/crates/cedian_agent_ui/src/lib.rs
++++ b/crates/cedian_agent_ui/src/lib.rs
+@@ -17,4 +17,4 @@ pub use composer::{Composer, ComposerMode};
+ pub use message::{render_thread, MessageModel, MessageRole, ToolCard, ToolCardStatus};
+ pub use panel::{Panel, PanelTask};
+ pub use text_buffer::TextDeltaBuffer;
+-pub use tool_card::{card_for_tool, generic_card, ToolCardMeta};
++pub use tool_card::{card_for_tool, generic_card, host_device, ToolCardMeta};
+diff --git a/crates/cedian_agent_ui/src/message.rs b/crates/cedian_agent_ui/src/message.rs
+index 2a9055a..79f0de8 100644
+--- a/crates/cedian_agent_ui/src/message.rs
++++ b/crates/cedian_agent_ui/src/message.rs
+@@ -135,8 +135,19 @@ pub fn render_thread(events: &[ThreadEvent]) -> (Vec<MessageModel>, Vec<ToolCard
+                 preview,
+                 summary,
+             } => {
+-                let meta = crate::card_for_tool(name);
+-                let mut card = ToolCard::running(call_id, name, meta.title, preview);
++                let mut card = match crate::tool_card::host_device(name, preview) {
++                    // Host tool execution: card named after the tool with the
++                    // tool name as its preview — never a file write.
++                    Some((tool, true)) => ToolCard::running(call_id, tool, "Host tool", tool),
++                    // Docs read: stays a read, titled as such.
++                    Some((_, false)) => {
++                        ToolCard::running(call_id, name, "Read host tool docs", preview)
++                    }
++                    None => {
++                        let meta = crate::card_for_tool(name);
++                        ToolCard::running(call_id, name, meta.title, preview)
++                    }
++                };
+                 card.status = (*status).into();
+                 card.summary = summary.clone();
+                 cards.push(card);
+@@ -187,4 +198,23 @@ mod tests {
+         card.set_summary("42 lines");
+         assert_eq!(card.display_line(), "Read file — a.rs → 42 lines");
+     }
++
++    #[test]
++    fn xd_host_tool_cards_named_after_the_tool() {
++        let tool = |call_id: &str, name: &str| ThreadEvent::Tool {
++            call_id: call_id.to_string(),
++            name: name.to_string(),
++            status: ToolCallStatus::Done,
++            preview: "xd://cedian_apply_edit".to_string(),
++            summary: String::new(),
++        };
++        let (_, cards) = render_thread(&[tool("r", "read"), tool("w", "write")]);
++        // Reading the device docs is not an edit: name stays `read`.
++        assert_eq!(
++            (cards[0].name.as_str(), cards[0].title.as_str()),
++            ("read", "Read host tool docs")
++        );
++        assert_eq!(cards[1].name, "cedian_apply_edit");
++        assert_eq!(cards[1].display_line(), "Host tool — cedian_apply_edit");
++    }
+ }
+diff --git a/crates/cedian_agent_ui/src/tool_card.rs b/crates/cedian_agent_ui/src/tool_card.rs
+index b9c8a36..e9164f8 100644
+--- a/crates/cedian_agent_ui/src/tool_card.rs
++++ b/crates/cedian_agent_ui/src/tool_card.rs
+@@ -15,9 +15,39 @@ pub struct ToolCardMeta {
+     pub summary_hint: &'static str,
+ }
+ 
++/// Host-device probe for OMP 18.6 host tools.
++///
++/// OMP runs cedian host tools as writes to `xd://<tool>` (executing the tool);
++/// a read of `xd://<tool>` only fetches the tool's docs/schema. Both arrive
++/// as plain `read`/`write` calls whose args preview is the device path, so
++/// without this probe the transcript shows them as file reads/writes.
++///
++/// Returns the host tool name and whether the call executes it (`true` for a
++/// write) or only reads its docs (`false` for a read). `None` for anything
++/// else: other tools, non-device paths, an empty device (`xd://`).
++pub fn host_device<'a>(name: &str, preview: &'a str) -> Option<(&'a str, bool)> {
++    let execute = match name {
++        "write" => true,
++        "read" => false,
++        _ => return None,
++    };
++    let tool = preview.strip_prefix("xd://")?;
++    if tool.is_empty() || tool.contains('/') {
++        return None;
++    }
++    Some((tool, execute))
++}
++
+ /// Card metadata for the Phase 3 tool list (plan Phase 3 acceptance set).
+ /// Unknown names fall back to `generic_card`.
+ pub fn card_for_tool(name: &str) -> ToolCardMeta {
++    // Host-device path (`xd://<tool>`): the card is named after the host
++    // tool, never shown as a file operation.
++    if let Some(tool) = name.strip_prefix("xd://") {
++        if !tool.is_empty() {
++            return host_tool_card();
++        }
++    }
+     match name {
+         "read" => ToolCardMeta {
+             title: "Read file",
+@@ -71,10 +101,23 @@ pub fn card_for_tool(name: &str) -> ToolCardMeta {
+             title: "Todo",
+             summary_hint: "update",
+         },
++        "cedian_apply_edit"
++        | "cedian_workflow_update"
++        | "cedian_complete"
++        | "cedian_worktree_request" => host_tool_card(),
+         _ => generic_card(),
+     }
+ }
+ 
++/// Card for a cedian host-tool execution: named after the tool, never a file
++/// operation and never raw JSON.
++fn host_tool_card() -> ToolCardMeta {
++    ToolCardMeta {
++        title: "Host tool",
++        summary_hint: "host tool",
++    }
++}
++
+ /// Fallback card: renders name + status, never raw JSON.
+ pub fn generic_card() -> ToolCardMeta {
+     ToolCardMeta {
+@@ -87,6 +130,21 @@ pub fn generic_card() -> ToolCardMeta {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn xd_devices_map_to_host_tools() {
++        assert_eq!(
++            host_device("write", "xd://cedian_apply_edit"),
++            Some(("cedian_apply_edit", true))
++        );
++        assert_eq!(
++            host_device("read", "xd://echo_host"),
++            Some(("echo_host", false))
++        );
++        assert_eq!(host_device("write", "src/a.rs"), None);
++        assert_eq!(host_device("bash", "xd://x"), None);
++        assert_eq!(host_device("write", "xd://"), None);
++    }
++
+     #[test]
+     fn known_tools_have_cards() {
+         for name in [

@@ -1,0 +1,3 @@
+# Vendored from upstream OMP (sdk/rust/omp-rpc): never reformat, so a pin bump
+# diffs cleanly against the generated source.
+disable_all_formatting = true

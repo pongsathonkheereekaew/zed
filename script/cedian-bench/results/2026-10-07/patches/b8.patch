@@ -1,0 +1,128 @@
+diff --git a/crates/cedian_cli/src/main.rs b/crates/cedian_cli/src/main.rs
+index c5e4eea..1264bea 100644
+--- a/crates/cedian_cli/src/main.rs
++++ b/crates/cedian_cli/src/main.rs
+@@ -950,27 +950,14 @@ fn cmd_workflow(
+             let title = args
+                 .get(2)
+                 .ok_or("usage: cedian workflow run <kind> <title> [--risk R]")?;
+-            let kind = match kind.as_str() {
+-                "investigation" => cedian_workflow::TaskKind::Investigation,
+-                "bug_fix" => cedian_workflow::TaskKind::BugFix,
+-                "feature" => cedian_workflow::TaskKind::Feature,
+-                "refactor" => cedian_workflow::TaskKind::Refactor,
+-                "performance" => cedian_workflow::TaskKind::Performance,
+-                "prototype" => cedian_workflow::TaskKind::Prototype,
+-                _ => return Err(format!("unknown kind {kind:?} (investigation|bug_fix|feature|refactor|performance|prototype)")),
+-            };
++            let kind = cedian_workflow::TaskKind::parse(kind)?;
+             let mut profile = cedian_workflow::TaskProfile::new(title, kind);
+             let mut i = 3;
+             while i < args.len() {
+                 match args[i].as_str() {
+                     "--risk" => {
+                         let r = args.get(i + 1).ok_or("usage: --risk low|medium|high")?;
+-                        profile.risk = match r.as_str() {
+-                            "low" => cedian_workflow::Risk::Low,
+-                            "medium" => cedian_workflow::Risk::Medium,
+-                            "high" => cedian_workflow::Risk::High,
+-                            _ => return Err(format!("unknown risk {r:?}")),
+-                        };
++                        profile.risk = cedian_workflow::Risk::parse(r)?;
+                         i += 2;
+                     }
+                     flag => return Err(format!("unknown flag {flag:?}")),
+diff --git a/crates/cedian_workflow/src/channel.rs b/crates/cedian_workflow/src/channel.rs
+index 3d62dac..521c0c7 100644
+--- a/crates/cedian_workflow/src/channel.rs
++++ b/crates/cedian_workflow/src/channel.rs
+@@ -170,9 +170,10 @@ impl WorkflowChannel {
+                         ));
+                     }
+                 }
+-                let kind: TaskKind = enum_arg(args, "kind")?.ok_or(
+-                    "missing `kind` (investigation|bug_fix|feature|refactor|performance|prototype)",
+-                )?;
++                let kind: TaskKind = enum_arg(args, "kind")?.ok_or(format!(
++                    "missing `kind` ({})",
++                    TaskKind::list()
++                ))?;
+                 let mut profile = TaskProfile::new(str_arg(args, "title")?, kind);
+                 if let Some(risk) = enum_arg::<Risk>(args, "risk")? {
+                     profile.risk = risk;
+diff --git a/crates/cedian_workflow/src/profile.rs b/crates/cedian_workflow/src/profile.rs
+index 7df0d98..be4dd3e 100644
+--- a/crates/cedian_workflow/src/profile.rs
++++ b/crates/cedian_workflow/src/profile.rs
+@@ -14,6 +14,39 @@ pub enum TaskKind {
+     Performance,
+     Prototype,
+ }
++impl TaskKind {
++    /// Every kind, in serde order. The spelling lives on the enum
++    /// (`snake_case`); this lists variants, never strings.
++    pub const ALL: [Self; 6] = [
++        Self::Investigation,
++        Self::BugFix,
++        Self::Feature,
++        Self::Refactor,
++        Self::Performance,
++        Self::Prototype,
++    ];
++
++    /// Parse one serde name (`bug_fix`, …) — the same spelling the workflow
++    /// channel deserializes. Unknown input fails listing every kind.
++    pub fn parse(s: &str) -> Result<Self, String> {
++        serde_json::from_value::<Self>(serde_json::Value::String(s.to_owned()))
++            .map_err(|_| format!("unknown kind {s:?} ({})", Self::list()))
++    }
++
++    /// `investigation|bug_fix|…`, derived from serde (no second spelling).
++    pub fn list() -> String {
++        Self::ALL
++            .iter()
++            .map(|k| {
++                serde_json::to_value(k)
++                    .ok()
++                    .and_then(|v| v.as_str().map(str::to_owned))
++                    .unwrap_or_else(|| "?".to_owned())
++            })
++            .collect::<Vec<_>>()
++            .join("|")
++    }
++}
+ 
+ /// Complexity bands (estimate only — gates, not phases, enforce quality).
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+@@ -33,6 +66,31 @@ pub enum Risk {
+     Medium,
+     High,
+ }
++impl Risk {
++    /// Every risk, in serde order.
++    pub const ALL: [Self; 3] = [Self::Low, Self::Medium, Self::High];
++
++    /// Parse one serde name (`low`, …) — the same spelling the workflow
++    /// channel deserializes. Unknown input fails listing every risk.
++    pub fn parse(s: &str) -> Result<Self, String> {
++        serde_json::from_value::<Self>(serde_json::Value::String(s.to_owned()))
++            .map_err(|_| format!("unknown risk {s:?} ({})", Self::list()))
++    }
++
++    /// `low|medium|high`, derived from serde (no second spelling).
++    pub fn list() -> String {
++        Self::ALL
++            .iter()
++            .map(|r| {
++                serde_json::to_value(r)
++                    .ok()
++                    .and_then(|v| v.as_str().map(str::to_owned))
++                    .unwrap_or_else(|| "?".to_owned())
++            })
++            .collect::<Vec<_>>()
++            .join("|")
++    }
++}
+ 
+ /// Surfaces the task touches (§47).
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

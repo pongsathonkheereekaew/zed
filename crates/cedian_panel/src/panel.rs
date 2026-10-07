@@ -12,8 +12,8 @@ use collections::HashMap;
 use editor::Editor;
 use futures::{StreamExt, channel::mpsc};
 use gpui::{
-    Action, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    Pixels, Render, Task, WeakEntity, Window, actions, px,
+    Action, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable, Pixels,
+    Render, Task, WeakEntity, Window, actions, px,
 };
 use language::Buffer;
 use project::Project;
@@ -322,7 +322,11 @@ impl Render for CedianPanel {
                             .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
                     ),
             )
-            .child(Label::new(footer).size(LabelSize::Small).color(Color::Muted))
+            .child(
+                Label::new(footer)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
     }
 }
 
@@ -409,7 +413,11 @@ mod tests {
             .iter()
             .map(|m| format!("{:?}: {}", m.role, m.text))
             .collect();
-        out.extend(cards.iter().map(|c| format!("card {:?} {}", c.status, c.display_line())));
+        out.extend(
+            cards
+                .iter()
+                .map(|c| format!("card {:?} {}", c.status, c.display_line())),
+        );
         out.join("\n")
     }
 
@@ -445,12 +453,22 @@ mod tests {
         };
         let read = |cx: &mut TestAppContext| {
             window
-                .update(cx, |panel, _, _| (panel.status.clone(), texts(panel), panel.imported.len(), panel.stale))
+                .update(cx, |panel, _, _| {
+                    (
+                        panel.status.clone(),
+                        texts(panel),
+                        panel.imported.len(),
+                        panel.stale,
+                    )
+                })
                 .unwrap()
         };
 
         // T2: a prompt typed into the panel streams a reply into the thread.
-        send(cx, "Reply with exactly this word and nothing else: hello-cedian");
+        send(
+            cx,
+            "Reply with exactly this word and nothing else: hello-cedian",
+        );
         wait_until(cx, "streamed reply", |cx| {
             let (status, text, _, _) = read(cx);
             status == "idle" && text.contains("hello-cedian")
@@ -480,7 +498,11 @@ mod tests {
             assert_eq!(b.text(), "alpha\nBETA\ngamma\n", "buffer shows OMP's write");
             assert!(!b.is_dirty());
             b.undo(cx);
-            assert_eq!(b.text(), "alpha\nbeta\ngamma\n", "ONE native undo reverts it");
+            assert_eq!(
+                b.text(),
+                "alpha\nbeta\ngamma\n",
+                "ONE native undo reverts it"
+            );
         });
         eprintln!("tool_call_id={call_id}: OMP edit imported and reverted by one undo");
     }

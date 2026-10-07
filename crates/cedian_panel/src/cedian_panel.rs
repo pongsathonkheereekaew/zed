@@ -5,4 +5,4 @@ pub mod import;
 pub mod panel;
 pub mod version;
 
-pub use panel::{init, CedianPanel, ImportedEdit, ToggleFocus};
+pub use panel::{CedianPanel, ImportedEdit, ToggleFocus, init};

@@ -381,14 +381,26 @@ impl OmpRuntime {
     pub fn shutdown(mut self) -> Result<(), OmpError> {
         self.stop.store(true, Ordering::Relaxed);
         let client = self.client.take().expect("shutdown consumes the client");
-        let client = Arc::try_unwrap(client)
-            .map_err(|_| OmpError::Transport("client still shared".to_string()))?;
+        let client = take_unique(client, CONTROL_RELEASE)
+            .map_err(|_| OmpError::Transport("a control call was still in flight".to_string()))?;
         let result = client.close().map_err(OmpError::from);
         if let Some(pump) = self.pump.take() {
             let _ = pump.join();
         }
         result
     }
+}
+
+/// How long shutdown waits for a [`RuntimeControl`] clone to drop: an abort
+/// thread may hold one for a moment after OMP has already answered.
+const CONTROL_RELEASE: Duration = Duration::from_secs(2);
+
+fn take_unique<T>(arc: Arc<T>, limit: Duration) -> Result<T, Arc<T>> {
+    let deadline = std::time::Instant::now() + limit;
+    while Arc::strong_count(&arc) > 1 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Arc::try_unwrap(arc)
 }
 
 /// What [`OmpRuntime::new_session`] did.
@@ -456,3 +468,27 @@ pub fn last_text(turn: &PromptTurn) -> Option<&str> {
 /// Suppress unused-import lint while `RpcNotification` shapes the Phase 2 API.
 #[allow(dead_code)]
 fn _notification_shape(_: &RpcNotification) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn take_unique_waits_for_a_clone_dropped_after_shutdown_starts() {
+        let shared = Arc::new(7);
+        let clone = Arc::clone(&shared);
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(clone);
+        });
+        assert_eq!(take_unique(shared, CONTROL_RELEASE).ok(), Some(7));
+        holder.join().unwrap();
+    }
+
+    #[test]
+    fn take_unique_gives_up_on_a_clone_that_stays() {
+        let shared = Arc::new(7);
+        let _clone = Arc::clone(&shared);
+        assert!(take_unique(shared, Duration::from_millis(50)).is_err());
+    }
+}

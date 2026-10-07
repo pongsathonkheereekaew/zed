@@ -647,10 +647,17 @@ fn wait_for(previous: Previous) {
     if finished_within(&previous.thread, limit) {
         return;
     }
+    let Some(pid) = previous.pid else {
+        // No pid to kill yet: still wait for the thread rather than open the
+        // session under it and meet Taken.
+        log::warn!("cedian: the previous OMP did not exit and has no pid yet; waiting");
+        if !finished_within(&previous.thread, limit + KILLED_EXIT) {
+            log::error!("cedian: the previous OMP's thread did not end");
+        }
+        return;
+    };
     log::warn!("cedian: the previous OMP did not exit; killing it");
-    if let Some(pid) = previous.pid {
-        cedian_omp::driver::kill_group(pid);
-    }
+    cedian_omp::driver::kill_group(pid);
     if !finished_within(&previous.thread, KILLED_EXIT) {
         log::error!("cedian: the previous OMP's thread did not end after the kill");
     }

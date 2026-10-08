@@ -12,8 +12,8 @@ use cedian_workspace::{CedianUri, Diagnostic, DiagnosticSeverity, HostTools, Uri
 use editor::Editor;
 use futures::StreamExt as _;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
-use gpui::{App, AppContext as _, Entity, Task, WeakEntity};
-use language::{Buffer, Location, Point, PointUtf16, ToPoint as _};
+use gpui::{App, Entity, Task, WeakEntity};
+use language::{Buffer, Location, Point, PointUtf16, ToPointUtf16 as _};
 use omp_rpc::{HostUri, HostUriRead};
 use project::{Project, WorktreeId};
 use std::path::{Path, PathBuf};
@@ -170,7 +170,8 @@ fn key(buffer: &Entity<Buffer>, root: WorktreeId, cx: &App) -> Option<PathBuf> {
 }
 
 /// Answer a code-intelligence read (`definitions`, `references`, `symbols`)
-/// from Zed's language servers, through its LspStore (ADR-0048).
+/// from Zed's language servers, through its LspStore (ADR-0048). Results in
+/// a private file or outside the folder are dropped.
 pub(crate) fn lsp_read(
     host: &HostTools,
     project: &Entity<Project>,
@@ -180,21 +181,22 @@ pub(crate) fn lsp_read(
     let Some(root) = project.read(cx).visible_worktrees(cx).next() else {
         return Task::ready(Err("no folder is open".to_string()));
     };
-    let root_id = root.read(cx).id();
-    let root_path = root.read(cx).abs_path();
     let (file, position) = match uri.kind {
         UriKind::Symbols => match uri.path.strip_prefix("file/") {
             Some(file) => (file, None),
             None => {
                 let symbols = project.update(cx, |p, cx| p.symbols(&uri.path, cx));
-                return cx.background_spawn(async move {
+                let query = uri.path.clone();
+                return cx.spawn(async move |cx| {
                     let symbols = symbols.await.map_err(|e| e.to_string())?;
-                    Ok(symbols
-                        .iter()
-                        .map(|s| workspace_symbol(s, root_id))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                        .into())
+                    let lines = cx.update(|cx| {
+                        let root = root.read(cx);
+                        symbols
+                            .iter()
+                            .filter_map(|s| workspace_symbol(s, root))
+                            .collect::<Vec<_>>()
+                    });
+                    Ok(answer_lines(lines, &format!("no symbols match {query:?}")).into())
                 });
             }
         },
@@ -209,13 +211,13 @@ pub(crate) fn lsp_read(
             }
         },
     };
-    let path = match host.resolve(Path::new(file)) {
-        Ok(key) => root_path.join(key.strip_prefix("/").unwrap_or(&key)),
-        Err(e) => return Task::ready(Err(e)),
-    };
+    let root_id = root.read(cx).id();
+    let path = inside(host, project, file, cx);
+    let file = file.to_string();
     let kind = uri.kind.clone();
     let project = project.clone();
     cx.spawn(async move |cx| {
+        let path = path.await?;
         let buffer = project
             .update(cx, |p, cx| p.open_local_buffer(&path, cx))
             .await
@@ -224,19 +226,34 @@ pub(crate) fn lsp_read(
         let _lsp = project.update(cx, |p, cx| {
             p.register_buffer_with_language_servers(&buffer, cx)
         });
-        let lines = match (kind, position) {
+        let store = project.read_with(cx, |p, _| p.lsp_store());
+        let has_server = store.update(cx, |store, cx| {
+            buffer.update(cx, |buffer, cx| {
+                !store
+                    .language_servers_for_local_buffer(buffer, cx)
+                    .is_empty()
+            })
+        });
+        if !has_server {
+            return Err(format!("no language server for {file}"));
+        }
+        let located = |locations: Vec<Location>, cx: &mut gpui::AsyncApp| {
+            cx.update(|cx| {
+                locations
+                    .iter()
+                    .filter_map(|l| location(l, root_id, cx))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let (lines, none) = match (kind, position) {
             (UriKind::Definitions, Some(at)) => {
                 let links = project
                     .update(cx, |p, cx| p.definitions(&buffer, at, cx))
                     .await
                     .map_err(|e| e.to_string())?
                     .unwrap_or_default();
-                cx.update(|cx| {
-                    links
-                        .iter()
-                        .map(|link| location(&link.target, root_id, cx))
-                        .collect::<Vec<_>>()
-                })
+                let targets = links.into_iter().map(|link| link.target).collect();
+                (located(targets, cx), "no definitions found")
             }
             (UriKind::References, Some(at)) => {
                 let locations = project
@@ -244,12 +261,7 @@ pub(crate) fn lsp_read(
                     .await
                     .map_err(|e| e.to_string())?
                     .unwrap_or_default();
-                cx.update(|cx| {
-                    locations
-                        .iter()
-                        .map(|l| location(l, root_id, cx))
-                        .collect::<Vec<_>>()
-                })
+                (located(locations, cx), "no references found")
             }
             _ => {
                 let symbols = project
@@ -258,29 +270,43 @@ pub(crate) fn lsp_read(
                     .map_err(|e| e.to_string())?;
                 let mut lines = Vec::new();
                 document_symbols(&symbols, &mut lines);
-                lines
+                (lines, "no symbols found")
             }
         };
-        Ok(lines.join("\n").into())
+        Ok(answer_lines(lines, none).into())
     })
 }
 
-/// `name (Kind) path:line:column`, the path as a `/rel` key when in the
-/// folder.
-fn workspace_symbol(symbol: &project::Symbol, root: WorktreeId) -> String {
+/// One result per line, or what an empty answer means.
+fn answer_lines(lines: Vec<String>, none: &str) -> String {
+    if lines.is_empty() {
+        none.to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
+/// `name (Kind) /rel:line:column`, for a symbol in a file of the folder
+/// that is not private.
+fn workspace_symbol(symbol: &project::Symbol, root: &worktree::Worktree) -> Option<String> {
     use project::lsp_store::SymbolLocation;
-    let path = match &symbol.path {
-        SymbolLocation::InProject(p) if p.worktree_id == root => {
-            format!("/{}", p.path.as_unix_str())
-        }
-        SymbolLocation::InProject(p) => p.path.as_unix_str().to_string(),
-        SymbolLocation::OutsideProject { abs_path, .. } => abs_path.display().to_string(),
+    let SymbolLocation::InProject(p) = &symbol.path else {
+        return None;
     };
+    let private = root.entry_for_path(&p.path).is_some_and(|e| e.is_private)
+        || root.as_local().is_some_and(|t| t.is_path_private(&p.path));
+    if p.worktree_id != root.id() || private {
+        return None;
+    }
     let start = symbol.range.start.0;
-    format!(
-        "{} ({:?}) {path}:{}:{}",
-        symbol.name, symbol.kind, start.row, start.column
-    )
+    Some(format!(
+        "{} ({:?}) /{}:{}:{}",
+        symbol.name,
+        symbol.kind,
+        p.path.as_unix_str(),
+        start.row,
+        start.column
+    ))
 }
 
 fn uri_kind_name(kind: &UriKind) -> &'static str {
@@ -299,16 +325,13 @@ fn parse_position(path: &str) -> Option<(&str, PointUtf16)> {
     Some((parts.next()?, PointUtf16::new(line, column)))
 }
 
-/// `path:line:column` of a location's start, the path as a `/rel` key when
-/// in the folder.
-fn location(location: &Location, root: WorktreeId, cx: &App) -> String {
-    let buffer = location.buffer.read(cx);
-    let start = location.range.start.to_point(&buffer.snapshot());
-    let path = key(&location.buffer, root, cx)
-        .map(|k| k.display().to_string())
-        .or_else(|| buffer.file().map(|f| f.full_path(cx).display().to_string()))
-        .unwrap_or_default();
-    format!("{path}:{}:{}", start.row, start.column)
+/// `/rel:line:column` of a location's start (UTF-16 column, as the input),
+/// unless it is outside the folder or private.
+fn location(location: &Location, root: WorktreeId, cx: &App) -> Option<String> {
+    let path = key(&location.buffer, root, cx)?;
+    let snapshot = location.buffer.read(cx).snapshot();
+    let start = location.range.start.to_point_utf16(&snapshot);
+    Some(format!("{}:{}:{}", path.display(), start.row, start.column))
 }
 
 /// `name (Kind) line:column`, children indented under their parent.
@@ -394,8 +417,12 @@ mod tests {
     const MAIN: &str = "fn helper() {}\nfn main() { helper(); }\n";
 
     fn at(line: u32, column: u32) -> lsp::Location {
+        at_in("/ws/src/main.rs", line, column)
+    }
+
+    fn at_in(path: &str, line: u32, column: u32) -> lsp::Location {
         lsp::Location::new(
-            lsp::Uri::from_file_path("/ws/src/main.rs").unwrap(),
+            lsp::Uri::from_file_path(path).unwrap(),
             lsp::Range::new(
                 lsp::Position::new(line, column),
                 lsp::Position::new(line, column + 6),
@@ -457,6 +484,120 @@ mod tests {
         let link = read("cedian://buffer/link.txt", cx).await.unwrap_err();
         assert!(link.contains("outside"), "{link}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A folder on Zed's fake fs, a private `.env` and `/outside`, with a
+    /// fake Rust language server started on `src/main.rs`.
+    async fn fake_folder(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<Project>,
+        lsp::FakeLanguageServer,
+        project::lsp_store::OpenLspBufferHandle,
+    ) {
+        init(cx);
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/ws",
+            serde_json::json!({
+                "src": {"main.rs": MAIN, "lib.rs": LIB},
+                "notes.txt": "notes\n",
+                ".env": "SECRET=1\n",
+            }),
+        )
+        .await;
+        fs.insert_tree("/outside", serde_json::json!({"x.rs": "fn x() {}\n"}))
+            .await;
+        let project = Project::test(fs, [Path::new("/ws")], cx).await;
+        let languages = project.read_with(cx, |p, _| p.languages().clone());
+        languages.add(rust_lang());
+        let mut servers = languages.register_fake_lsp(
+            "Rust",
+            FakeLspAdapter {
+                capabilities: lsp::ServerCapabilities {
+                    definition_provider: Some(lsp::OneOf::Left(true)),
+                    references_provider: Some(lsp::OneOf::Left(true)),
+                    workspace_symbol_provider: Some(lsp::OneOf::Left(true)),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let (_buffer, handle) = project
+            .update(cx, |p, cx| {
+                p.open_local_buffer_with_lsp("/ws/src/main.rs", cx)
+            })
+            .await
+            .unwrap();
+        let server = servers.next().await.unwrap();
+        (project, server, handle)
+    }
+
+    const LIB: &str = "fn a() { /* éé */ helper(); }\n";
+
+    /// Code-intelligence reads never take a private input and never answer
+    /// a private file or one outside the folder; columns are UTF-16, as
+    /// the input; an empty answer says why.
+    #[gpui::test]
+    async fn lsp_reads_stay_inside_the_folder(cx: &mut TestAppContext) {
+        let (project, server, _handle) = fake_folder(cx).await;
+        server.set_request_handler::<lsp::request::GotoDefinition, _, _>(|params, _| async move {
+            let uri = params.text_document_position_params.text_document.uri;
+            Ok(uri
+                .as_str()
+                .ends_with("lib.rs")
+                .then(|| lsp::GotoDefinitionResponse::Scalar(at_in("/ws/src/lib.rs", 0, 18))))
+        });
+        server.set_request_handler::<lsp::request::References, _, _>(|_, _| async move {
+            Ok(Some(vec![
+                at(0, 3),
+                at_in("/ws/.env", 0, 0),
+                at_in("/outside/x.rs", 0, 3),
+            ]))
+        });
+        #[allow(deprecated)]
+        server.set_request_handler::<lsp::request::WorkspaceSymbolRequest, _, _>(
+            |_, _| async move {
+                let symbol = |name: &str, location| lsp::SymbolInformation {
+                    name: name.to_string(),
+                    kind: lsp::SymbolKind::FUNCTION,
+                    tags: None,
+                    deprecated: None,
+                    location,
+                    container_name: None,
+                };
+                Ok(Some(lsp::WorkspaceSymbolResponse::Flat(vec![
+                    symbol("helper", at(0, 3)),
+                    symbol("SECRET", at_in("/ws/.env", 0, 0)),
+                    symbol("x", at_in("/outside/x.rs", 0, 3)),
+                ])))
+            },
+        );
+        cx.run_until_parked();
+        let read = |url: &'static str, cx: &mut TestAppContext| {
+            let project = project.clone();
+            cx.update(move |cx| answer(url, None, &project, cx))
+        };
+        let private = read("cedian://references/.env:0:0", cx).await.unwrap_err();
+        assert!(private.contains("private"), "{private}");
+        let references = read("cedian://references/src/main.rs:1:12", cx).await;
+        assert_eq!(references.unwrap().content, "/src/main.rs:0:3");
+        let symbols = read("cedian://symbols/x", cx).await;
+        assert_eq!(
+            symbols.unwrap().content,
+            "helper (Function) /src/main.rs:0:3"
+        );
+        let utf16 = read("cedian://definitions/src/lib.rs:0:18", cx).await;
+        assert_eq!(utf16.unwrap().content, "/src/lib.rs:0:18");
+        let none = read("cedian://definitions/src/main.rs:1:12", cx).await;
+        assert_eq!(none.unwrap().content, "no definitions found");
+        let no_server = read("cedian://definitions/notes.txt:0:0", cx)
+            .await
+            .unwrap_err();
+        assert!(
+            no_server.contains("no language server for notes.txt"),
+            "{no_server}"
+        );
     }
 
     /// Definitions, references and symbols are Zed's language server's

@@ -2896,6 +2896,7 @@ dependencies = [
  "ui",
  "util",
  "workspace",
+ "worktree",
 ]
 
 [[package]]

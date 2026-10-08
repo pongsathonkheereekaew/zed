@@ -79,9 +79,21 @@ pub fn request_worktree(
     validate_id(id).map_err(|e| e.to_string())?;
     let briefs = state.join("briefs");
     let brief = briefs.join(format!("{id}.1.json"));
+    // ADR-0033: a stored brief is immutable, even one a removed worker left.
     std::fs::create_dir_all(&briefs)
-        .and_then(|()| std::fs::write(&brief, Value::Object(args.clone()).to_string()))
-        .map_err(|e| format!("brief: {e}"))?;
+        .and_then(|()| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&brief)
+        })
+        .and_then(|mut file| {
+            let text = Value::Object(args.clone()).to_string();
+            std::io::Write::write_all(&mut file, text.as_bytes()).inspect_err(|_| {
+                let _ = std::fs::remove_file(&brief);
+            })
+        })
+        .map_err(|e| format!("brief {}: {e}", brief.display()))?;
     let mut head = match spawn(repo, id, base) {
         Ok(head) => head,
         Err(e) => {
@@ -246,6 +258,21 @@ mod tests {
         std::fs::remove_dir(&stuck).unwrap();
         request_worktree(&repo, &state(&repo), &args(brief("w1"))).expect("a retry succeeds");
         assert!(stuck.is_file());
+    }
+
+    #[test]
+    fn a_stored_brief_is_never_overwritten() {
+        let repo = fixture();
+        let kept = state(&repo).join("briefs/w1.1.json");
+        std::fs::create_dir_all(kept.parent().unwrap()).unwrap();
+        std::fs::write(&kept, "the removed worker's brief").unwrap();
+        let err = request_worktree(&repo, &state(&repo), &args(brief("w1"))).unwrap_err();
+        assert!(err.contains("exists"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&kept).unwrap(),
+            "the removed worker's brief"
+        );
+        assert!(!repo.join(".worktrees/w1").exists());
     }
 
     #[test]

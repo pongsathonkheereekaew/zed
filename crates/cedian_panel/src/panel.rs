@@ -26,7 +26,7 @@ use crate::review::{ReviewError, TaskReview};
 use cedian_agent::Thread;
 use cedian_omp::{RouterEvent, UserAnswer};
 use cedian_review::{HunkKey, HunkStatus};
-use cedian_workspace::{CedianUri, UriKind, capture_ambient, render_snapshot};
+use cedian_workspace::{capture_ambient, render_snapshot};
 use collections::{HashMap, HashSet, IndexMap};
 use editor::{Editor, actions::Paste};
 use futures::{StreamExt, channel::mpsc};
@@ -36,7 +36,7 @@ use gpui::{
     Window, actions, px,
 };
 use language::{Buffer, BufferEvent};
-use omp_rpc::{ExtensionUiRequest, HostUriRead, ImageContent};
+use omp_rpc::{ExtensionUiRequest, ImageContent};
 use project::Project;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -444,17 +444,19 @@ impl CedianPanel {
                 return;
             }
         };
-        let (read_tx, mut read_rx) = mpsc::unbounded::<context::Read>();
+        let (read_tx, read_rx) = mpsc::unbounded::<context::Read>();
         spec.uris.push(context::scheme(read_tx));
-        self._context = Some(cx.spawn(async move |this, cx| {
-            while let Some(read) = read_rx.next().await {
-                let Ok(answer) = this.update(cx, |this, cx| this.read_context(&read.url, cx))
-                else {
-                    break;
-                };
-                let _ = read.reply.send(answer.await);
-            }
-        }));
+        let this = cx.entity().downgrade();
+        self._context = Some(context::serve(
+            read_rx,
+            move |url, cx| {
+                this.update(cx, |this, cx| {
+                    context::answer(url, this.workspace.as_ref(), &this.project, cx)
+                })
+                .ok()
+            },
+            cx,
+        ));
         let (event_tx, mut event_rx) = mpsc::unbounded::<LinkEvent>();
         self.link = Some(OmpLink::start(spec, event_tx, previous));
         self.connection = Connection::Starting;
@@ -469,26 +471,6 @@ impl CedianPanel {
             }
         }));
         cx.notify();
-    }
-
-    /// Answer one `cedian://` read from what Zed holds now.
-    fn read_context(&self, url: &str, cx: &mut Context<Self>) -> Task<Result<HostUriRead, String>> {
-        let Some(host) = context::host(self.workspace.as_ref(), &self.project, cx) else {
-            return Task::ready(Err("no folder is open".to_string()));
-        };
-        match cedian_workspace::parse_cedian_uri(url) {
-            Ok(
-                uri @ CedianUri {
-                    kind: UriKind::Definitions | UriKind::References | UriKind::Symbols,
-                    ..
-                },
-            ) => context::lsp_read(&host, &self.project, &uri, cx),
-            Ok(CedianUri {
-                kind: UriKind::Diagnostics,
-                path,
-            }) => Task::ready(Ok(host.render_diagnostics(&path).into())),
-            _ => Task::ready(host.read_uri(url).map_err(|e| e.to_string())),
-        }
     }
 
     /// The prompt as OMP gets it: the bounded snapshot of what the person

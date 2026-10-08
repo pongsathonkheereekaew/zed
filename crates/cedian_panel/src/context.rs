@@ -10,13 +10,16 @@
 
 use cedian_workspace::{CedianUri, Diagnostic, DiagnosticSeverity, HostTools, UriKind};
 use editor::Editor;
-use futures::channel::mpsc::UnboundedSender;
+use futures::StreamExt as _;
+use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use gpui::{App, AppContext as _, Entity, Task, WeakEntity};
 use language::{Buffer, Location, Point, PointUtf16, ToPoint as _};
 use omp_rpc::{HostUri, HostUriRead};
 use project::{Project, WorktreeId};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use util::paths::PathStyle;
+use util::rel_path::RelPath;
 use workspace::Workspace;
 
 /// How long a `cedian://` read waits for the app.
@@ -44,6 +47,119 @@ pub(crate) fn scheme(reads: UnboundedSender<Read>) -> HostUri {
         }
     })
     .expect("cedian scheme is valid")
+}
+
+/// Answer `cedian://` reads, one at a time, with `answer`, called when
+/// each arrives; `None` (the panel is gone) stops.
+pub(crate) fn serve(
+    mut reads: UnboundedReceiver<Read>,
+    answer: impl Fn(&str, &mut App) -> Option<Task<Result<HostUriRead, String>>> + 'static,
+    cx: &mut App,
+) -> Task<()> {
+    cx.spawn(async move |cx| {
+        while let Some(read) = reads.next().await {
+            let Some(answer) = cx.update(|cx| answer(&read.url, cx)) else {
+                break;
+            };
+            let _ = read.reply.send(answer.await);
+        }
+    })
+}
+
+/// Answer one `cedian://` read from Zed.
+pub(crate) fn answer(
+    url: &str,
+    workspace: Option<&WeakEntity<Workspace>>,
+    project: &Entity<Project>,
+    cx: &mut App,
+) -> Task<Result<HostUriRead, String>> {
+    let Some(host) = host(workspace, project, cx) else {
+        return Task::ready(Err("no folder is open".to_string()));
+    };
+    match cedian_workspace::parse_cedian_uri(url) {
+        Ok(
+            uri @ CedianUri {
+                kind: UriKind::Definitions | UriKind::References | UriKind::Symbols,
+                ..
+            },
+        ) => lsp_read(&host, project, &uri, cx),
+        Ok(CedianUri {
+            kind: UriKind::Diagnostics,
+            path,
+        }) => Task::ready(Ok(host.render_diagnostics(&path).into())),
+        Ok(CedianUri {
+            kind: UriKind::Buffer,
+            path,
+        }) => buffer_read(&host, project, &path, cx),
+        _ => Task::ready(host.read_uri(url).map_err(|e| e.to_string())),
+    }
+}
+
+/// The text Zed holds for `file`, unsaved edits included.
+fn buffer_read(
+    host: &HostTools,
+    project: &Entity<Project>,
+    file: &str,
+    cx: &mut App,
+) -> Task<Result<HostUriRead, String>> {
+    let path = inside(host, project, file, cx);
+    let project = project.clone();
+    cx.spawn(async move |cx| {
+        let path = path.await?;
+        let buffer = project
+            .update(cx, |p, cx| p.open_local_buffer(&path, cx))
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(cx.update(|cx| buffer.read(cx).text()).into())
+    })
+}
+
+/// The absolute path of `file` in the folder. Refused when it is private
+/// (`private_files`) or resolves, symlinks followed, outside the folder.
+fn inside(
+    host: &HostTools,
+    project: &Entity<Project>,
+    file: &str,
+    cx: &mut App,
+) -> Task<Result<PathBuf, String>> {
+    let Some(tree) = project.read(cx).visible_worktrees(cx).next() else {
+        return Task::ready(Err("no folder is open".to_string()));
+    };
+    let key = match host.resolve(Path::new(file)) {
+        Ok(key) => key,
+        Err(e) => return Task::ready(Err(e)),
+    };
+    let root = tree.read(cx).abs_path().to_path_buf();
+    let path = root.join(key.strip_prefix("/").unwrap_or(&key));
+    let fs = project.read(cx).fs().clone();
+    let file = file.to_string();
+    cx.spawn(async move |cx| {
+        let private = |rel: &Path, cx: &mut gpui::AsyncApp| {
+            cx.update(|cx| {
+                let Ok(rel) = RelPath::new(rel, PathStyle::local()) else {
+                    return true;
+                };
+                let tree = tree.read(cx);
+                tree.entry_for_path(&rel).is_some_and(|e| e.is_private)
+                    || tree.as_local().is_some_and(|t| t.is_path_private(&rel))
+            })
+        };
+        if private(path.strip_prefix(&root).unwrap_or(&path), cx) {
+            return Err(format!("{file} is private (private_files)"));
+        }
+        let canonical = fs
+            .canonicalize(&path)
+            .await
+            .map_err(|_| format!("no such file in the folder: {file}"))?;
+        let canonical_root = fs.canonicalize(&root).await.map_err(|e| e.to_string())?;
+        let Ok(rel) = canonical.strip_prefix(&canonical_root) else {
+            return Err(format!("{file} resolves outside the folder"));
+        };
+        if private(rel, cx) {
+            return Err(format!("{file} is private (private_files)"));
+        }
+        Ok(path)
+    })
 }
 
 /// A buffer's `/rel` key in the folder, unless it is outside it or private.
@@ -271,7 +387,6 @@ pub(crate) fn host(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::StreamExt as _;
     use gpui::TestAppContext;
     use language::{FakeLspAdapter, rust_lang};
     use settings::SettingsStore;
@@ -286,6 +401,62 @@ mod tests {
                 lsp::Position::new(line, column + 6),
             ),
         )
+    }
+
+    fn init(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+        });
+    }
+
+    /// A real folder: `src/main.rs`, a private `.env`, and `link.txt`, a
+    /// symlink to a file outside the folder.
+    async fn real_folder(name: &str, cx: &mut TestAppContext) -> (PathBuf, Entity<Project>) {
+        cx.executor().allow_parking();
+        init(cx);
+        let dir = std::env::temp_dir().join(format!("cedian-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("ws/src")).unwrap();
+        std::fs::create_dir_all(dir.join("outside")).unwrap();
+        std::fs::write(dir.join("ws/src/main.rs"), MAIN).unwrap();
+        std::fs::write(dir.join("ws/.env"), "SECRET=1\n").unwrap();
+        std::fs::write(dir.join("outside/secret.txt"), "secret\n").unwrap();
+        std::os::unix::fs::symlink(dir.join("outside/secret.txt"), dir.join("ws/link.txt"))
+            .unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let project = Project::test(
+            fs::RealFs::new(None, cx.executor()),
+            [dir.join("ws").as_path()],
+            cx,
+        )
+        .await;
+        let scan = project.read_with(cx, |p, cx| {
+            let tree = p.visible_worktrees(cx).next().unwrap();
+            tree.read(cx).as_local().unwrap().scan_complete()
+        });
+        scan.await;
+        (dir, project)
+    }
+
+    /// `cedian://buffer` is answered from Zed only: never a private file,
+    /// never a file a symlink in the folder points to outside it.
+    #[gpui::test]
+    async fn buffer_reads_refuse_private_files_and_links_outside(cx: &mut TestAppContext) {
+        let (dir, project) = real_folder("u6-buffer-guard", cx).await;
+        let read = |url: &'static str, cx: &mut TestAppContext| {
+            let project = project.clone();
+            cx.update(move |cx| answer(url, None, &project, cx))
+        };
+        let main = read("cedian://buffer/src/main.rs", cx).await.unwrap();
+        assert_eq!(main.content, MAIN);
+        let private = read("cedian://buffer/.env", cx).await.unwrap_err();
+        assert!(private.contains("private"), "{private}");
+        let link = read("cedian://buffer/link.txt", cx).await.unwrap_err();
+        assert!(link.contains("outside"), "{link}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Definitions, references and symbols are Zed's language server's

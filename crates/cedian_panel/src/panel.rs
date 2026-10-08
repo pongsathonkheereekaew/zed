@@ -479,6 +479,7 @@ impl CedianPanel {
                 if self.turn != Turn::Idle {
                     self.thread.withdraw_user();
                     self.turn = Turn::Idle;
+                    self.review.end_turn();
                 }
                 self.connection = Connection::Taken { session_id, reason };
             }
@@ -534,6 +535,7 @@ impl CedianPanel {
     /// The prompt call ended without OMP settling: idle again, and a failed
     /// turn keeps its reason over `notice`.
     fn end_turn(&mut self, notice: Option<String>) {
+        self.review.end_turn();
         if let Turn::Failed(reason) = std::mem::replace(&mut self.turn, Turn::Idle) {
             self.notice = Some(format!("turn failed: {reason}"));
         } else if notice.is_some() {
@@ -2086,6 +2088,45 @@ mod tests {
                  0 changed again by a later turn, kept"
             )
         );
+    }
+
+    /// A prompt that did not settle (stopped, cancelled, failed, or the
+    /// session taken) still ends the review's turn, so Revert is not stuck
+    /// on "turn n is still running".
+    #[gpui::test]
+    async fn a_stopped_prompt_ends_the_reviews_turn(cx: &mut TestAppContext) {
+        let (f, buffer) = fixture(cx).await;
+        tool_start(&f, cx, "c1", &["notes.txt"]);
+        omp_writes(&f, "/ws/notes.txt", "ALPHA\nbeta\ngamma\n").await;
+        tool_end(&f, cx, "c1");
+        f.window
+            .update(cx, |panel, window, cx| {
+                panel.turn = Turn::Stopping;
+                panel.on_link_event(LinkEvent::PromptStopped("pipe".into()), window, cx);
+                assert!(!panel.review.turn_open(), "the turn ended with the prompt");
+                panel.revert_turn(1, cx);
+                assert_eq!(
+                    panel.notice().map(str::to_string).as_deref(),
+                    Some(
+                        "turn 1 reverted: 1 hunk(s) put back, 0 STALE kept, \
+                         0 changed again by a later turn, kept"
+                    )
+                );
+            })
+            .unwrap();
+        assert_eq!(buffer.read_with(cx, |b, _| b.text()), ORIGINAL);
+        let (f, _buffer) = fixture(cx).await;
+        f.window
+            .update(cx, |panel, window, cx| {
+                panel.turn = Turn::Streaming;
+                let taken = LinkEvent::Taken {
+                    session_id: "s".into(),
+                    reason: "another driver".into(),
+                };
+                panel.on_link_event(taken, window, cx);
+                assert!(!panel.review.turn_open(), "a taken session ends the turn");
+            })
+            .unwrap();
     }
 
     #[gpui::test]

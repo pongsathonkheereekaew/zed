@@ -312,6 +312,28 @@ mod tests {
         });
     }
 
+    /// The import marks the buffer saved at the disk's mtime, so a later
+    /// user edit is not a conflict with the file on disk.
+    #[gpui::test]
+    async fn a_user_edit_after_an_import_is_no_conflict(cx: &mut TestAppContext) {
+        let (fs, _project, buffer) = setup(cx).await;
+        let mark = buffer.update(cx, |b, _| begin(b));
+        omp_writes(&fs, "alpha\nBETA\ngamma\n").await;
+        finish(buffer.clone(), mark, &mut cx.to_async())
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        buffer.update(cx, |b, cx| {
+            assert!(!b.has_conflict(), "clean after the import");
+            b.edit([(0..0, "USER ")], None, cx);
+            assert!(b.is_dirty());
+            assert!(
+                !b.has_conflict(),
+                "the user's edit is on top of the imported disk text"
+            );
+        });
+    }
+
     #[gpui::test]
     async fn untouched_file_is_unchanged_not_misattributed(cx: &mut TestAppContext) {
         // A prior agent transaction sits on top of the undo stack; an empty

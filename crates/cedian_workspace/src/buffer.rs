@@ -29,7 +29,10 @@ pub fn version_token(version: &Global) -> String {
     }
 }
 
-/// The version a token stands for; `None` for a malformed token.
+/// The version a token stands for; `None` for a malformed token. Only a
+/// canonical token is accepted (one `version_token` would print), so a
+/// token that names no edit (`1.0`) or repeats a replica cannot pass as a
+/// version.
 pub fn parse_version_token(token: &str) -> Option<Global> {
     if token == "0" {
         return Some(Global::new());
@@ -42,7 +45,7 @@ pub fn parse_version_token(token: &str) -> Option<Global> {
             value: seq.parse().ok()?,
         });
     }
-    Some(version)
+    (version_token(&version) == token).then_some(version)
 }
 
 /// One text replacement: byte range → new text. Ranges are validated against
@@ -299,7 +302,9 @@ mod tests {
         let token = version_token(&v(3));
         assert_eq!(token, "0.3");
         assert_eq!(parse_version_token(&token), Some(v(3)));
-        for bad in ["", "3", "0.x", "0.3,", "a.b", "1"] {
+        for bad in [
+            "", "3", "0.x", "0.3,", "a.b", "1", "1.0", "0.0", "0.3,0.3", "0.03", " 0.3",
+        ] {
             assert_eq!(parse_version_token(bad), None, "{bad:?}");
         }
     }

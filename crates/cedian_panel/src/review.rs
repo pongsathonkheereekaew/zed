@@ -1505,6 +1505,78 @@ mod tests {
         assert_eq!(statuses(&f), vec![HunkStatus::Pending]);
     }
 
+    /// A call that deletes a line is credited with the deletion, not with
+    /// a line another call edited. Next to that line, the CRDT reports one
+    /// edit for both, and that one hunk is both calls' work.
+    #[gpui::test]
+    async fn a_deletion_is_credited_to_its_own_call(cx: &mut TestAppContext) {
+        let mut f = setup_with("alpha\nbeta\ngamma\ndelta\n", cx).await;
+        agent_writes(&mut f, "c1", "alpha\nbeta\ngamma\nDELTA\n", cx).await;
+        agent_writes(&mut f, "c2", "alpha\ngamma\nDELTA\n", cx).await;
+        let hunks: Vec<(&str, &str, Vec<String>)> = f.review.files()[0]
+            .hunks()
+            .iter()
+            .map(|h| {
+                (
+                    h.old_text.as_str(),
+                    h.new_text.as_str(),
+                    h.tool_call_ids.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            hunks,
+            vec![
+                ("beta\n", "", vec!["c2".to_string()]),
+                ("delta\n", "DELTA\n", vec!["c1".to_string()]),
+            ]
+        );
+
+        let mut f = setup(cx).await;
+        agent_writes(&mut f, "c1", "alpha\nbeta\nGAMMA\n", cx).await;
+        agent_writes(&mut f, "c2", "alpha\nGAMMA\n", cx).await;
+        let hunks: Vec<(&str, &str, Vec<String>)> = f.review.files()[0]
+            .hunks()
+            .iter()
+            .map(|h| {
+                (
+                    h.old_text.as_str(),
+                    h.new_text.as_str(),
+                    h.tool_call_ids.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            hunks,
+            vec![(
+                "beta\ngamma\n",
+                "GAMMA\n",
+                vec!["c1".to_string(), "c2".to_string()]
+            )]
+        );
+    }
+
+    /// A rejected call's emptied range does not credit it with what a later
+    /// call writes on that line.
+    #[gpui::test]
+    async fn a_rejected_call_is_not_credited_with_a_later_calls_line(cx: &mut TestAppContext) {
+        let mut f = setup(cx).await;
+        agent_writes(&mut f, "c1", "alpha\nBETA\ngamma\n", cx).await;
+        let path = cx.update(|cx| f.review.path(&f.review.files()[0], cx));
+        {
+            let k = key(&f, 0);
+            cx.update(|cx| f.review.reject(&path, &k, cx)).unwrap();
+        }
+        f.project
+            .update(cx, |p, cx| p.save_buffer(f.buffer.clone(), cx))
+            .await
+            .unwrap();
+        agent_writes(&mut f, "c2", "alpha\nbeta two\ngamma\n", cx).await;
+        let hunks = f.review.files()[0].hunks();
+        assert_eq!(hunks.len(), 1, "{hunks:?}");
+        assert_eq!(hunks[0].tool_call_ids, vec!["c2".to_string()]);
+    }
+
     #[gpui::test]
     async fn dirty_buffer_import_is_stale_for_the_file(cx: &mut TestAppContext) {
         let mut f = setup(cx).await;

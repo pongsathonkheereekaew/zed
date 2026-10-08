@@ -158,7 +158,8 @@ fn buffer_read(
 }
 
 /// The absolute path of `file` in the folder. Refused when it is private
-/// (`private_files`) or resolves, symlinks followed, outside the folder.
+/// (`private_files`), has no entry in Zed's worktree, or resolves,
+/// symlinks followed, outside the folder.
 fn inside(
     host: &HostTools,
     project: &Entity<Project>,
@@ -177,19 +178,14 @@ fn inside(
     let fs = project.read(cx).fs().clone();
     let file = file.to_string();
     cx.spawn(async move |cx| {
-        let private = |rel: &Path, cx: &mut gpui::AsyncApp| {
+        // Only Zed's own entries are answered: they carry on-disk case and
+        // `is_private`, and a case-folding fs would open any other spelling.
+        let entry_private = |rel: &Path, cx: &mut gpui::AsyncApp| {
             cx.update(|cx| {
-                let Ok(rel) = RelPath::new(rel, PathStyle::local()) else {
-                    return true;
-                };
-                let tree = tree.read(cx);
-                tree.entry_for_path(&rel).is_some_and(|e| e.is_private)
-                    || tree.as_local().is_some_and(|t| t.is_path_private(&rel))
+                let rel = RelPath::new(rel, PathStyle::local()).ok()?;
+                tree.read(cx).entry_for_path(&rel).map(|e| e.is_private)
             })
         };
-        if private(path.strip_prefix(&root).unwrap_or(&path), cx) {
-            return Err(format!("{file} is private (private_files)"));
-        }
         let canonical = fs
             .canonicalize(&path)
             .await
@@ -198,8 +194,13 @@ fn inside(
         let Ok(rel) = canonical.strip_prefix(&canonical_root) else {
             return Err(format!("{file} resolves outside the folder"));
         };
-        if private(rel, cx) {
-            return Err(format!("{file} is private (private_files)"));
+        let given = path.strip_prefix(&root).unwrap_or(&path);
+        for rel in [given, rel] {
+            match entry_private(rel, cx) {
+                Some(false) => {}
+                Some(true) => return Err(format!("{file} is private (private_files)")),
+                None => return Err(format!("{file} is not in the folder Zed has open")),
+            }
         }
         Ok(path)
     })
@@ -493,6 +494,8 @@ mod tests {
         std::fs::create_dir_all(dir.join("outside")).unwrap();
         std::fs::write(dir.join("ws/src/main.rs"), MAIN).unwrap();
         std::fs::write(dir.join("ws/.env"), "SECRET=1\n").unwrap();
+        std::fs::create_dir_all(dir.join("ws/.git")).unwrap();
+        std::fs::write(dir.join("ws/.git/config"), "[core]\n").unwrap();
         std::fs::write(dir.join("outside/secret.txt"), "secret\n").unwrap();
         std::os::unix::fs::symlink(dir.join("outside/secret.txt"), dir.join("ws/link.txt"))
             .unwrap();
@@ -524,6 +527,12 @@ mod tests {
         assert_eq!(main.content, MAIN);
         let private = read("cedian://buffer/.env", cx).await.unwrap_err();
         assert!(private.contains("private"), "{private}");
+        read("cedian://buffer/.ENV", cx).await.unwrap_err();
+        let sym = read("cedian://symbols/file/.ENV", cx).await.unwrap_err();
+        assert!(!sym.contains("no language server"), "{sym}");
+        read("cedian://buffer//.ENV", cx).await.unwrap_err();
+        let unscanned = read("cedian://buffer/.git/config", cx).await.unwrap_err();
+        assert!(unscanned.contains("not in the folder"), "{unscanned}");
         let link = read("cedian://buffer/link.txt", cx).await.unwrap_err();
         assert!(link.contains("escapes"), "{link}");
         let link_key = read("cedian://buffer//link.txt", cx).await.unwrap_err();

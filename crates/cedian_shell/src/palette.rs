@@ -28,23 +28,8 @@ pub const ACTIONS: &[PaletteAction] = &[
     },
     PaletteAction {
         id: "review",
-        title: "Review changes",
-        hint: "baseline → current hunks",
-    },
-    PaletteAction {
-        id: "accept",
-        title: "Accept hunk",
-        hint: "mark (keep buffer)",
-    },
-    PaletteAction {
-        id: "reject",
-        title: "Reject hunk",
-        hint: "inverse patch to baseline",
-    },
-    PaletteAction {
-        id: "accept-all",
-        title: "Accept all",
-        hint: "skips unattributed",
+        title: "Review findings",
+        hint: "the reviewer's findings on this task",
     },
     PaletteAction {
         id: "state",
@@ -79,14 +64,7 @@ mod tests {
 
     #[test]
     fn cli_commands_all_registered() {
-        for cmd in [
-            "prompt",
-            "review",
-            "accept",
-            "reject",
-            "accept-all",
-            "state",
-        ] {
+        for cmd in ["prompt", "review", "state"] {
             assert!(
                 ACTIONS.iter().any(|a| a.id == cmd),
                 "{cmd} missing from palette"
@@ -96,7 +74,7 @@ mod tests {
 
     #[test]
     fn filter_matches() {
-        assert_eq!(Palette::filter("acc").len(), 2);
+        assert_eq!(Palette::filter("rev").len(), 1);
         assert_eq!(Palette::filter("").len(), ACTIONS.len());
     }
 }

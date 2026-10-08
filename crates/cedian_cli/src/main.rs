@@ -1,24 +1,24 @@
 //! `cedian` CLI harness (throwaway): the full agent loop without GPUI.
 //!
 //! Wires the headless crates end-to-end in one process:
-//! `OmpRuntime` + `HostTools` + `Panel` + `ReviewTracker`. Commands mirror the
-//! future palette entries (§2.5) so the wiring transfers to the app shell.
+//! `OmpRuntime` + `HostTools` + `Panel`. Commands mirror the future palette
+//! entries (§2.5) so the wiring transfers to the app shell. Reviewing hunks
+//! (accept, reject, revert a turn) lives in the app's panel, not here.
 //!
 //! Usage:
 //! ```text
-//! cedian prompt "fix the typo"        # one turn: prompt → stream → cards → review pending
-//! cedian review                       # show pending hunks (baseline → current)
+//! cedian prompt "fix the typo"        # one turn: prompt → stream → cards
+//! cedian review                       # list the reviewer's findings
+//! cedian review --agent [focus]       # run the reviewer on the task's hunks
+//! cedian review dismiss <id> <reason> # close a finding, audited
 //! cedian review reset                 # drop the review task (new baseline next prompt)
-//! cedian accept <path> <hunk>         # accept one hunk (mark)
-//! cedian reject <path> <hunk>         # reject one hunk (inverse patch)
-//! cedian accept-all                   # bulk accept (skips unattributed)
 //! cedian state                        # session snapshot (model, streaming, queue)
 //! ```
 //!
 //! State lives in-process per invocation EXCEPT the OMP session (adopted via
 //! `--session-dir` + `open_session`), workspace files, and the review task in
-//! `review.json` in the state dir (baseline + AgentEdit records + resolutions, see
-//! `session.rs`). `cedian review reset` starts a new review task.
+//! `review.json` in the state dir (baseline + turn log, see `session.rs`).
+//! `cedian review reset` starts a new review task.
 #![allow(
     clippy::disallowed_methods,
     reason = "headless, synchronous process control (OMP, LSP, DAP, Chrome, git, sandbox-exec): Zed's async spawn helpers do not apply"
@@ -26,7 +26,6 @@
 
 mod browser_store;
 mod corrections;
-mod revert_turn;
 mod review_agent;
 mod review_findings;
 mod session;
@@ -42,7 +41,7 @@ mod workspace_files;
 
 use cedian_agent_ui::Panel;
 use cedian_omp::{OmpBinary, OmpRuntime, RuntimeConfig};
-use cedian_review::{AgentEdit, ReviewTracker};
+use cedian_review::FileDiff;
 use cedian_workspace::{HostTools, WorkspaceHost};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -66,7 +65,7 @@ fn is_read_only(args: &[String]) -> bool {
     let sub = args.get(1).map(String::as_str);
     match args.first().map(String::as_str).unwrap_or("help") {
         "review" => sub.is_none(),
-        "state" | "palette" | "symbols" | "diagnostics" | "help" | "shell" | "turns" => true,
+        "state" | "palette" | "symbols" | "diagnostics" | "help" | "shell" => true,
         "workflow" => sub == Some("status"),
         "worker" => matches!(sub, Some("list" | "preview")),
         "browser" => sub == Some("status"),
@@ -132,30 +131,6 @@ pub(crate) fn dispatch(args: Vec<String>, in_shell: bool) -> Result<(), String> 
                 "usage: cedian review [reset | --agent [focus] | dismiss <id> <reason>] (got {other:?})"
             )),
         },
-        "accept" => {
-            let path = args.get(1).ok_or("usage: cedian accept <path> <hunk>")?;
-            let hunk: usize = args
-                .get(2)
-                .ok_or("usage: cedian accept <path> <hunk>")?
-                .parse()
-                .map_err(|_| "bad hunk index")?;
-            cmd_accept(&workdir, Path::new(path), hunk)
-        }
-        "reject" => {
-            let path = args.get(1).ok_or("usage: cedian reject <path> <hunk>")?;
-            let hunk: usize = args
-                .get(2)
-                .ok_or("usage: cedian reject <path> <hunk>")?
-                .parse()
-                .map_err(|_| "bad hunk index")?;
-            cmd_reject(&workdir, Path::new(path), hunk)
-        }
-        "accept-all" => cmd_accept_all(&workdir),
-        "turns" => revert_turn::cmd_turns(&workdir),
-        "revert-turn" => {
-            let which = args.get(1).ok_or("usage: cedian revert-turn <n|last>")?;
-            revert_turn::cmd_revert_turn(&workdir, which)
-        }
         "state" => cmd_state(&session_dir, &workdir, &settings),
         "shell" if in_shell => Err("already inside cedian shell".to_string()),
         "shell" => shell::run(&session_dir, &workdir, &settings),
@@ -176,7 +151,7 @@ pub(crate) fn dispatch(args: Vec<String>, in_shell: bool) -> Result<(), String> 
         "worker" => cmd_worker(&workdir, &args[1..]),
         _ => {
             eprintln!(
-                "usage: cedian <prompt|shell|review|accept|reject|accept-all|turns|revert-turn|state|\
+                "usage: cedian <prompt|shell|review|state|\
                 palette|symbols|diagnostics|browser|workflow|worker> …"
             );
             eprintln!("env: CEDIAN_SESSION_DIR, CEDIAN_WORKDIR, CEDIAN_OMP_BINARY");
@@ -524,9 +499,6 @@ fn workflow_ambient(workdir: &Path) -> Option<String> {
     ))
 }
 
-/// Tools whose successful completion may have changed files on disk.
-const EDIT_TOOLS: &[&str] = &["edit", "write", "ast_edit", "cedian_apply_edit"];
-
 fn cmd_prompt(
     session_dir: &Path,
     workdir: &Path,
@@ -553,9 +525,9 @@ fn cmd_prompt(
 }
 
 /// One OMP turn on an already-running runtime: prompt → cards → write-back →
-/// provenance → review store + turn log. Shared by one-shot `prompt` and
-/// `cedian shell`. `live` streams assistant text to stdout as it arrives (the
-/// shell). `kind` + `label` describe the turn in `cedian turns`.
+/// task baseline + turn log. Shared by one-shot `prompt` and `cedian shell`.
+/// `live` streams assistant text to stdout as it arrives (the shell).
+/// `kind` + `label` describe the turn in the turn log.
 pub(crate) fn run_turn(
     rt: &mut OmpRuntime,
     host: &std::sync::Arc<HostTools>,
@@ -728,61 +700,17 @@ pub(crate) fn run_turn(
         );
     }
 
-    // Provenance (§17): snapshot every file the turn changed, read from disk
-    // (new files included). Pin to a tool call when one edit-class card names
-    // the file, or when the turn had exactly one; otherwise no record → the
-    // hunks review as UNATTRIBUTED (never misattributed).
-    let edit_cards: Vec<&cedian_agent_ui::ToolCard> = cards
-        .iter()
-        .filter(|c| {
-            c.status == cedian_agent_ui::ToolCardStatus::Done
-                && EDIT_TOOLS.contains(&c.name.as_str())
-        })
-        .collect();
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let mut unattributed = 0;
     let mut turn_files = Vec::new();
     for (key, before, after) in changed_since(workdir, &pre) {
         store.baseline_once(&key, &before); // first change in task (new file: empty)
         turn_files.push(session::TurnFile {
             file: key.to_string_lossy().into_owned(),
-            before: before.clone(),
-            after: after.clone(),
+            before,
+            after,
             created: !pre.contains_key(&key),
         });
-        let rel = key.to_string_lossy().trim_start_matches('/').to_string();
-        let pinned =
-            edit_cards
-                .iter()
-                .find(|c| c.preview.contains(&rel))
-                .or(if edit_cards.len() == 1 {
-                    edit_cards.first()
-                } else {
-                    None
-                });
-        match pinned {
-            Some(card) => store.record(AgentEdit {
-                tool_call_id: card.call_id.clone(),
-                task_id: session::CLI_TASK.to_string(),
-                file: key.to_string_lossy().into_owned(),
-                before,
-                after,
-                timestamp_ms: now_ms,
-            }),
-            None => unattributed += 1,
-        }
     }
-    if unattributed > 0 {
-        eprintln!(
-            "({unattributed} changed file(s) not pinned to a tool call → UNATTRIBUTED in review)"
-        );
-    }
-    if let Some(n) = store.record_turn(kind, label, turn_files) {
-        println!("(turn {n} recorded — `revert-turn {n}` puts it back)");
-    }
+    store.record_turn(kind, label, turn_files);
     store.models.extend(rt.router().answered_models());
     let saved = session::save(workdir, &store);
     let total_ms = timing::ms(turn_started.elapsed());
@@ -853,173 +781,52 @@ fn flush_turn_for_review(workdir: &Path, host: &HostTools) -> Result<(), String>
     session::save(workdir, &store)
 }
 
-/// Load the review task + tracker, rebuilt against current disk state.
-/// No task yet → empty tracker (review shows nothing).
-fn load_tracker(
-    workdir: &Path,
-    host: &HostTools,
-) -> Result<(session::ReviewStore, ReviewTracker), String> {
-    load_workspace(host, workdir);
+/// The task's diffs: baseline → current disk text for every file the task
+/// changed. No task yet → none. A baselined file gone from disk reviews as
+/// a deletion.
+fn task_diffs(workdir: &Path) -> Result<(session::ReviewStore, Vec<FileDiff>), String> {
     let store = session::load(workdir)?.unwrap_or_default();
-    let (baseline, texts) = store.tracker_inputs();
-    // Files in the baseline that no longer exist on disk review as deletions.
-    for key in texts.keys() {
-        if host.read_buffer(key).is_none() {
-            host.open(key, "");
-        }
+    let mut diffs = Vec::new();
+    for (key, before) in &store.baseline {
+        let after = workspace_files::local_path(workdir, Path::new(key))
+            .and_then(|local| std::fs::read_to_string(local).ok())
+            .unwrap_or_default();
+        let hunks = cedian_review::line_diff(before, &after);
+        diffs.push(FileDiff {
+            path: key.clone(),
+            statuses: vec![cedian_review::HunkStatus::Pending; hunks.len()],
+            hunks,
+            snapshot: after,
+        });
     }
-    let mut tracker = ReviewTracker::new(&store.task_id, baseline, texts);
-    tracker.attribute(&store.provenance);
-    tracker.restore_statuses(store.statuses.clone());
-    tracker.rebuild_now(host as &dyn WorkspaceHost);
-    // ADR-0032: a user edit over an agent hunk is a correction (once per text).
-    for path in tracker.paths() {
-        let Ok(diff) = tracker.diff(&path) else {
-            continue;
-        };
-        for (i, status) in diff.statuses.iter().enumerate() {
-            if *status != cedian_review::HunkStatus::Stale {
-                continue;
-            }
-            let key = path.to_string_lossy().into_owned();
-            corrections::record(
-                workdir,
-                corrections::CorrectionKind::UserEditedAgentHunk,
-                corrections::Event {
-                    turn: store.last_turn_touching(&key),
-                    hunk_key: Some(format!("{key}#{i}")),
-                    path: Some(key),
-                    excerpt: hunk_text(&tracker, &path, i),
-                    ..corrections::Event::default()
-                },
-            )?;
-        }
-    }
-    Ok((store, tracker))
+    Ok((store, diffs))
 }
 
-/// A hunk's after-lines, the text a correction row hashes.
-fn hunk_text(tracker: &ReviewTracker, path: &Path, hunk: usize) -> Option<String> {
-    let diff = tracker.diff(path).ok()?;
-    let h = diff.hunks.get(hunk)?;
-    Some(
-        diff.snapshot
-            .lines()
-            .skip(h.after_start)
-            .take(h.after_count)
-            .collect::<Vec<_>>()
-            .join("\n"),
-    )
-}
-
-/// Persist the tracker's resolutions back into the review task.
-fn save_statuses(
-    workdir: &Path,
-    mut store: session::ReviewStore,
-    tracker: &ReviewTracker,
-) -> Result<(), String> {
-    store.statuses = tracker.status_records();
-    session::save(workdir, &store)
+/// `path`'s diff among the task's.
+fn diff_for(diffs: &[FileDiff], path: &Path) -> Result<FileDiff, String> {
+    let key = path.to_string_lossy();
+    diffs
+        .iter()
+        .find(|d| d.path == key)
+        .cloned()
+        .ok_or_else(|| {
+            let changed: Vec<&str> = diffs.iter().map(|d| d.path.as_str()).collect();
+            format!("{key} is not in this review task; changed files: {changed:?}")
+        })
 }
 
 fn cmd_review(workdir: &Path) -> Result<(), String> {
-    let host = HostTools::new(workdir);
-    let (_store, tracker) = load_tracker(workdir, &host)?;
-    let mut any = false;
-    for path in tracker.paths() {
-        let diff = tracker.diff(&path).map_err(|e| e.to_string())?;
-        if diff.is_empty() {
-            continue;
-        }
-        any = true;
-        println!("{} ({} hunk(s))", diff.path, diff.len());
-        for (i, hunk) in diff.hunks.iter().enumerate() {
-            println!(
-                "  [{}] hunk {i}: -{}+{} → +{}+{} [{}]",
-                i,
-                hunk.before_start + 1,
-                hunk.before_count,
-                hunk.after_start + 1,
-                hunk.after_count,
-                status_glyph(diff.statuses[i])
-            );
-        }
-    }
-    if !any {
-        println!("no pending changes (baseline == current)");
-    }
     let findings = review_findings::states(workdir)?;
-    if !findings.is_empty() {
-        println!("findings:");
-        for (f, state) in findings {
-            println!(
-                "  {} [{state}] {:?} {} hunk {}: {}",
-                f.id, f.finding.severity, f.finding.path, f.hunk, f.finding.message
-            );
-        }
+    if findings.is_empty() {
+        println!("no review findings");
+        return Ok(());
     }
-    Ok(())
-}
-
-fn cmd_accept(workdir: &Path, path: &Path, hunk: usize) -> Result<(), String> {
-    let host = HostTools::new(workdir);
-    let (store, mut tracker) = load_tracker(workdir, &host)?;
-    tracker.accept_hunk(path, hunk).map_err(|e| e.to_string())?;
-    save_statuses(workdir, store, &tracker)?;
-    println!(
-        "accepted {} hunk {hunk} (marked; code already in buffer)",
-        path.display()
-    );
-    Ok(())
-}
-
-fn cmd_reject(workdir: &Path, path: &Path, hunk: usize) -> Result<(), String> {
-    let host = HostTools::new(workdir);
-    let (store, mut tracker) = load_tracker(workdir, &host)?;
-    let rejected = hunk_text(&tracker, path, hunk);
-    let v = tracker
-        .reject_hunk(path, hunk, &host as &dyn WorkspaceHost)
-        .map_err(|e| e.to_string())?;
-    let key = path.to_string_lossy().into_owned();
-    corrections::record(
-        workdir,
-        corrections::CorrectionKind::HunkRejected,
-        corrections::Event {
-            turn: store.last_turn_touching(&key),
-            hunk_key: Some(format!("{key}#{hunk}")),
-            tool_call_id: store
-                .provenance
-                .iter()
-                .rev()
-                .find(|e| e.file == key)
-                .map(|e| e.tool_call_id.clone()),
-            path: Some(key),
-            excerpt: rejected,
-        },
-    )?;
-    // Sync the restored buffer back to disk.
-    if let Some(local) = workspace_files::local_path(workdir, path) {
-        if let Some(text) = host.read_buffer(path) {
-            std::fs::write(&local, text).map_err(|e| e.to_string())?;
-        }
-    }
-    save_statuses(workdir, store, &tracker)?;
-    println!(
-        "rejected {} hunk {hunk} (inverse patch → version {})",
-        path.display(),
-        cedian_workspace::version_token(&v)
-    );
-    Ok(())
-}
-
-fn cmd_accept_all(workdir: &Path) -> Result<(), String> {
-    let host = HostTools::new(workdir);
-    let (store, mut tracker) = load_tracker(workdir, &host)?;
-    let accepted = tracker.accept_all();
-    save_statuses(workdir, store, &tracker)?;
-    println!("accepted {} hunk(s) (unattributed skipped)", accepted.len());
-    for (path, i) in accepted {
-        println!("  {} hunk {i}", path.display());
+    println!("findings:");
+    for (f, state) in findings {
+        println!(
+            "  {} [{state}] {:?} {} hunk {}: {}",
+            f.id, f.finding.severity, f.finding.path, f.hunk, f.finding.message
+        );
     }
     Ok(())
 }
@@ -1656,17 +1463,6 @@ fn render_workflow(
             "{}",
             cedian_workflow::ledger_lines(&last.claims).trim_start()
         );
-    }
-}
-
-fn status_glyph(s: cedian_review::HunkStatus) -> &'static str {
-    match s {
-        cedian_review::HunkStatus::Pending => "pending",
-        cedian_review::HunkStatus::Interrupted => "interrupted",
-        cedian_review::HunkStatus::Unattributed => "unattributed",
-        cedian_review::HunkStatus::Stale => "stale",
-        cedian_review::HunkStatus::Accepted => "accepted",
-        cedian_review::HunkStatus::Rejected => "rejected",
     }
 }
 

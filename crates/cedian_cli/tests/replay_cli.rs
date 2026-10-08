@@ -1,14 +1,13 @@
-//! P2 hermetic S0 loop through the real CLI binary (§86):
-//! `cedian prompt` (recorded OMP turn calling `cedian_apply_edit`) → tool card
-//! → buffer edit synced to disk → `cedian review` shows the task-attributed
-//! hunk → `cedian reject` restores the baseline — each step its own process,
-//! so the persisted `review.json` (in the state dir, ADR-0044) is exercised too.
+//! Hermetic replays through the real CLI binary (§86): recorded OMP turns,
+//! each step its own process, so the persisted stores in the state dir
+//! (ADR-0044) are exercised too. Hunk review itself is GPUI-tested in
+//! `cedian_panel`.
 //!
 //! `harness = false`: when the CLI spawns OMP, it spawns THIS test binary
 //! (`CEDIAN_OMP_BINARY`), which then acts as fake-omp.
 //!
 //! Hermetic: `cargo test -p cedian_cli --test replay_cli`
-//! Re-record one fixture (real OMP + auth): `CEDIAN_P2_RECORD=cli|shell|channel|worktree|revert|s2 cargo test -p cedian_cli --test replay_cli`
+//! Re-record one fixture (real OMP + auth): `CEDIAN_P2_RECORD=cli|shell|channel|worktree|s2 cargo test -p cedian_cli --test replay_cli`
 #![allow(
     clippy::disallowed_methods,
     reason = "headless, synchronous process control (OMP, LSP, DAP, Chrome, git, sandbox-exec): Zed's async spawn helpers do not apply"
@@ -31,17 +30,14 @@ fn main() {
     if args.first().map(String::as_str) == Some("config") {
         std::process::exit(cedian_fake_omp::config_get(&args));
     }
-    // `CEDIAN_P2_RECORD=cli|shell|channel|worktree|revert|s2` re-records ONE fixture against real OMP.
+    // `CEDIAN_P2_RECORD=cli|shell|channel|worktree|s2` re-records ONE fixture against real OMP.
     let which = std::env::var("CEDIAN_P2_RECORD").unwrap_or_default();
     let record = which == "cli";
     print!(
-        "test replay_cli_host_edit_review_reject ({}) ... ",
+        "test replay_cli_host_edit ({}) ... ",
         if record { "record" } else { "replay" }
     );
     scenario(record);
-    println!("ok");
-    print!("test replay_cli_user_edit_over_agent_hunk_is_stale (replay) ... ");
-    stale_scenario();
     println!("ok");
     print!("test replay_cli_review_blocker_listed_then_dismissed (replay) ... ");
     dismiss_scenario();
@@ -66,13 +62,6 @@ fn main() {
         if record { "record" } else { "replay" }
     );
     worktree_scenario(record);
-    println!("ok");
-    let record = which == "revert";
-    print!(
-        "test replay_p6_inline_edit_revert_turn ({}) ... ",
-        if record { "record" } else { "replay" }
-    );
-    revert_scenario(record);
     println!("ok");
     let record = which == "s2";
     print!(
@@ -156,6 +145,8 @@ fn cedian(root: &Path, args: &[&str]) -> String {
     stdout
 }
 
+/// P2: one `cedian prompt` turn calls `cedian_apply_edit`; the tool card
+/// renders, the buffer edit lands on disk, timing adds up, no workflow.
 fn scenario(record: bool) {
     let root: PathBuf = std::env::temp_dir().join(format!("cedian-p2-cli-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -210,111 +201,6 @@ fn scenario(record: bool) {
     assert_eq!(
         std::fs::read_to_string(&notes).unwrap(),
         "alpha\nBETA\ngamma\n"
-    );
-
-    let review = cedian(&root, &["review"]);
-    assert!(
-        review.contains("notes.txt (1 hunk(s))"),
-        "one attributed hunk:\n{review}"
-    );
-
-    cedian(&root, &["reject", "/notes.txt", "0"]);
-    // ADR-0032: the reject is a correction row, bound to the turn's tool call.
-    let rows = corrections(&root);
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    assert_eq!(rows[0]["kind"], "hunk_rejected");
-    assert_eq!(rows[0]["path"], "/notes.txt");
-    assert_eq!(rows[0]["turn"], 1);
-    assert!(rows[0]["tool_call_id"].is_string(), "{rows:?}");
-    assert_eq!(
-        std::fs::read_to_string(&notes).unwrap(),
-        ORIGINAL,
-        "reject restored baseline"
-    );
-    let review = cedian(&root, &["review"]);
-    assert!(!review.contains("(1 hunk(s))"), "hunk resolved:\n{review}");
-}
-
-/// S0 exit: a user edit over the agent's hunk shows `stale` in review, and
-/// reject refuses it rather than overwrite the user's line (ARCHITECTURE §18).
-fn stale_scenario() {
-    let root: PathBuf =
-        std::env::temp_dir().join(format!("cedian-s0-stale-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(root.join("ws")).unwrap();
-    let notes = root.join("ws/notes.txt");
-    std::fs::write(&notes, ORIGINAL).unwrap();
-    // ADR-0041 decision 2: a project allow for a tool the overlay does not
-    // name is pinned to `prompt`.
-    std::fs::create_dir_all(root.join("ws/.omp")).unwrap();
-    std::fs::write(
-        root.join("ws/.omp/config.yml"),
-        "tools:\n  approval:\n    some_mcp_tool: allow\n    cedian_apply_edit: allow\n",
-    )
-    .unwrap();
-    let root = root.canonicalize().unwrap();
-    cedian_fake_omp::install_replay(&root.join("sessions"), Path::new(FIXTURE)).unwrap();
-    cedian(
-        &root,
-        &[
-            "prompt",
-            "Call cedian_apply_edit with path 'notes.txt', expected_version 0, start 6, end 10, \
-             replacement 'BETA'. Do not use any other tool. Then reply with only: edited-ok",
-        ],
-    );
-    assert_eq!(
-        std::fs::read_to_string(&notes).unwrap(),
-        "alpha\nBETA\ngamma\n"
-    );
-    let approval = &overlay(&root.join("sessions"))["tools"]["approval"];
-    assert_eq!(approval["some_mcp_tool"], "prompt", "project allow pinned");
-    assert_eq!(
-        approval["cedian_apply_edit"], "allow",
-        "host tool keeps allow"
-    );
-
-    std::fs::write(&notes, "alpha\nBETA by user\ngamma\n").unwrap();
-    let review = cedian(&root, &["review"]);
-    assert!(
-        review.contains("stale"),
-        "user edit over the agent hunk is stale:\n{review}"
-    );
-    assert!(
-        !review.contains("pending"),
-        "no hunk still pending:\n{review}"
-    );
-    cedian(&root, &["review"]);
-    let edits: Vec<_> = corrections(&root)
-        .into_iter()
-        .filter(|r| r["kind"] == "user_edited_agent_hunk")
-        .collect();
-    assert_eq!(
-        edits.len(),
-        1,
-        "one row per edited hunk, however often review runs: {edits:?}"
-    );
-
-    let out = cli(&root)
-        .args(["reject", "/notes.txt", "0"])
-        .output()
-        .unwrap();
-    assert!(!out.status.success(), "reject of a stale hunk is refused");
-    assert_eq!(
-        std::fs::read_to_string(&notes).unwrap(),
-        "alpha\nBETA by user\ngamma\n",
-        "the user's line survives"
-    );
-
-    cedian(&root, &["accept", "/notes.txt", "0"]);
-    let review = cedian(&root, &["review"]);
-    assert!(
-        !review.contains("stale"),
-        "accept persists across invocations:\n{review}"
-    );
-    assert_eq!(
-        std::fs::read_to_string(&notes).unwrap(),
-        "alpha\nBETA by user\ngamma\n",
-        "accept keeps the buffer as it is"
     );
 }
 
@@ -748,7 +634,7 @@ fn shell_scenario(record: bool) {
     );
 
     // One-shot commands from another terminal while the shell is live.
-    let refused = cli(&root).arg("accept-all").output().unwrap();
+    let refused = cli(&root).args(["review", "reset"]).output().unwrap();
     assert!(!refused.status.success());
     assert!(
         String::from_utf8_lossy(&refused.stderr).contains("inside the shell"),
@@ -768,13 +654,6 @@ fn shell_scenario(record: bool) {
         std::fs::read_to_string(root.join("ws/notes.txt")).unwrap(),
         "alpha\nBETA\ngamma\n",
         "turn 1 output:\n{out}"
-    );
-
-    send("review");
-    let out = wait_for("hunk(s)");
-    assert!(
-        out.contains("notes.txt (1 hunk(s))"),
-        "review inside shell:\n{out}"
     );
 
     send("prompt Reply with exactly this word and nothing else: second-turn");
@@ -1009,134 +888,6 @@ fn worktree_scenario(record: bool) {
     );
     let reg = std::fs::read_to_string(state_dir(&root).join("workers.json")).unwrap();
     assert!(reg.contains("try casing fix"), "registry row:\n{reg}");
-}
-
-const REVERT_FIXTURE: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/p6_revert.jsonl"
-);
-
-/// P6 (ADR-0026): in one `cedian shell`, an inline `edit` turn changes only
-/// its target line; a prompt turn changes two more lines; the user then
-/// rewrites one of them on disk. `revert-turn 2` puts back the other line
-/// and keeps the user's (STALE); reverting that revert redoes it; reverting
-/// the inline edit restores its line. Every step is an observed file state.
-fn revert_scenario(record: bool) {
-    use std::io::{BufRead, BufReader, Write};
-    use std::process::Stdio;
-    use std::sync::mpsc;
-    use std::time::{Duration, Instant};
-
-    let root: PathBuf = std::env::temp_dir().join(format!("cedian-p6-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(root.join("ws")).unwrap();
-    let notes = root.join("ws/notes.txt");
-    std::fs::write(&notes, "alpha\nbeta\ngamma\ndelta\n").unwrap();
-    let root = root.canonicalize().unwrap();
-    let notes = root.join("ws/notes.txt");
-    let sessions = root.join("sessions");
-    if record {
-        cedian_fake_omp::arm_record(&sessions, &cedian_omp_path()).unwrap();
-    } else {
-        cedian_fake_omp::install_replay(&sessions, Path::new(REVERT_FIXTURE)).unwrap();
-    }
-
-    let mut shell = cli(&root)
-        .arg("shell")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn cedian shell");
-    let mut stdin = shell.stdin.take().unwrap();
-    let (tx, rx) = mpsc::channel::<String>();
-    let stdout = shell.stdout.take().unwrap();
-    std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if tx.send(line).is_err() {
-                break;
-            }
-        }
-    });
-    let mut seen = String::new();
-    let mut wait_for = |needle: &str| {
-        let deadline = Instant::now() + Duration::from_secs(240);
-        while !seen.contains(needle) {
-            let left = deadline.saturating_duration_since(Instant::now());
-            match rx.recv_timeout(left) {
-                Ok(line) => {
-                    seen.push_str(&line);
-                    seen.push('\n');
-                }
-                Err(_) => panic!("shell never printed {needle:?}; output so far:\n{seen}"),
-            }
-        }
-        std::mem::take(&mut seen)
-    };
-    let mut send = |line: &str| {
-        writeln!(stdin, "{line}").unwrap();
-        stdin.flush().unwrap();
-    };
-    let text = || std::fs::read_to_string(&notes).unwrap();
-    wait_for("cedian shell");
-
-    send("edit notes.txt 2-2 \"make this line uppercase\"");
-    let out = wait_for("(turn done)");
-    assert_eq!(text(), "alpha\nBETA\ngamma\ndelta\n", "inline edit:\n{out}");
-    assert!(out.contains("(turn 1 recorded"), "{out}");
-    assert!(!out.contains("warning:"), "edit stayed in range:\n{out}");
-
-    send(
-        "prompt In notes.txt change line 1 'alpha' to 'ALPHA' and line 4 'delta' to 'DELTA' \
-         with your edit tool. Change nothing else. Reply with only: t2-done",
-    );
-    let out = wait_for("(turn done)");
-    assert_eq!(text(), "ALPHA\nBETA\ngamma\nDELTA\n", "prompt turn:\n{out}");
-    assert!(out.contains("(turn 2 recorded"), "{out}");
-
-    // The user rewrites line 4 after the agent.
-    std::fs::write(&notes, "ALPHA\nBETA\ngamma\nDELTA (mine)\n").unwrap();
-
-    send("revert-turn 2");
-    let out = wait_for("revert-turn 3` redoes");
-    let reverted: Vec<_> = corrections(&root)
-        .into_iter()
-        .filter(|r| r["kind"] == "turn_reverted")
-        .collect();
-    assert_eq!(reverted.len(), 1, "{reverted:?}");
-    assert_eq!(reverted[0]["turn"], 2);
-    assert!(
-        out.contains("STALE notes.txt"),
-        "user line reported STALE:\n{out}"
-    );
-    assert_eq!(text(), "alpha\nBETA\ngamma\nDELTA (mine)\n", "{out}");
-
-    send("revert-turn 3");
-    wait_for("revert-turn 4` redoes");
-    assert_eq!(text(), "ALPHA\nBETA\ngamma\nDELTA (mine)\n", "redo");
-
-    send("revert-turn 1");
-    wait_for("revert-turn 5` redoes");
-    assert_eq!(
-        text(),
-        "ALPHA\nbeta\ngamma\nDELTA (mine)\n",
-        "inline edit reverted"
-    );
-
-    send("turns");
-    let out = wait_for("[revert of 1]");
-    assert!(out.contains("1 [edit] edit notes.txt:2-2"), "{out}");
-
-    send("quit");
-    wait_for("cedian shell closed");
-    assert!(shell.wait().unwrap().success());
-    if record {
-        std::fs::copy(
-            sessions.join(cedian_fake_omp::RECORDED_FILE),
-            REVERT_FIXTURE,
-        )
-        .unwrap();
-    }
 }
 
 const S2_FIXTURE: &str = concat!(

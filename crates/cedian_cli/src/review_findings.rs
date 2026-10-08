@@ -121,16 +121,15 @@ pub fn states(workdir: &Path) -> Result<Vec<(AttachedFinding, &'static str)>, St
     if store.findings.is_empty() {
         return Ok(Vec::new());
     }
-    let host = cedian_workspace::HostTools::new(workdir);
-    let (_review, tracker) = crate::load_tracker(workdir, &host)?;
+    let (_review, diffs) = crate::task_diffs(workdir)?;
     Ok(store
         .findings
         .into_iter()
         .map(|f| {
-            let state = match tracker.diff(Path::new(&f.finding.path)) {
+            let state = match crate::diff_for(&diffs, Path::new(&f.finding.path)) {
                 _ if f.dismissed.is_some() => "dismissed",
-                Ok(diff) if f.blocks(diff) => "open blocker",
-                Ok(diff) if f.is_stale(diff) => "stale (its hunk changed)",
+                Ok(diff) if f.blocks(&diff) => "open blocker",
+                Ok(diff) if f.is_stale(&diff) => "stale (its hunk changed)",
                 Ok(_) => "open",
                 Err(_) => "stale (its hunk changed)",
             };
@@ -219,14 +218,10 @@ pub fn review_finding_tool(workdir: PathBuf) -> HostTool {
          `blocker` keeps the change from completing until it is fixed or a person dismisses it.",
         params,
         move |args, _ctx| {
-            let host = cedian_workspace::HostTools::new(&workdir);
-            let (_review, tracker) = crate::load_tracker(&workdir, &host)?;
+            let (_review, diffs) = crate::task_diffs(&workdir)?;
             let mut store = load(&workdir)?;
             let reply = record(&mut store, &args, first_of_review, |path| {
-                tracker
-                    .diff(path)
-                    .cloned()
-                    .map_err(|e| format!("{e}; changed files: {:?}", tracker.paths()))
+                crate::diff_for(&diffs, path)
             })?;
             save(&workdir, &mut store)?;
             Ok(reply.into())

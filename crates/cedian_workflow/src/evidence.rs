@@ -1,12 +1,12 @@
 //! Evidence as first-class data (§53): every gate decision reads evidence
 //! items already stored in the `WorkflowState` evidence map. Each item carries
-//! provenance (§53 R2 fix): `AgentEdit` link or `unattributed`; the code
+//! provenance (§53 R2 fix): a tool-call link or `unattributed`; the code
 //! state it verified and a three-way outcome (ADR-0024).
 
 use crate::code_state::{CodeState, CurrentState};
 use serde::{Deserialize, Serialize};
 
-/// Provenance: link to the §17 AgentEdit store, or unattributed.
+/// Provenance: link to the tool call that produced it, or unattributed.
 ///
 /// Required gates REJECT unattributed evidence; optional gates accept it but
 /// flag `unverified-origin` in the `GateResult`.

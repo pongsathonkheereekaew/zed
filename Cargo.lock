@@ -2918,10 +2918,6 @@ dependencies = [
 name = "cedian_review"
 version = "0.1.0"
 dependencies = [
- "cedian_agent",
- "cedian_omp",
- "cedian_workspace",
- "clock",
  "serde",
  "serde_json",
 ]

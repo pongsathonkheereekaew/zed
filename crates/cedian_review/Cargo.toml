@@ -3,18 +3,13 @@ name = "cedian_review"
 version = "0.1.0"
 edition = "2021"
 
-# Phase 5: edit provenance + review changes (headless).
-# Baseline (task-start versions) + AgentEdit store (keyed task_id+tool_call_id,
-# snapshot at tool_execution_end) + hunk accept/reject over the buffer store.
-# Thin projection: no parallel diff engine — line diffs derive from buffer
-# text; Zed multibuffer binding swaps in with the fork.
+# Hunk shapes, findings and feedback payloads shared by the panel's review
+# (Zed buffers) and the headless reviewer.
 
 [dependencies]
-clock.workspace = true
-cedian_agent = { path = "../cedian_agent" }
-cedian_omp = { path = "../cedian_omp" }
-cedian_workspace = { path = "../cedian_workspace" }
 serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
 serde_json = { workspace = true }
 
 [lints]

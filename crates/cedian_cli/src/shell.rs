@@ -21,8 +21,7 @@ use std::{
 };
 
 const HELP: &str = "prompt <msg> | edit <path> <start>-<end> <instruction> [--model p/id] | \
-steer <msg> | abort | review | accept <path> <hunk> | reject <path> <hunk> | accept-all | \
-turns | revert-turn <n|last> | <any cedian verb> | help | quit";
+steer <msg> | abort | review | <any cedian verb> | help | quit";
 
 type TurnResult = (OmpRuntime, Result<(), String>);
 
@@ -347,12 +346,11 @@ fn out_of_range(turn: &crate::session::TurnRecord, edit: &InlineEdit) -> Vec<Str
                 || hunk.before_count == 0 && lo >= edit.start && lo <= edit.end + 1;
             if !inside {
                 out.push(format!(
-                    "edit changed {} lines {lo}-{} outside {}-{} — `revert-turn {}` undoes the edit",
+                    "edit changed {} lines {lo}-{} outside {}-{}",
                     edit.rel(),
                     hi.max(lo),
                     edit.start,
-                    edit.end,
-                    turn.n
+                    edit.end
                 ));
             }
         }
@@ -444,8 +442,8 @@ mod tests {
     #[test]
     fn words_and_rest() {
         assert_eq!(
-            words(r#"accept /a b.txt 0"#),
-            ["accept", "/a", "b.txt", "0"]
+            words(r#"review dismiss f1 "not a bug""#),
+            ["review", "dismiss", "f1", "not a bug"]
         );
         assert_eq!(
             words(r#"workflow run bug_fix "fix login""#),

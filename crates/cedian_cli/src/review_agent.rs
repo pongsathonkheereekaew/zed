@@ -207,14 +207,12 @@ pub fn run_review(
     if let Some(live) = requester.live_buffers {
         crate::flush_turn_for_review(workdir, live)?;
     }
-    let host = cedian_workspace::HostTools::new(workdir);
-    let (store, tracker) = crate::load_tracker(workdir, &host)?;
-    let diffs: Vec<FileDiff> = tracker
-        .paths()
+    let (store, diffs) = crate::task_diffs(workdir)?;
+    let baseline: HashMap<PathBuf, String> = store
+        .baseline
         .iter()
-        .filter_map(|p| tracker.diff(p).ok().cloned())
+        .map(|(key, text)| (PathBuf::from(key), text.clone()))
         .collect();
-    let (_, baseline) = store.tracker_inputs();
     let diff = render_diff(&diffs, &baseline);
     if diff.is_empty() {
         return Err("nothing to review: no open hunks in this task".to_string());

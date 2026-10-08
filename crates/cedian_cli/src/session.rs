@@ -2,20 +2,17 @@
 //!
 //! One file per workdir, `review.json` in its state dir (ADR-0044), holding the current review
 //! TASK: baseline texts (taken the first time a file is seen in the task —
-//! task baseline, not per-turn), the cedian-owned `AgentEdit` records (§17 R1:
-//! never derived from the OMP transcript), and the user's hunk resolutions.
+//! task baseline, not per-turn), the turn log and the models that answered.
 //! Versioned (`snapshot_version`): a mismatch or a corrupt file fails closed
 //! with "re-baseline" — never silently misread (§75 herdr lesson 3).
 //! `cedian review reset` deletes it to start a new task.
 
-use cedian_review::{AgentEdit, Baseline, ProvenanceStore, StatusRecord};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Bump on any schema change — older files fail closed.
-pub const REVIEW_SNAPSHOT_VERSION: u32 = 2;
+pub const REVIEW_SNAPSHOT_VERSION: u32 = 3;
 
 /// The CLI's single review task id (the app shell owns real task ids).
 pub const CLI_TASK: &str = "cli";
@@ -27,11 +24,7 @@ pub struct ReviewStore {
     pub task_id: String,
     /// Buffer key → text at task start.
     pub baseline: BTreeMap<String, String>,
-    /// §17 `AgentEdit` records, oldest first.
-    pub provenance: Vec<AgentEdit>,
-    /// User resolutions keyed by hunk identity.
-    pub statuses: Vec<StatusRecord>,
-    /// Every turn that changed files, oldest first (P6: revert turn).
+    /// Every turn that changed files, oldest first.
     pub turns: Vec<TurnRecord>,
     /// `provider/model` of every model that answered in a turn of this task
     /// (ADR-0039: a review is independent only of all of them).
@@ -46,14 +39,9 @@ pub enum TurnKind {
     Prompt,
     /// Inline edit (`edit <path> <range> <instruction>`).
     Edit,
-    /// `revert-turn <of>` — revert it again to redo `of`.
-    Revert {
-        of: u32,
-    },
 }
 
-/// One file as a turn left it. Pre/post texts come from disk, so files
-/// with no `AgentEdit` (UNATTRIBUTED) are covered too.
+/// One file as a turn left it. Pre/post texts come from disk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnFile {
     /// Buffer key (`/rel`).
@@ -71,7 +59,7 @@ pub struct TurnRecord {
     pub n: u32,
     #[serde(flatten)]
     pub kind: TurnKind,
-    /// First line of the prompt (or the edit / revert description).
+    /// First line of the prompt (or the edit description).
     pub label: String,
     pub files: Vec<TurnFile>,
 }
@@ -83,14 +71,11 @@ impl ReviewStore {
             snapshot_version: REVIEW_SNAPSHOT_VERSION,
             task_id: CLI_TASK.to_string(),
             baseline: BTreeMap::new(),
-            provenance: Vec::new(),
-            statuses: Vec::new(),
             turns: Vec::new(),
             models: Default::default(),
         }
     }
 
-    /// Append a turn (numbered here); no-op when it changed nothing.
     /// The newest turn that changed `file` (a buffer key).
     pub fn last_turn_touching(&self, file: &str) -> Option<u32> {
         self.turns
@@ -100,6 +85,7 @@ impl ReviewStore {
             .map(|t| t.n)
     }
 
+    /// Append a turn (numbered here); no-op when it changed nothing.
     pub fn record_turn(
         &mut self,
         kind: TurnKind,
@@ -131,25 +117,6 @@ impl ReviewStore {
         self.baseline
             .entry(key.to_string_lossy().into_owned())
             .or_insert_with(|| text.to_string());
-    }
-
-    /// Append one agent edit record (keyed task + tool call).
-    pub fn record(&mut self, edit: AgentEdit) {
-        let mut store = ProvenanceStore::from_records(std::mem::take(&mut self.provenance));
-        store.record(edit);
-        self.provenance = store.all();
-    }
-
-    /// Baseline in tracker shape (versions re-anchor at 0: review diffs text).
-    pub fn tracker_inputs(&self) -> (Baseline, HashMap<PathBuf, String>) {
-        let mut baseline = Baseline::new();
-        let mut texts = HashMap::new();
-        for (key, text) in &self.baseline {
-            let key = PathBuf::from(key);
-            baseline.snapshot(&key, clock::Global::new());
-            texts.insert(key, text.clone());
-        }
-        (baseline, texts)
     }
 }
 
@@ -218,18 +185,9 @@ mod tests {
         let mut store = ReviewStore::new();
         store.baseline_once(Path::new("/a.rs"), "v1");
         store.baseline_once(Path::new("/a.rs"), "v2");
-        store.record(AgentEdit {
-            tool_call_id: "c1".into(),
-            task_id: CLI_TASK.into(),
-            file: "/a.rs".into(),
-            before: "v1".into(),
-            after: "v3".into(),
-            timestamp_ms: 1,
-        });
         save(&dir, &store).unwrap();
         let back = load(&dir).unwrap().unwrap();
         assert_eq!(back.baseline["/a.rs"], "v1", "task baseline kept");
-        assert_eq!(back.provenance.len(), 1);
         let file = TurnFile {
             file: "/a.rs".into(),
             before: "v1".into(),
@@ -246,13 +204,13 @@ mod tests {
             Some(1)
         );
         assert_eq!(
-            back.record_turn(TurnKind::Revert { of: 1 }, "revert", vec![file]),
+            back.record_turn(TurnKind::Edit, "edit", vec![file]),
             Some(2)
         );
         save(&dir, &back).unwrap();
         let back = load(&dir).unwrap().unwrap();
         assert_eq!(back.turns[0].label, "fix");
-        assert_eq!(back.turns[1].kind, TurnKind::Revert { of: 1 });
+        assert_eq!(back.turns[1].kind, TurnKind::Edit);
         reset(&dir);
         assert!(load(&dir).unwrap().is_none());
     }

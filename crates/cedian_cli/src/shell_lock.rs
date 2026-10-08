@@ -119,7 +119,7 @@ mod tests {
         let lock = ShellLock::acquire(&d).unwrap();
         assert!(lock_path(&d).unwrap().exists());
         // Our own lock never refuses our own one-shot calls.
-        assert!(refuse_if_shell_live(&d, "accept").is_ok());
+        assert!(refuse_if_shell_live(&d, "review reset").is_ok());
         drop(lock);
         assert!(!lock_path(&d).unwrap().exists());
     }
@@ -135,7 +135,7 @@ mod tests {
         write_lock(&d, child.id());
         assert_eq!(live_holder(&d), Some(child.id()));
         assert!(
-            refuse_if_shell_live(&d, "accept")
+            refuse_if_shell_live(&d, "review reset")
                 .unwrap_err()
                 .contains("inside the shell")
         );

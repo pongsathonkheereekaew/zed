@@ -11,8 +11,8 @@
 //! gate, or the counter still advances. On exhaustion: `blocked` + the caller
 //! force-escalates `{gate_id, missing_evidence, attempts}` to the user.
 //!
-//! Evidence carries provenance (§53 R2 fix): every item links to the §17
-//! `AgentEdit` store via `tool_call_id`, or is `unattributed`. A `required`
+//! Evidence carries provenance (§53 R2 fix): every item links to the
+//! finished tool call it came from (`tool_call_id`), or is `unattributed`. A `required`
 //! gate REJECTS unattributed evidence; optional gates accept it but surface
 //! `unverified-origin` in the result.
 //!

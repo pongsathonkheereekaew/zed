@@ -34,7 +34,7 @@ The one home for **per-feature OMP coverage** ([ADR-0034](https://github.com/pon
 | `set_cache_warming`, `set_auto_retry`, `abort_retry` | runtime settings, retry banner | planned S9 |
 | `goal` | Goal mode ([ADR-0014](https://github.com/pongsathonkheereekaew/cedian/blob/main/docs/decisions/0014-agent-modes.md)) | planned S9 |
 | `set_todos` | todo list in Workflow UI | planned S2 |
-| `set_host_tools`, `set_host_uri_schemes` | cedian host tools, `cedian://`; `cedian_apply_edit` takes `expected_version` as the buffer's version token (`0` for a buffer no edit has touched, else `replica.seq` pairs), and a malformed or outdated token refuses the edit (S9 U5) | headless |
+| `set_host_tools`, `set_host_uri_schemes` | headless (CLI): the host tool `cedian_apply_edit` and `cedian://`; `cedian_apply_edit` takes `expected_version` as the buffer's version token (`0` for a buffer no edit has touched, else `replica.seq` pairs), and a malformed or outdated token refuses the edit. The app registers the `cedian` URI scheme only, no host tools yet (S9 U6): `buffer`, `selection`, `active-file`, `diagnostics`, `open-editors` answered from Zed (unsaved text included), each read in its own task with a 20 s bound, a cancelled read skipped; a private file (`private_files`) or a path that resolves outside the folder is refused | native (S9 U6): `set_host_uri_schemes`; headless: `set_host_tools` |
 | `set_ask_dialog` | native ask dialogs | headless |
 | `set_event_filter` | router subscription | planned S9 |
 | `get_available_commands` | slash commands in palette and composer | planned S9 |
@@ -100,7 +100,8 @@ Frames OMP sends besides the agent events above.
 | `read`, `grep`/`glob`/`find`, `ast_grep` | tool cards | headless |
 | `edit`, `write`, `ast_edit` | one agent transaction per call on the Zed buffer, native undo; Review Changes per task with Accept/Reject per hunk, Accept all (skips STALE), Revert turn; a hunk the user edited after the agent is STALE and never rejected; a write over unsaved edits is refused and the file shows STALE with the reason ([ADR-0006](https://github.com/pongsathonkheereekaew/cedian/blob/main/docs/decisions/0006-review-baseline-provenance-precedence.md), [ADR-0027](https://github.com/pongsathonkheereekaew/cedian/blob/main/docs/decisions/0027-zero-omp-fork.md)) | native (S9 U5); the headless CLI review commands are deleted (stand-in G) |
 | `bash`, `eval` | tool cards (the summary is the output, without OMP's `Wall time:` footer); prompts per approval mode, answered in the app's approval dialog (S9 U4; a real OMP 18.6.1 approval recorded and replayed in the app: `cedian_panel/tests/live_approval.rs`) | headless (cards); native (approvals) |
-| `lsp`, `debug` | backed by Zed LSP/DAP via `cedian://` | headless stand-in (row B); native S9 |
+| `lsp` | OMP's own tool in the app and headless (`--no-lsp` is not set). In the app the agent also reads Zed's language servers through `cedian://definitions`, `references`, `symbols`: the servers the person already runs, results in a private file or outside the folder dropped, columns UTF-16; headless those reads answer an error naming OMP's `lsp` tool ([ADR-0048](https://github.com/pongsathonkheereekaew/cedian/blob/main/docs/decisions/0048-one-lsp-zeds-staged.md)) | native (S9 U6): `cedian://` reads; OMP's tool as upstream ships it |
+| `debug` | OMP's own tool as upstream ships it; nothing in cedian uses DAP (stand-in B's `cedian_dap` is deleted, [ADR-0048](https://github.com/pongsathonkheereekaew/cedian/blob/main/docs/decisions/0048-one-lsp-zeds-staged.md)) | headless: OMP's tool |
 | `task`, `hub`/`wait`, `vibe_spawn`/`vibe_send` | subagent tree | planned S5 |
 | `todo` | Workflow UI | planned S2 |
 | `ask` | native dialog | native (S9 U4) |

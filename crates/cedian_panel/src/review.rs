@@ -103,6 +103,8 @@ pub enum ReviewEvent {
         stale: usize,
         /// Changes a later turn wrote over; they stay (revert that turn first).
         overwritten: usize,
+        /// Changes the person accepted; they stay.
+        accepted: usize,
     },
 }
 
@@ -114,16 +116,18 @@ impl std::fmt::Display for ReviewEvent {
                 reverted: 0,
                 stale: 0,
                 overwritten: 0,
+                accepted: 0,
             } => write!(f, "turn {turn}: nothing to do"),
             Self::TurnReverted {
                 turn,
                 reverted,
                 stale,
                 overwritten,
+                accepted,
             } => write!(
                 f,
                 "turn {turn} reverted: {reverted} hunk(s) put back, {stale} STALE kept, \
-                 {overwritten} changed again by a later turn, kept"
+                 {overwritten} changed again by a later turn, kept, {accepted} accepted, kept"
             ),
             other => write!(f, "{other:?}"),
         }
@@ -185,6 +189,7 @@ struct TurnRevert {
     edits: Vec<(Range<usize>, String)>,
     stale: usize,
     overwritten: usize,
+    accepted: usize,
 }
 
 /// Per-buffer review state.
@@ -446,6 +451,7 @@ impl FileReview {
                 continue;
             }
             if accepted.iter().any(|r| touches(&now, r)) {
+                plan.accepted += 1;
                 continue;
             }
             plan.edits.push((now, old_text));
@@ -699,6 +705,8 @@ impl TaskReview {
         });
         file.last_seen = buffer.version();
         file.stale_import = None;
+        let path = path_of(buffer, cx);
+        self.unreviewable.retain(|(p, _)| *p != path);
         self.rebuild(cx);
     }
 
@@ -871,7 +879,7 @@ impl TaskReview {
             .map(|(_, k)| k.clone())
             .ok_or(ReviewError::NoTurn { turn: n })?;
         let next = self.turns.last().map_or(1, |(n, _)| n + 1);
-        let (reverted, stale, overwritten, transactions) = match kind {
+        let (reverted, stale, overwritten, accepted, transactions) = match kind {
             TurnKind::Revert { transactions, .. } => {
                 let mut undone = 0;
                 for (buffer, txn) in &transactions {
@@ -883,18 +891,20 @@ impl TaskReview {
                     }
                 }
                 self.rebuild(cx);
-                (undone, 0, 0, Vec::new())
+                (undone, 0, 0, 0, Vec::new())
             }
             TurnKind::Prompt => {
                 self.rebuild(cx);
                 let mut reverted = 0;
                 let mut stale = 0;
                 let mut overwritten = 0;
+                let mut accepted = 0;
                 let mut transactions = Vec::new();
                 for file in &mut self.files {
                     let plan = file.turn_revert(n, cx);
                     stale += plan.stale;
                     overwritten += plan.overwritten;
+                    accepted += plan.accepted;
                     if plan.edits.is_empty() {
                         continue;
                     }
@@ -946,7 +956,7 @@ impl TaskReview {
                     transactions.push((file.buffer.clone(), txn));
                 }
                 self.rebuild(cx);
-                (reverted, stale, overwritten, transactions)
+                (reverted, stale, overwritten, accepted, transactions)
             }
         };
         self.turns.push((
@@ -961,6 +971,7 @@ impl TaskReview {
             reverted,
             stale,
             overwritten,
+            accepted,
         };
         self.events.push(event.clone());
         Ok(event)
@@ -1282,6 +1293,7 @@ mod tests {
                 reverted: 1,
                 stale: 0,
                 overwritten: 0,
+                accepted: 0,
             }
         );
         assert_eq!(text(&f, cx), "alpha\nONE\ngamma\n");
@@ -1306,6 +1318,7 @@ mod tests {
                 reverted: 0,
                 stale: 0,
                 overwritten: 1,
+                accepted: 0,
             }
         );
         assert_eq!(text(&f, cx), "alpha\nTWO\ngamma\n", "turn 2's text stays");
@@ -1336,6 +1349,7 @@ mod tests {
                 reverted: 1,
                 stale: 0,
                 overwritten: 0,
+                accepted: 0,
             }
         );
         assert_eq!(
@@ -1359,10 +1373,54 @@ mod tests {
                 reverted: 0,
                 stale: 0,
                 overwritten: 0,
+                accepted: 0,
             }
         );
         assert_eq!(event.to_string(), "turn 1: nothing to do");
         assert_eq!(text(&f, cx), ORIGINAL);
+    }
+
+    /// A file listed as unreviewable is a reviewed file again once a later
+    /// call imports it.
+    #[gpui::test]
+    async fn a_later_import_clears_the_files_unreviewable_entry(cx: &mut TestAppContext) {
+        let mut f = setup(cx).await;
+        let path = cx.update(|cx| path_of(f.buffer.read(cx), cx));
+        f.review
+            .could_not_review(path.clone(), "permission denied".into());
+        agent_writes(&mut f, "c1", "alpha\nBETA\ngamma\n", cx).await;
+        assert!(
+            f.review.unreviewable().is_empty(),
+            "{:?}",
+            f.review.unreviewable()
+        );
+        assert_eq!(statuses(&f), vec![HunkStatus::Pending]);
+    }
+
+    /// Reverting a turn keeps an accepted hunk and says so.
+    #[gpui::test]
+    async fn revert_turn_counts_an_accepted_hunk_it_keeps(cx: &mut TestAppContext) {
+        let mut f = setup(cx).await;
+        agent_writes(&mut f, "c1", "ALPHA\nbeta\nGAMMA\n", cx).await;
+        let path = cx.update(|cx| f.review.path(&f.review.files()[0], cx));
+        {
+            let k = key(&f, 0);
+            cx.update(|cx| f.review.accept(&path, &k, cx)).unwrap();
+        }
+        f.review.end_turn();
+        let event = cx.update(|cx| f.review.revert_turn(1, cx)).unwrap();
+        assert_eq!(
+            event,
+            ReviewEvent::TurnReverted {
+                turn: 1,
+                reverted: 1,
+                stale: 0,
+                overwritten: 0,
+                accepted: 1,
+            }
+        );
+        assert!(event.to_string().contains("1 accepted, kept"), "{event}");
+        assert_eq!(text(&f, cx), "ALPHA\nbeta\ngamma\n");
     }
 
     #[gpui::test]
@@ -1535,6 +1593,7 @@ mod tests {
                 reverted: 1,
                 stale: 1,
                 overwritten: 0,
+                accepted: 0,
             }
         );
         assert_eq!(

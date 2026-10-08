@@ -379,6 +379,9 @@ impl CedianPanel {
         for event in self.review.drain_events() {
             log::info!("cedian review: {event:?}");
         }
+        if self.review.stale_count() == 0 {
+            self.confirm_accept_all = false;
+        }
         cx.notify();
     }
 
@@ -2052,6 +2055,28 @@ mod tests {
         );
     }
 
+    /// The question is about the STALE hunks there are: when the person
+    /// accepts the one STALE hunk while it is open, there is nothing to ask.
+    #[gpui::test]
+    async fn the_accept_all_question_goes_when_no_hunk_is_stale(cx: &mut TestAppContext) {
+        let (f, buffer) = fixture(cx).await;
+        tool_start(&f, cx, "c1", &["notes.txt"]);
+        omp_writes(&f, "/ws/notes.txt", "ALPHA\nbeta\nGAMMA\n").await;
+        tool_end(&f, cx, "c1");
+        buffer.update(cx, |b, cx| b.edit([(11..11, "!")], None, cx));
+        let mut vcx = VisualTestContext::from_window(f.window.into(), cx);
+        click(&mut vcx, "cedian-review-toggle");
+        click(&mut vcx, "cedian-accept-all");
+        assert!(vcx.debug_bounds("cedian-accept-all-confirm").is_some());
+        click(&mut vcx, "cedian-accept-ws/notes.txt-1");
+        assert!(
+            vcx.debug_bounds("cedian-accept-all-confirm").is_none(),
+            "no STALE hunk is left to ask about"
+        );
+        let statuses: Vec<HunkStatus> = hunks(&f, &mut vcx).into_iter().map(|h| h.1).collect();
+        assert_eq!(statuses, vec![HunkStatus::Pending, HunkStatus::Accepted]);
+    }
+
     #[gpui::test]
     async fn accept_all_without_stale_does_not_ask(cx: &mut TestAppContext) {
         let (f, _buffer) = fixture(cx).await;
@@ -2085,7 +2110,7 @@ mod tests {
             notice.as_deref(),
             Some(
                 "turn 1 reverted: 1 hunk(s) put back, 0 STALE kept, \
-                 0 changed again by a later turn, kept"
+                 0 changed again by a later turn, kept, 0 accepted, kept"
             )
         );
     }
@@ -2109,7 +2134,7 @@ mod tests {
                     panel.notice().map(str::to_string).as_deref(),
                     Some(
                         "turn 1 reverted: 1 hunk(s) put back, 0 STALE kept, \
-                         0 changed again by a later turn, kept"
+                         0 changed again by a later turn, kept, 0 accepted, kept"
                     )
                 );
             })

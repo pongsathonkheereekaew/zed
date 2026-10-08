@@ -55,22 +55,26 @@ pub fn begin(buffer: &mut Buffer) -> Mark {
     }
 }
 
-/// Load the disk text and fold everything since [`begin`] into one
-/// transaction. The import applies the disk diff itself rather than calling
-/// `Buffer::reload`: the project's watcher reloads the same change on its
-/// own, and a second `reload` cancels the first, so the import would see
-/// nothing while the watcher's reload landed after it. Applying the diff
-/// directly is safe in either order: whichever lands second finds its hunks
-/// already in the buffer and applies nothing.
+/// Load the disk text and import it as one transaction. The import applies
+/// the disk diff itself rather than calling `Buffer::reload`: the project's
+/// watcher reloads the same change on its own, and a second `reload` cancels
+/// the first, so the import would see nothing while the watcher's reload
+/// landed after it.
+///
+/// Whether the watcher raced ahead is decided by content, not by the undo
+/// stack: edits since [`begin`] that leave the buffer equal to the disk text
+/// are the watcher landing this same write, and that transaction is the
+/// import. Edits since [`begin`] that leave it different are the user's (a
+/// keystroke during the reads, or a transaction autosave already wrote), so
+/// nothing is imported and the file is `Stale`.
 pub async fn finish(
     buffer: Entity<Buffer>,
     mark: Mark,
     cx: &mut AsyncApp,
 ) -> Result<ImportOutcome> {
-    let (dirty, watcher_txn, load) = buffer.read_with(cx, |b, cx| {
-        let raced = (top(b) != mark.start_top).then(|| top(b)).flatten();
+    let (dirty, load) = buffer.read_with(cx, |b, cx| {
         let load = b.file().and_then(|f| f.as_local()).map(|f| f.load(cx));
-        (b.is_dirty(), raced, load)
+        (b.is_dirty(), load)
     });
     if dirty {
         return Ok(ImportOutcome::Stale);
@@ -78,29 +82,31 @@ pub async fn finish(
     let Some(load) = load else {
         return Ok(ImportOutcome::Unchanged);
     };
-    let new_text = load.await?;
-    let diff = buffer.read_with(cx, |b, cx| b.diff(new_text, cx)).await;
+    let mut disk_text = load.await?;
+    text::LineEnding::normalize(&mut disk_text);
+    let diff = buffer
+        .read_with(cx, |b, cx| b.diff(disk_text.clone(), cx))
+        .await;
 
     buffer.update(cx, |b, cx| {
         b.finalize_last_transaction();
-        let ours = b.apply_diff(diff, cx);
-        b.finalize_last_transaction();
-        let changed = b.version() != *mark.start.version();
-        if changed {
+        let edited_since_mark = b.has_edits_since(mark.start.version());
+        let imported = if edited_since_mark {
+            if b.text() != disk_text {
+                return Ok(ImportOutcome::Stale);
+            }
+            top(b).filter(|t| Some(*t) != mark.start_top)
+        } else {
+            let ours = b.apply_diff(diff, cx);
+            b.finalize_last_transaction();
+            ours
+        };
+        if b.text() == disk_text {
             let mtime = b.file().and_then(|f| f.disk_state().mtime());
             b.did_reload(b.version(), b.line_ending(), mtime, cx);
         }
-        let id = match (watcher_txn, ours) {
-            (Some(watcher), Some(ours)) if watcher != ours => {
-                b.merge_transactions(ours, watcher);
-                Some(watcher)
-            }
-            // The watcher may have landed between the check above and the
-            // apply: the top of the undo stack is then its transaction.
-            _ => top(b).filter(|t| Some(*t) != mark.start_top),
-        };
-        Ok(match id {
-            Some(id) if changed => ImportOutcome::Imported(id),
+        Ok(match imported {
+            Some(id) if b.version() != *mark.start.version() => ImportOutcome::Imported(id),
             _ => ImportOutcome::Unchanged,
         })
     })
@@ -192,6 +198,52 @@ mod tests {
         let (fs, _project, buffer) = setup(cx).await;
         let mark = buffer.update(cx, |b, _| begin(b));
         buffer.update(cx, |b, cx| b.edit([(0..0, "USER ")], None, cx));
+        omp_writes(&fs, "alpha\nBETA\ngamma\n").await;
+        let outcome = finish(buffer.clone(), mark, &mut cx.to_async())
+            .await
+            .unwrap();
+        assert_eq!(outcome, ImportOutcome::Stale);
+        assert_eq!(
+            buffer.read_with(cx, |b, _| b.text()),
+            "USER alpha\nbeta\ngamma\n"
+        );
+    }
+
+    /// A keystroke lands while `finish` is reading the disk: the import must
+    /// not take it (the user's text would be marked saved and lost), so the
+    /// file is Stale and the buffer stays dirty.
+    #[gpui::test]
+    async fn a_keystroke_during_the_import_leaves_the_buffer_dirty(cx: &mut TestAppContext) {
+        let (fs, _project, buffer) = setup(cx).await;
+        let mark = buffer.update(cx, |b, _| begin(b));
+        omp_writes(&fs, "alpha\nBETA\ngamma\n").await;
+        let mut acx = cx.to_async();
+        let mut finish = std::pin::pin!(finish(buffer.clone(), mark, &mut acx));
+        assert!(
+            futures::poll!(finish.as_mut()).is_pending(),
+            "the dirty check passed; the disk read is in flight"
+        );
+        buffer.update(cx, |b, cx| b.edit([(0..0, "USER ")], None, cx));
+        let outcome = finish.await.unwrap();
+        cx.run_until_parked();
+        assert_eq!(outcome, ImportOutcome::Stale);
+        buffer.read_with(cx, |b, _| {
+            assert_eq!(b.text(), "USER alpha\nbeta\ngamma\n");
+            assert!(b.is_dirty(), "the user's edit is still unsaved");
+        });
+    }
+
+    /// Autosave: the user's transaction during the call is already saved,
+    /// so the buffer is clean at `finish`. It is still not the agent's.
+    #[gpui::test]
+    async fn a_saved_user_transaction_during_the_call_is_not_the_agents(cx: &mut TestAppContext) {
+        let (fs, project, buffer) = setup(cx).await;
+        let mark = buffer.update(cx, |b, _| begin(b));
+        buffer.update(cx, |b, cx| b.edit([(0..0, "USER ")], None, cx));
+        project
+            .update(cx, |p, cx| p.save_buffer(buffer.clone(), cx))
+            .await
+            .unwrap();
         omp_writes(&fs, "alpha\nBETA\ngamma\n").await;
         let outcome = finish(buffer.clone(), mark, &mut cx.to_async())
             .await

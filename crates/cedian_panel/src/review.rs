@@ -160,6 +160,21 @@ pub struct FileReview {
 }
 
 impl FileReview {
+    fn new(buffer: Entity<Buffer>, baseline: text::BufferSnapshot) -> Self {
+        Self {
+            buffer,
+            last_seen: baseline.version().clone(),
+            baseline,
+            agent_txns: Vec::new(),
+            user_edits: Vec::new(),
+            stale_import: None,
+            resolved: HashMap::default(),
+            reported_stale: collections::HashSet::default(),
+            hunks: Vec::new(),
+            built_at: clock::Global::new(),
+        }
+    }
+
     pub fn hunks(&self) -> &[ReviewHunk] {
         &self.hunks
     }
@@ -413,28 +428,38 @@ impl TaskReview {
         let i = match self.file_index(buffer) {
             Some(i) => i,
             None => {
-                self.files.push(FileReview {
-                    buffer: buffer.clone(),
-                    last_seen: baseline.version().clone(),
-                    baseline,
-                    agent_txns: Vec::new(),
-                    user_edits: Vec::new(),
-                    stale_import: None,
-                    resolved: HashMap::default(),
-                    reported_stale: collections::HashSet::default(),
-                    hunks: Vec::new(),
-                    built_at: clock::Global::new(),
-                });
+                self.files
+                    .push(FileReview::new(buffer.clone(), baseline.clone()));
                 self.files.len() - 1
             }
         };
         let file = &mut self.files[i];
+        if file.agent_txns.is_empty() {
+            // The file was only ever refused: the task's first edit to it
+            // is this one, and edits before it are never hunks.
+            file.last_seen = baseline.version().clone();
+            file.baseline = baseline;
+            file.user_edits.clear();
+        }
+        let buffer = buffer.read(cx);
+        // Edits between the last accounting and the transaction's start are
+        // the user's (a transaction autosave wrote, under the watcher's
+        // reload of OMP's write). The reload erased their text, so the only
+        // trace is the version gap: every edit since then counts as theirs
+        // (unsure means STALE, never an overwrite).
+        let started_later = buffer
+            .get_transaction(transaction)
+            .is_some_and(|t| !file.last_seen.observed_all(&t.start));
+        if started_later {
+            file.fold_user_edits(buffer);
+        }
         file.agent_txns.push(AgentTxn {
             tool_call_id: tool_call_id.to_string(),
             turn,
             transaction,
         });
-        file.last_seen = buffer.read(cx).version();
+        file.last_seen = buffer.version();
+        file.stale_import = None;
         self.rebuild(cx);
     }
 
@@ -445,24 +470,15 @@ impl TaskReview {
             "OMP wrote the file on disk (call {tool_call_id}) while the buffer had unsaved edits; \
              nothing was imported"
         );
-        match self.file_index(buffer) {
-            Some(i) => self.files[i].stale_import = Some(reason),
+        let i = match self.file_index(buffer) {
+            Some(i) => i,
             None => {
                 let snapshot = buffer.read(cx).text_snapshot();
-                self.files.push(FileReview {
-                    buffer: buffer.clone(),
-                    last_seen: snapshot.version().clone(),
-                    baseline: snapshot,
-                    agent_txns: Vec::new(),
-                    user_edits: Vec::new(),
-                    stale_import: Some(reason),
-                    resolved: HashMap::default(),
-                    reported_stale: collections::HashSet::default(),
-                    hunks: Vec::new(),
-                    built_at: clock::Global::new(),
-                });
+                self.files.push(FileReview::new(buffer.clone(), snapshot));
+                self.files.len() - 1
             }
-        }
+        };
+        self.files[i].stale_import = Some(reason);
     }
 
     /// Recompute every file's hunks from its buffer.
@@ -1088,6 +1104,56 @@ mod tests {
         });
         cx.update(|cx| f.review.revert_turn(1, cx)).unwrap();
         assert_eq!(text(&f, cx), "alpha\nbeta\ngamma\ndelta by user\n");
+    }
+
+    /// Autosave plus the watcher racing ahead: the user's saved transaction
+    /// during the call sits under the watcher's reload of OMP's write. The
+    /// import is the watcher's transaction; the user's lines are STALE, not
+    /// a pending agent hunk. A clean later import clears the file's STALE.
+    #[gpui::test]
+    async fn a_user_transaction_under_the_watchers_reload_is_stale(cx: &mut TestAppContext) {
+        let mut f = setup(cx).await;
+        cx.update(|cx| f.review.observe(&f.buffer, cx));
+        let mark = f.buffer.update(cx, |b, _| import::begin(b));
+        let baseline = mark.start().clone();
+        user_types(&f, 6..10, "by user", cx);
+        f.project
+            .update(cx, |p, cx| p.save_buffer(f.buffer.clone(), cx))
+            .await
+            .unwrap();
+        f.fs.save(
+            Path::new(NOTES),
+            &"alpha\nBETA\ngamma\n".into(),
+            LineEnding::Unix,
+        )
+        .await
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(text(&f, cx), "alpha\nBETA\ngamma\n", "the watcher reloaded");
+        let outcome = import::finish(f.buffer.clone(), mark, &mut cx.to_async())
+            .await
+            .unwrap();
+        let ImportOutcome::Imported(txn) = outcome else {
+            panic!("{outcome:?}");
+        };
+        cx.update(|cx| f.review.agent_edited(&f.buffer, "c1", txn, baseline, cx));
+        assert_eq!(statuses(&f), vec![HunkStatus::Stale]);
+    }
+
+    #[gpui::test]
+    async fn a_clean_import_clears_the_files_stale_import(cx: &mut TestAppContext) {
+        let mut f = setup(cx).await;
+        user_types(&f, 0..0, "USER ", cx);
+        agent_writes(&mut f, "c1", "alpha\nBETA\ngamma\n", cx).await;
+        assert!(f.review.files()[0].stale_import().is_some());
+        user_types(&f, 0..5, "", cx);
+        f.project
+            .update(cx, |p, cx| p.save_buffer(f.buffer.clone(), cx))
+            .await
+            .unwrap();
+        agent_writes(&mut f, "c2", "alpha\nBETA\ngamma\n", cx).await;
+        assert_eq!(f.review.files()[0].stale_import(), None);
+        assert_eq!(statuses(&f), vec![HunkStatus::Pending]);
     }
 
     #[gpui::test]

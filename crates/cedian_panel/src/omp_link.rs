@@ -526,7 +526,7 @@ impl OmpLink {
     /// (`follow_up`), off the UI thread; OMP's `queue_update` shows it.
     pub fn queue(&self, text: String, steer: bool) {
         let not_running = LinkEvent::QueueRefused("OMP is not running".to_string());
-        self.off_thread(not_running, move |control, _| {
+        self.off_thread(not_running, move |control| {
             let sent = if steer {
                 control.steer(&text)
             } else {
@@ -546,7 +546,7 @@ impl OmpLink {
             id: id.clone(),
             result: Err("OMP is not running".to_string()),
         };
-        self.off_thread(not_running, move |control, _| LinkEvent::SubagentSteered {
+        self.off_thread(not_running, move |control| LinkEvent::SubagentSteered {
             result: control
                 .steer_subagent(&id, &message)
                 .map_err(|e| e.to_string()),
@@ -555,24 +555,25 @@ impl OmpLink {
     }
 
     /// Cancel subagent `id` off the UI thread. The person's cancel is an
-    /// audit row once OMP has answered (ADR-0050 decision 4).
+    /// audit row whatever came of it (ADR-0050 decision 4).
     pub fn cancel_subagent(&self, id: String) {
-        let not_running = LinkEvent::SubagentCancelled {
-            id: id.clone(),
-            result: Err("OMP is not running".to_string()),
-        };
-        self.off_thread(not_running, move |control, gate| {
-            let result = control.cancel_subagent(&id).map_err(|e| e.to_string());
-            if let Ok(cancelled) = result {
-                let recorded = match &mut gate.state.lock().audit {
-                    Some(audit) => audit.subagent_cancel(&id, cancelled),
-                    None => Err("the audit log is not open".to_string()),
-                };
-                if let Err(e) = recorded {
-                    let _ = gate.events.unbounded_send(LinkEvent::AuditFailed(e));
-                }
+        let gate = Arc::clone(&self.gate);
+        let control = gate.control.lock().clone();
+        std::thread::spawn(move || {
+            let result = match control {
+                Some(control) => control.cancel_subagent(&id).map_err(|e| e.to_string()),
+                None => Err("OMP is not running".to_string()),
+            };
+            let recorded = match &mut gate.state.lock().audit {
+                Some(audit) => audit.subagent_cancel(&id, &result),
+                None => Err("the audit log is not open".to_string()),
+            };
+            if let Err(e) = recorded {
+                let _ = gate.events.unbounded_send(LinkEvent::AuditFailed(e));
             }
-            LinkEvent::SubagentCancelled { id, result }
+            let _ = gate
+                .events
+                .unbounded_send(LinkEvent::SubagentCancelled { id, result });
         });
     }
 
@@ -580,7 +581,7 @@ impl OmpLink {
     fn off_thread(
         &self,
         not_running: LinkEvent,
-        call: impl FnOnce(RuntimeControl, &Gate) -> LinkEvent + Send + 'static,
+        call: impl FnOnce(RuntimeControl) -> LinkEvent + Send + 'static,
     ) {
         let gate = Arc::clone(&self.gate);
         let Some(control) = gate.control.lock().clone() else {
@@ -588,7 +589,7 @@ impl OmpLink {
             return;
         };
         std::thread::spawn(move || {
-            let event = call(control, &gate);
+            let event = call(control);
             let _ = gate.events.unbounded_send(event);
         });
     }
@@ -1037,6 +1038,44 @@ mod tests {
         assert!(result.is_err(), "{result:?}");
         assert_eq!(sent.borrow().len(), 2, "every dialog got its cancel");
         assert!(gate.open.is_empty());
+    }
+
+    #[test]
+    fn a_cancel_that_never_reached_omp_is_still_an_audit_row() {
+        let dir = temp("cancel-off");
+        let (events, mut rx) = futures::channel::mpsc::unbounded();
+        let link = OmpLink {
+            commands: mpsc::channel().0,
+            pid: Arc::default(),
+            gate: Arc::new(Gate {
+                control: Mutex::default(),
+                turn: Mutex::default(),
+                state: Mutex::new(gate(&dir)),
+                queue: Mutex::default(),
+                events,
+            }),
+            thread: None,
+        };
+        link.cancel_subagent("sa-1".to_string());
+        let event = futures::executor::block_on(rx.next());
+        assert!(
+            matches!(
+                event,
+                Some(LinkEvent::SubagentCancelled { ref id, result: Err(_) }) if id == "sa-1"
+            ),
+            "{event:?}"
+        );
+        let rows: Vec<serde_json::Value> =
+            std::fs::read_to_string(dir.join(cedian_shell::audit::AUDIT_FILE))
+                .unwrap_or_default()
+                .lines()
+                .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["item"].clone())
+                .filter(|item| item["tool"] == "cancel_subagent")
+                .collect();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["command"], "sa-1");
+        assert_eq!(rows[0]["error"], "OMP is not running");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn ready(

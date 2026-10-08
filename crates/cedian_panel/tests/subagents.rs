@@ -10,7 +10,8 @@
 //! 4. Cancel on a subagent that had already ended: OMP says
 //!    `cancelled: false`, the row says "already ended";
 //! 5. Cancel on a running one: OMP aborts it, the row shows aborted, and
-//!    each Cancel is an audit row;
+//!    each Cancel is an audit row (one that never reaches OMP is too:
+//!    `omp_link`'s unit test);
 //! 6. the link registers `cedian_worktree_request`: a request without the
 //!    ADR-0033 brief is refused naming the missing fields, with no tree;
 //!    one with it gets a tree, a registry row and its stored brief;
@@ -194,22 +195,25 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
         .unwrap();
     assert_eq!(boxes, [false, false], "an ended row drops its steer box");
     assert_connected(cx, &window);
-    let rows: Vec<(String, bool)> = std::fs::read_to_string(state.join("audit.jsonl"))
+    let rows: Vec<(String, String)> = std::fs::read_to_string(state.join("audit.jsonl"))
         .unwrap()
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .map(|row| row["item"].clone())
         .filter(|item| item["tool"] == "cancel_subagent")
         .map(|item| {
-            (
-                item["command"].as_str().unwrap().to_string(),
-                item["cancelled"].as_bool().unwrap(),
-            )
+            let outcome = match item["cancelled"].as_bool() {
+                Some(cancelled) => cancelled.to_string(),
+                None => item["error"].as_str().unwrap_or_default().to_string(),
+            };
+            (item["command"].as_str().unwrap().to_string(), outcome)
         })
         .collect();
+    let row = |id: &str, outcome: &str| (id.to_string(), outcome.to_string());
     assert_eq!(
         rows,
-        [("sa-2".to_string(), false), ("sa-1".to_string(), true)]
+        [row("sa-2", "false"), row("sa-1", "true")],
+        "every Cancel is an audit row"
     );
 
     // 6. OMP asks the app for worktrees: one without the ADR-0033 brief is

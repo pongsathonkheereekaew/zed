@@ -133,14 +133,22 @@ impl AuditLog {
         self.append(item, None)
     }
 
-    /// The person cancelled OMP subagent `id` (ADR-0050 decision 4);
-    /// `cancelled` is OMP's answer, `false` when it had already ended.
-    pub fn subagent_cancel(&mut self, id: &str, cancelled: bool) -> Result<(), String> {
-        let item = json!({
+    /// The person cancelled OMP subagent `id` (ADR-0050 decision 4):
+    /// OMP's answer, `false` when it had already ended, or why the cancel
+    /// did not reach OMP.
+    pub fn subagent_cancel(
+        &mut self,
+        id: &str,
+        outcome: &Result<bool, String>,
+    ) -> Result<(), String> {
+        let mut item = json!({
             "kind": "gate", "tool": "cancel_subagent", "command": id,
             "decision": "cancel", "scope": "once", "answered_by": "user",
-            "cancelled": cancelled,
         });
+        match outcome {
+            Ok(cancelled) => item["cancelled"] = json!(cancelled),
+            Err(e) => item["error"] = json!(e),
+        }
         self.append(item, None)
     }
 

@@ -759,12 +759,13 @@ impl TaskReview {
         self.rebuild(cx);
     }
 
-    /// OMP wrote the disk while the buffer had unsaved edits: nothing was
-    /// imported and the file is STALE as a whole.
+    /// The file changed during the call while the person was editing it
+    /// (unsaved edits, or a save during the call): nothing was imported and
+    /// the file is STALE as a whole.
     pub fn import_refused(&mut self, buffer: &Entity<Buffer>, tool_call_id: &str, cx: &App) {
         let reason = format!(
-            "OMP wrote the file on disk (call {tool_call_id}) while the buffer had unsaved edits; \
-             nothing was imported"
+            "the file changed during call {tool_call_id} while you were editing it \
+             (unsaved edits, or a save during the call); nothing was imported"
         );
         let i = match self.file_index(buffer) {
             Some(i) => i,
@@ -1170,7 +1171,7 @@ mod tests {
     /// imports it as one transaction attributed to `call`.
     async fn agent_writes(f: &mut Fixture, call: &str, text: &str, cx: &mut TestAppContext) {
         cx.update(|cx| f.review.observe(&f.buffer, call, cx));
-        let mark = f.buffer.update(cx, |b, _| import::begin(b));
+        let mark = f.buffer.update(cx, |b, cx| import::begin(b, cx));
         let baseline = mark.start().clone();
         f.fs.save(Path::new(NOTES), &text.into(), LineEnding::Unix)
             .await
@@ -1714,7 +1715,7 @@ mod tests {
         let mut f = setup(cx).await;
         agent_writes(&mut f, "c0", "ALPHA\nbeta\ngamma\n", cx).await;
         cx.update(|cx| f.review.observe(&f.buffer, "c1", cx));
-        let mark = f.buffer.update(cx, |b, _| import::begin(b));
+        let mark = f.buffer.update(cx, |b, cx| import::begin(b, cx));
         let baseline = mark.start().clone();
         cx.update(|cx| f.review.import_done(&f.buffer, "c1", cx));
         f.fs.save(
@@ -1737,17 +1738,16 @@ mod tests {
         assert_eq!(statuses(&f), vec![HunkStatus::Pending, HunkStatus::Pending]);
     }
 
-    /// A keystroke inside the word OMP rewrote, folded by a second call's
-    /// observe and kept by OMP's write (it read the autosaved file): the
-    /// fold saw the import land after it, so it is the user's and the hunk
-    /// is STALE, never rejected.
+    /// A keystroke inside the word OMP rewrote, autosaved and kept by OMP's
+    /// write (it read the autosaved file), with the watcher ahead: the save
+    /// in the window makes the import refuse, so the file is STALE as a
+    /// whole, the user's text is kept, and nothing is rejectable over it.
     #[gpui::test]
     async fn a_user_edit_the_write_kept_is_not_the_imports_own(cx: &mut TestAppContext) {
         let mut f = setup(cx).await;
         agent_writes(&mut f, "c0", "alpha\nbeta\nGAMMA\n", cx).await;
         cx.update(|cx| f.review.observe(&f.buffer, "c1", cx));
-        let mark = f.buffer.update(cx, |b, _| import::begin(b));
-        let baseline = mark.start().clone();
+        let mark = f.buffer.update(cx, |b, cx| import::begin(b, cx));
         user_types(&f, 5..5, "foo", cx);
         cx.update(|cx| f.review.observe(&f.buffer, "c2", cx));
         f.project
@@ -1770,13 +1770,12 @@ mod tests {
         let outcome = import::finish(f.buffer.clone(), mark, &mut cx.to_async())
             .await
             .unwrap();
-        let ImportOutcome::Imported(txn) = outcome else {
-            panic!("{outcome:?}");
-        };
+        assert_eq!(outcome, ImportOutcome::Stale);
         cx.update(|cx| {
-            f.review.agent_edited(&f.buffer, "c1", txn, baseline, cx);
+            f.review.import_refused(&f.buffer, "c1", cx);
             f.review.import_done(&f.buffer, "c2", cx);
         });
+        assert!(f.review.files()[0].stale_import().is_some());
         assert_eq!(statuses(&f), vec![HunkStatus::Stale, HunkStatus::Pending]);
         let key = key(&f, 0);
         let path = cx.update(|cx| f.review.path(&f.review.files()[0], cx));
@@ -1791,14 +1790,13 @@ mod tests {
 
     /// Autosave plus the watcher racing ahead: the user's saved transaction
     /// during the call sits under the watcher's reload of OMP's write. The
-    /// import is the watcher's transaction; the user's line is STALE, and
-    /// the agent's line elsewhere is a pending hunk, not STALE with it.
+    /// save in the window refuses the import: the file is STALE as a whole
+    /// and nothing is rejectable, the agent's line included.
     #[gpui::test]
     async fn a_user_transaction_under_the_watchers_reload_is_stale(cx: &mut TestAppContext) {
         let mut f = setup(cx).await;
         cx.update(|cx| f.review.observe(&f.buffer, "c1", cx));
-        let mark = f.buffer.update(cx, |b, _| import::begin(b));
-        let baseline = mark.start().clone();
+        let mark = f.buffer.update(cx, |b, cx| import::begin(b, cx));
         user_types(&f, 0..5, "by user", cx);
         f.project
             .update(cx, |p, cx| p.save_buffer(f.buffer.clone(), cx))
@@ -1820,17 +1818,12 @@ mod tests {
         let outcome = import::finish(f.buffer.clone(), mark, &mut cx.to_async())
             .await
             .unwrap();
-        let ImportOutcome::Imported(txn) = outcome else {
-            panic!("{outcome:?}");
-        };
-        cx.update(|cx| f.review.agent_edited(&f.buffer, "c1", txn, baseline, cx));
-        let hunks = f.review.files()[0].hunks();
-        let seen: Vec<(u32, HunkStatus)> = hunks.iter().map(|h| (h.rows.start, h.status)).collect();
-        assert_eq!(
-            seen,
-            vec![(0, HunkStatus::Stale), (1, HunkStatus::Pending)],
-            "{hunks:?}"
-        );
+        assert_eq!(outcome, ImportOutcome::Stale);
+        cx.update(|cx| f.review.import_refused(&f.buffer, "c1", cx));
+        let file = &f.review.files()[0];
+        assert!(file.stale_import().unwrap().contains("c1"));
+        assert!(file.hunks().is_empty(), "{:?}", file.hunks());
+        assert_eq!(text(&f, cx), "by user\nBETA\ngamma\n");
     }
 
     #[gpui::test]

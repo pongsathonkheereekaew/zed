@@ -902,7 +902,7 @@ impl CedianPanel {
             .enumerate()
             .map(|(i, (b, path))| {
                 self.review.observe(&b, &tool_call_id, cx);
-                let mark = b.update(cx, |b, _| import::begin(b));
+                let mark = b.update(cx, |b, cx| import::begin(b, cx));
                 if b.read(cx).is_dirty() {
                     dirty.push((i, path));
                 }
@@ -989,7 +989,7 @@ impl CedianPanel {
                         let mark = buffer.update(cx, |b, cx| {
                             import::begin_from(b, &before, cx).unwrap_or_else(|| {
                                 held.push((cx.entity(), before.clone()));
-                                import::begin(b)
+                                import::begin(b, cx)
                             })
                         });
                         marks.push((buffer, mark));
@@ -1886,8 +1886,8 @@ mod tests {
         assert_eq!(
             stale,
             vec![
-                "OMP wrote the file on disk (call c1) while the buffer had unsaved edits; \
-                 nothing was imported"
+                "the file changed during call c1 while you were editing it \
+                 (unsaved edits, or a save during the call); nothing was imported"
                     .to_string()
             ],
             "the file shows STALE with the reason"

@@ -10,47 +10,72 @@
 
 use cedian_workspace::{CedianUri, Diagnostic, DiagnosticSeverity, HostTools, UriKind};
 use editor::Editor;
-use futures::StreamExt as _;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
+use futures::{FutureExt as _, StreamExt as _};
 use gpui::{App, Entity, Task, WeakEntity};
 use language::{Buffer, Location, Point, PointUtf16, ToPointUtf16 as _};
 use omp_rpc::{HostUri, HostUriRead};
 use project::{Project, WorktreeId};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
+use std::time::{Duration, Instant};
 use util::paths::PathStyle;
 use util::rel_path::RelPath;
 use workspace::Workspace;
 
 /// How long a `cedian://` read waits for the app.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the app works on one read before it answers an error: under
+/// OMP's own 30 s, so OMP gets the reason rather than its timeout.
+const APP_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// One `cedian://` read OMP asked for, answered on the GPUI thread.
 pub(crate) struct Read {
     pub url: String,
+    /// Set once OMP cancelled the read; the app then skips it.
+    pub cancelled: Arc<AtomicBool>,
     pub reply: std::sync::mpsc::Sender<Result<HostUriRead, String>>,
 }
 
 /// The `cedian` scheme: each read crosses to the GPUI thread over `reads`.
 pub(crate) fn scheme(reads: UnboundedSender<Read>) -> HostUri {
-    HostUri::new("cedian", move |url, _ctx| {
+    HostUri::new("cedian", move |url, ctx| {
         let (reply, answer) = std::sync::mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
         reads
             .unbounded_send(Read {
                 url: url.to_string(),
+                cancelled: cancelled.clone(),
                 reply,
             })
             .map_err(|_| "the cedian panel is closed")?;
-        match answer.recv_timeout(READ_TIMEOUT) {
-            Ok(read) => read.map_err(Into::into),
-            Err(_) => Err(format!("no answer from the app for {url}").into()),
+        let deadline = Instant::now() + READ_TIMEOUT;
+        loop {
+            match answer.recv_timeout(Duration::from_millis(50)) {
+                Ok(read) => return read.map_err(Into::into),
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(format!("the app dropped the read of {url}").into());
+                }
+                Err(RecvTimeoutError::Timeout) if ctx.is_cancelled() => {
+                    cancelled.store(true, Ordering::SeqCst);
+                    return Err(format!("cancelled: {url}").into());
+                }
+                Err(RecvTimeoutError::Timeout) if Instant::now() >= deadline => {
+                    return Err(format!("no answer from the app for {url}").into());
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+            }
         }
     })
     .expect("cedian scheme is valid")
 }
 
-/// Answer `cedian://` reads, one at a time, with `answer`, called when
-/// each arrives; `None` (the panel is gone) stops.
+/// Answer each `cedian://` read in its own task, with `answer` called when
+/// it arrives, so a slow language server holds up only its own read. A read
+/// gets an error after [`APP_TIMEOUT`]; a cancelled one is skipped. `None`
+/// from `answer` (the panel is gone) stops.
 pub(crate) fn serve(
     mut reads: UnboundedReceiver<Read>,
     answer: impl Fn(&str, &mut App) -> Option<Task<Result<HostUriRead, String>>> + 'static,
@@ -58,10 +83,28 @@ pub(crate) fn serve(
 ) -> Task<()> {
     cx.spawn(async move |cx| {
         while let Some(read) = reads.next().await {
-            let Some(answer) = cx.update(|cx| answer(&read.url, cx)) else {
+            if read.cancelled.load(Ordering::SeqCst) {
+                continue;
+            }
+            let Some(task) = cx.update(|cx| answer(&read.url, cx)) else {
                 break;
             };
-            let _ = read.reply.send(answer.await);
+            let timeout = cx.background_executor().timer(APP_TIMEOUT);
+            cx.spawn(async move |_| {
+                let task = task.fuse();
+                let timeout = timeout.fuse();
+                futures::pin_mut!(task, timeout);
+                let answer = futures::select_biased! {
+                    answer = task => answer,
+                    _ = timeout => Err(format!(
+                        "no answer from Zed within {}s for {}",
+                        APP_TIMEOUT.as_secs(),
+                        read.url
+                    )),
+                };
+                let _ = read.reply.send(answer);
+            })
+            .detach();
         }
     })
 }
@@ -598,6 +641,49 @@ mod tests {
             no_server.contains("no language server for notes.txt"),
             "{no_server}"
         );
+    }
+
+    /// A read whose language server never answers neither blocks the reads
+    /// after it nor waits past the app's own timeout.
+    #[gpui::test]
+    async fn a_stuck_read_blocks_nothing(cx: &mut TestAppContext) {
+        let (project, server, _handle) = fake_folder(cx).await;
+        server.set_request_handler::<lsp::request::GotoDefinition, _, _>(|_, _| async move {
+            futures::future::pending::<anyhow::Result<Option<lsp::GotoDefinitionResponse>>>().await
+        });
+        // Let the server finish initializing, so the request reaches it.
+        cx.run_until_parked();
+        let (reads, rx) = futures::channel::mpsc::unbounded();
+        let _serve = cx.update(|cx| {
+            let project = project.clone();
+            serve(rx, move |url, cx| Some(answer(url, None, &project, cx)), cx)
+        });
+        let send = |url: &str, cancelled: bool| {
+            let (reply, answer) = std::sync::mpsc::channel();
+            reads
+                .unbounded_send(Read {
+                    url: url.to_string(),
+                    cancelled: Arc::new(AtomicBool::new(cancelled)),
+                    reply,
+                })
+                .unwrap();
+            answer
+        };
+        let stuck = send("cedian://definitions/src/main.rs:1:12", false);
+        let cancelled = send("cedian://active-file", true);
+        let selection = send("cedian://selection", false);
+        cx.run_until_parked();
+        assert_eq!(selection.try_recv().unwrap().unwrap().content, "");
+        assert_eq!(
+            cancelled.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected),
+            "a cancelled read is skipped"
+        );
+        assert!(stuck.try_recv().is_err(), "still waiting on the server");
+        cx.executor().advance_clock(APP_TIMEOUT);
+        cx.run_until_parked();
+        let timed_out = stuck.try_recv().unwrap().unwrap_err();
+        assert!(timed_out.contains("no answer"), "{timed_out}");
     }
 
     /// Definitions, references and symbols are Zed's language server's

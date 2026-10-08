@@ -483,6 +483,10 @@ impl CedianPanel {
                     ..
                 },
             ) => context::lsp_read(&host, &self.project, &uri, cx),
+            Ok(CedianUri {
+                kind: UriKind::Diagnostics,
+                path,
+            }) => Task::ready(Ok(host.render_diagnostics(&path).into())),
             _ => Task::ready(host.read_uri(url).map_err(|e| e.to_string())),
         }
     }

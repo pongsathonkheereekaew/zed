@@ -10,7 +10,6 @@ edition = "2021"
 
 [dependencies]
 clock.workspace = true
-cedian_lsp = { path = "../cedian_lsp" }
 cedian_omp = { path = "../cedian_omp" }
 omp-rpc = { path = "../../vendor/omp-rpc" }
 parking_lot = "0.12"

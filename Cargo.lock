@@ -2842,15 +2842,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cedian_dap"
-version = "0.1.0"
-dependencies = [
- "parking_lot",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "cedian_fake_omp"
 version = "0.1.0"
 dependencies = [
@@ -2858,15 +2849,6 @@ dependencies = [
  "cedian_agent_ui",
  "cedian_omp",
  "omp-rpc",
- "serde_json",
-]
-
-[[package]]
-name = "cedian_lsp"
-version = "0.1.0"
-dependencies = [
- "parking_lot",
- "serde",
  "serde_json",
 ]
 
@@ -2958,7 +2940,6 @@ dependencies = [
 name = "cedian_workspace"
 version = "0.1.0"
 dependencies = [
- "cedian_lsp",
  "cedian_omp",
  "clock",
  "omp-rpc",

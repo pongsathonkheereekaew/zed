@@ -113,8 +113,6 @@ pub struct HostTools {
     selection: Mutex<Option<(PathBuf, usize, usize)>>,
     diagnostics: Mutex<HashMap<PathBuf, Vec<Diagnostic>>>,
     workdir: PathBuf,
-    /// Live LSP bridge (S1): `None` until `attach_lsp` runs.
-    lsp: Mutex<Option<Arc<crate::LspBridge>>>,
 }
 
 impl HostTools {
@@ -130,7 +128,6 @@ impl HostTools {
             workdir: workdir
                 .canonicalize()
                 .unwrap_or_else(|_| workdir.to_path_buf()),
-            lsp: Mutex::new(None),
         }
     }
 
@@ -341,63 +338,14 @@ impl HostTools {
             }
             UriKind::Selection => Ok(self.render_selection().into()),
             UriKind::ActiveFile => Ok(self.render_active_file().into()),
-            UriKind::Diagnostics => Ok(self.render_diagnostics(&uri.path).into()),
             UriKind::OpenEditors => Ok(self.render_open_editors().into()),
-            UriKind::Symbols => self.serve_symbols(&uri.path),
-            UriKind::Definitions | UriKind::References => Err(HEADLESS_LSP.to_string().into()),
+            UriKind::Diagnostics
+            | UriKind::Symbols
+            | UriKind::Definitions
+            | UriKind::References => Err(HEADLESS_LSP.to_string().into()),
             UriKind::Unknown(kind) => Err(format!("unknown cedian:// kind: {kind}").into()),
         }
     }
-    /// Attach a live LSP bridge (S1). Replaces any previous bridge.
-    /// Also syncs every currently-open buffer into the server.
-    pub fn attach_lsp(&self, bridge: Arc<crate::LspBridge>) {
-        // Snapshot under one short lock: a guard in a `for` head lives for the
-        // whole loop, so re-locking inside it would deadlock (parking_lot is
-        // not reentrant).
-        let open: Vec<(PathBuf, String)> = {
-            let store = self.store.lock();
-            store
-                .open_paths()
-                .into_iter()
-                .filter_map(|key| store.read(&key).map(|(text, _)| (key, text)))
-                .collect()
-        };
-        for (key, text) in open {
-            let local = self.workdir.join(key.strip_prefix("/").unwrap_or(&key));
-            bridge.sync_buffer(&local, &text);
-        }
-        *self.lsp.lock() = Some(bridge);
-    }
-
-    /// Serve `cedian://symbols/...`: `file/<path>` → document symbols,
-    /// anything else → workspace search. No bridge → visible error (never
-    /// silent empty — the caller must attach LSP first).
-    fn serve_symbols(&self, path: &str) -> Result<omp_rpc::HostUriRead, omp_rpc::HostUriError> {
-        let bridge = self
-            .lsp
-            .lock()
-            .clone()
-            .ok_or_else(|| -> omp_rpc::HostUriError {
-                "no LSP bridge attached (attach_lsp first)"
-                    .to_string()
-                    .into()
-            })?;
-        if let Some(file) = path.strip_prefix("file/") {
-            let key = self
-                .resolve(Path::new(file))
-                .map_err(|e| -> omp_rpc::HostUriError { e.into() })?;
-            let local = self.workdir.join(key.strip_prefix("/").unwrap_or(&key));
-            let symbols = bridge
-                .document_symbols(&local)
-                .map_err(|e| -> omp_rpc::HostUriError { e.to_string().into() })?;
-            return Ok(crate::lsp_bridge::render_workspace_symbols(&symbols).into());
-        }
-        let symbols = bridge
-            .workspace_symbols(path)
-            .map_err(|e| -> omp_rpc::HostUriError { e.to_string().into() })?;
-        Ok(crate::lsp_bridge::render_workspace_symbols(&symbols).into())
-    }
-
     /// Publish diagnostics for a buffer (fork: LSP publishDiagnostics lands here).
     pub fn publish_diagnostics(&self, path: &Path, diagnostics: Vec<Diagnostic>) {
         self.diagnostics
@@ -435,7 +383,7 @@ impl HostTools {
     /// Render `cedian://diagnostics[/path]`: `severity path:line message` lines.
     /// Empty path = all buffers. Empty output = no diagnostics (not an error).
     /// Path matches with or without a leading `/` (URI paths strip it).
-    fn render_diagnostics(&self, path: &str) -> String {
+    pub fn render_diagnostics(&self, path: &str) -> String {
         let all = self.diagnostics.lock();
         let mut lines = Vec::new();
         for (buf, diags) in all.iter() {
@@ -589,9 +537,9 @@ mod tests {
         assert_eq!(serve(UriKind::Buffer, "/a.rs"), "hello\nworld\n");
         assert!(serve(UriKind::Selection, "").contains("/a.rs:0-5"));
         assert_eq!(serve(UriKind::ActiveFile, ""), "/a.rs");
-        assert!(serve(UriKind::Diagnostics, "").contains("warning /a.rs:1 unused"));
-        assert!(serve(UriKind::Diagnostics, "a.rs").contains("unused"));
-        assert!(!serve(UriKind::Diagnostics, "b.rs").contains("unused"));
+        assert!(h.render_diagnostics("").contains("warning /a.rs:1 unused"));
+        assert!(h.render_diagnostics("a.rs").contains("unused"));
+        assert!(!h.render_diagnostics("b.rs").contains("unused"));
         let editors = serve(UriKind::OpenEditors, "");
         assert!(editors.contains("/a.rs") && editors.contains("/b.rs"));
         // Unknown kind: visible error, never silent empty.
@@ -603,7 +551,12 @@ mod tests {
             .is_err()
         );
         // Code intelligence is the app's (Zed's language servers).
-        for kind in [UriKind::Definitions, UriKind::References] {
+        for kind in [
+            UriKind::Diagnostics,
+            UriKind::Symbols,
+            UriKind::Definitions,
+            UriKind::References,
+        ] {
             let e = h
                 .serve_uri(&CedianUri {
                     kind,

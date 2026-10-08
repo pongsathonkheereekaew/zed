@@ -1,6 +1,6 @@
 //! Sync CDP client: id-multiplexed `call` + event pump (S4 Task 2).
 //!
-//! Blocking API like `cedian_lsp`/`cedian_dap`: one in-flight call at a
+//! Blocking API: one in-flight call at a
 //! time, a 100ms socket-read-timeout retry loop to the call deadline, and
 //! `Page.frameNavigated` / `Page.loadEventFired` notifications pumped into
 //! an event queue while waiting. Unknown notification methods are ignored.

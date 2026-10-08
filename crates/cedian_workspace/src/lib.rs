@@ -14,13 +14,11 @@
 pub mod ambient;
 pub mod buffer;
 pub mod host;
-pub mod lsp_bridge;
 pub mod service;
 pub mod uri;
 
 pub use ambient::{AmbientSnapshot, capture_ambient, render_snapshot};
 pub use buffer::{ApplyEditResult, BufferStore, TextEdit, parse_version_token, version_token};
 pub use host::{APPLY_EDIT_TOOL, Diagnostic, DiagnosticSeverity, HostTools, WorkspaceHost};
-pub use lsp_bridge::{LspBridge, LspBridgeError, render_workspace_symbols};
 pub use service::{HostService, ServiceId};
 pub use uri::{CedianUri, UriKind, parse_cedian_uri};

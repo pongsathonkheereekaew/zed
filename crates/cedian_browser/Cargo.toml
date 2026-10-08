@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 # S4: cedian-owned headless Chromium over CDP (plan Phase 9 + 11).
-# Blocking API like cedian_lsp/cedian_dap; GPUI binding lands at S9.
+# Blocking API; GPUI binding lands at S9.
 
 [dependencies]
 tungstenite = "0.26"

@@ -5,7 +5,7 @@
 //! re-capture).
 //!
 //! Notes: R1 user-input-preempts is a GPUI concern, deferred to the S9
-//! binding. Blocking/sync API like `cedian_lsp`/`cedian_dap`; never spawn
+//! binding. Blocking/sync API; never spawn
 //! threads inside gate evaluation. S9 handoff: this crate dies at the GPUI
 //! binding, which takes over process ownership.
 #![allow(

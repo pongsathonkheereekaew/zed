@@ -160,7 +160,8 @@ pub struct SpawnPolicy {
     pub sandbox: Option<crate::sandbox::ReviewerLayout>,
     /// The app's browser endpoint (ADR-0049): OMP attaches there instead of
     /// launching its own browser or relaying the person's Chrome, under every
-    /// approvals source. Must be `http://127.0.0.1:<port>`.
+    /// approvals source but the reviewer's, whose tool set has no browser
+    /// (ADR-0043). Must be `http://127.0.0.1:<port>`.
     pub browser_cdp_url: Option<String>,
 }
 
@@ -277,7 +278,9 @@ impl SpawnPolicy {
             Approvals::Omp if patterns.is_empty() => json!({"tools": {"approval": approval}}),
             Approvals::Omp => json!({"tools": {"approval": approval}, "bash": bash}),
         };
-        if let Some(url) = &self.browser_cdp_url {
+        if self.approvals == Approvals::Reviewer {
+            overlay["browser"] = json!({"relay": false});
+        } else if let Some(url) = &self.browser_cdp_url {
             check_browser_url(url)?;
             overlay["browser"] = json!({"cdpUrl": url, "relay": false});
         }
@@ -767,13 +770,19 @@ mod tests {
     }
 
     #[test]
-    fn overlay_points_omp_at_the_apps_browser_under_every_policy() {
+    fn overlay_points_omp_at_the_apps_browser_under_every_policy_but_the_reviewers() {
         let url = "http://127.0.0.1:43123";
-        for approvals in [
-            Approvals::Cedian(ApprovalMode::Write),
-            Approvals::Omp,
-            Approvals::Reviewer,
-        ] {
+        let reviewer = SpawnPolicy {
+            approvals: Approvals::Reviewer,
+            browser_cdp_url: Some(url.to_string()),
+            ..SpawnPolicy::default()
+        };
+        assert_eq!(
+            reviewer.overlay().unwrap()["browser"],
+            json!({"relay": false}),
+            "the reviewer gets no browser (ADR-0043) and no relay"
+        );
+        for approvals in [Approvals::Cedian(ApprovalMode::Write), Approvals::Omp] {
             let policy = SpawnPolicy {
                 approvals,
                 browser_cdp_url: Some(url.to_string()),

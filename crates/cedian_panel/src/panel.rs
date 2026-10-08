@@ -26,7 +26,7 @@ use crate::review::{ReviewError, TaskReview};
 use cedian_agent::Thread;
 use cedian_omp::{RouterEvent, UserAnswer};
 use cedian_review::{HunkKey, HunkStatus};
-use cedian_workspace::{capture_ambient, render_snapshot};
+use cedian_workspace::{CedianUri, UriKind, capture_ambient, render_snapshot};
 use collections::{HashMap, HashSet, IndexMap};
 use editor::{Editor, actions::Paste};
 use futures::{StreamExt, channel::mpsc};
@@ -473,12 +473,18 @@ impl CedianPanel {
 
     /// Answer one `cedian://` read from what Zed holds now.
     fn read_context(&self, url: &str, cx: &mut Context<Self>) -> Task<Result<HostUriRead, String>> {
-        Task::ready(
-            match context::host(self.workspace.as_ref(), &self.project, cx) {
-                Some(host) => host.read_uri(url).map_err(|e| e.to_string()),
-                None => Err("no folder is open".to_string()),
-            },
-        )
+        let Some(host) = context::host(self.workspace.as_ref(), &self.project, cx) else {
+            return Task::ready(Err("no folder is open".to_string()));
+        };
+        match cedian_workspace::parse_cedian_uri(url) {
+            Ok(
+                uri @ CedianUri {
+                    kind: UriKind::Definitions | UriKind::References | UriKind::Symbols,
+                    ..
+                },
+            ) => context::lsp_read(&host, &self.project, &uri, cx),
+            _ => Task::ready(host.read_uri(url).map_err(|e| e.to_string())),
+        }
     }
 
     /// The prompt as OMP gets it: the bounded snapshot of what the person

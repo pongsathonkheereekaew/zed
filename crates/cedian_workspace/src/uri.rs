@@ -21,6 +21,12 @@ pub enum UriKind {
     /// LSP symbols: `cedian://symbols/<query>` (workspace) or
     /// `cedian://symbols/file/<path>` (document). Served by the LSP bridge.
     Symbols,
+    /// `cedian://definitions/<path>:<line>:<column>` (0-based, as LSP):
+    /// where the symbol there is defined. Served by the app (ADR-0048).
+    Definitions,
+    /// `cedian://references/<path>:<line>:<column>` (0-based, as LSP):
+    /// every use of the symbol there. Served by the app (ADR-0048).
+    References,
     Unknown(String),
 }
 
@@ -34,6 +40,8 @@ impl UriKind {
             "diagnostics" => Self::Diagnostics,
             "open-editors" => Self::OpenEditors,
             "symbols" => Self::Symbols,
+            "definitions" => Self::Definitions,
+            "references" => Self::References,
             other => Self::Unknown(other.to_string()),
         }
     }

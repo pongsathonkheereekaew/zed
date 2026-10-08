@@ -20,6 +20,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// What a code-intelligence read answers without Zed's project.
+pub const HEADLESS_LSP: &str = "served by the cedian app from Zed's language servers; \
+     headless, use OMP's own lsp tool";
+
 /// Name of the host edit tool (also allow-listed in the OMP spawn overlay).
 pub const APPLY_EDIT_TOOL: &str = "cedian_apply_edit";
 /// Normalize any key-shaped path to canonical `/rel` form (leading `/`
@@ -340,6 +344,7 @@ impl HostTools {
             UriKind::Diagnostics => Ok(self.render_diagnostics(&uri.path).into()),
             UriKind::OpenEditors => Ok(self.render_open_editors().into()),
             UriKind::Symbols => self.serve_symbols(&uri.path),
+            UriKind::Definitions | UriKind::References => Err(HEADLESS_LSP.to_string().into()),
             UriKind::Unknown(kind) => Err(format!("unknown cedian:// kind: {kind}").into()),
         }
     }
@@ -597,6 +602,16 @@ mod tests {
             })
             .is_err()
         );
+        // Code intelligence is the app's (Zed's language servers).
+        for kind in [UriKind::Definitions, UriKind::References] {
+            let e = h
+                .serve_uri(&CedianUri {
+                    kind,
+                    path: "a.rs:0:0".into(),
+                })
+                .unwrap_err();
+            assert!(e.to_string().contains("OMP's own lsp tool"), "{e}");
+        }
         // Missing buffer: visible error.
         assert!(
             h.serve_uri(&CedianUri {

@@ -111,6 +111,12 @@ impl std::fmt::Display for ReviewEvent {
         match self {
             Self::TurnReverted {
                 turn,
+                reverted: 0,
+                stale: 0,
+                overwritten: 0,
+            } => write!(f, "turn {turn}: nothing to do"),
+            Self::TurnReverted {
+                turn,
                 reverted,
                 stale,
                 overwritten,
@@ -368,7 +374,8 @@ impl FileReview {
     /// What reverting turn `n` does to this buffer: the turn's changes are
     /// the line hunks between its start snapshot and the next turn's (or
     /// now). Each maps to current offsets through the later edits, unless a
-    /// later edit touches it (`overwritten`) or a user edit does (`stale`).
+    /// later edit touches it (`overwritten`, or nothing to do when that edit
+    /// put the turn's start text back) or a user edit does (`stale`).
     fn turn_revert(&self, n: u32, cx: &App) -> TurnRevert {
         let mut plan = TurnRevert::default();
         let Some(i) = self.turn_starts.iter().position(|(t, _)| *t == n) else {
@@ -409,8 +416,11 @@ impl FileReview {
             if old_text == new_text {
                 continue;
             }
-            if later.iter().any(|(old, _)| touches(&new, old)) {
-                plan.overwritten += 1;
+            if let Some((later_old, later_new)) = later.iter().find(|(old, _)| touches(&new, old)) {
+                let current: String = snapshot.text_for_range(later_new.clone()).collect();
+                if *later_old != new || current != old_text {
+                    plan.overwritten += 1;
+                }
                 continue;
             }
             let delta: i64 = later
@@ -852,6 +862,7 @@ impl TaskReview {
             .find(|(t, _)| *t == n)
             .map(|(_, k)| k.clone())
             .ok_or(ReviewError::NoTurn { turn: n })?;
+        let next = self.turns.last().map_or(1, |(n, _)| n + 1);
         let (reverted, stale, overwritten, transactions) = match kind {
             TurnKind::Revert { transactions, .. } => {
                 let mut undone = 0;
@@ -902,6 +913,10 @@ impl TaskReview {
                             (range.clone(), text.len(), calls)
                         })
                         .collect();
+                    // The revert closes the reverted turn's window: a later
+                    // turn's revert must not include this one's restore.
+                    let before = file.buffer.read(cx).text_snapshot();
+                    file.turn_starts.push((next, before));
                     let txn = restore(&file.buffer, plan.edits, cx);
                     let snapshot = file.buffer.read(cx).text_snapshot();
                     let mut delta: i64 = 0;
@@ -926,7 +941,6 @@ impl TaskReview {
                 (reverted, stale, overwritten, transactions)
             }
         };
-        let next = self.turns.last().map_or(1, |(n, _)| n + 1);
         self.turns.push((
             next,
             TurnKind::Revert {
@@ -1291,6 +1305,56 @@ mod tests {
             event.to_string().contains("changed again by a later turn"),
             "{event}"
         );
+    }
+
+    /// A revert closes the reverted turn's window: reverting turn 2 after
+    /// turn 1 was reverted does not put turn 1's text back.
+    #[gpui::test]
+    async fn reverting_a_later_turn_does_not_reapply_an_earlier_reverted_one(
+        cx: &mut TestAppContext,
+    ) {
+        let mut f = setup(cx).await;
+        agent_writes(&mut f, "c1", "ALPHA\nbeta\ngamma\n", cx).await;
+        f.review.begin_turn();
+        agent_writes(&mut f, "c2", "ALPHA\nbeta\nGAMMA\n", cx).await;
+        f.review.end_turn();
+        cx.update(|cx| f.review.revert_turn(1, cx)).unwrap();
+        assert_eq!(text(&f, cx), "alpha\nbeta\nGAMMA\n");
+        let event = cx.update(|cx| f.review.revert_turn(2, cx)).unwrap();
+        assert_eq!(
+            event,
+            ReviewEvent::TurnReverted {
+                turn: 2,
+                reverted: 1,
+                stale: 0,
+                overwritten: 0,
+            }
+        );
+        assert_eq!(
+            text(&f, cx),
+            ORIGINAL,
+            "line 1 stays reverted, line 3 is back"
+        );
+    }
+
+    #[gpui::test]
+    async fn reverting_a_turn_twice_is_nothing_to_do(cx: &mut TestAppContext) {
+        let mut f = setup(cx).await;
+        agent_writes(&mut f, "c1", "ALPHA\nbeta\ngamma\n", cx).await;
+        f.review.end_turn();
+        cx.update(|cx| f.review.revert_turn(1, cx)).unwrap();
+        let event = cx.update(|cx| f.review.revert_turn(1, cx)).unwrap();
+        assert_eq!(
+            event,
+            ReviewEvent::TurnReverted {
+                turn: 1,
+                reverted: 0,
+                stale: 0,
+                overwritten: 0,
+            }
+        );
+        assert_eq!(event.to_string(), "turn 1: nothing to do");
+        assert_eq!(text(&f, cx), ORIGINAL);
     }
 
     #[gpui::test]

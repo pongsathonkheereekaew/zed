@@ -15,6 +15,8 @@ type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
 pub struct Notification {
     pub method: String,
     pub params: Value,
+    /// The flat session it came from; `None` for the browser target.
+    pub session: Option<String>,
 }
 
 pub struct CdpClient {
@@ -37,16 +39,31 @@ impl CdpClient {
         })
     }
 
-    /// Send `method` and wait up to `timeout` for its result.
+    /// Send `method` to the browser target and wait up to `timeout`.
     pub fn call(
         &mut self,
         method: &str,
         params: Value,
         timeout: Duration,
     ) -> Result<Value, String> {
+        self.call_in(None, method, params, timeout)
+    }
+
+    /// Send `method` on flat `session` (or the browser target) and wait up to
+    /// `timeout` for its result.
+    pub fn call_in(
+        &mut self,
+        session: Option<&str>,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
         let id = self.next_id;
         self.next_id += 1;
-        let request = json!({"id": id, "method": method, "params": params});
+        let mut request = json!({"id": id, "method": method, "params": params});
+        if let Some(session) = session {
+            request["sessionId"] = json!(session);
+        }
         self.socket
             .send(Message::Text(request.to_string().into()))
             .map_err(|e| format!("cdp send: {e}"))?;
@@ -85,6 +102,10 @@ impl CdpClient {
             self.pending.push(Notification {
                 method: method.to_string(),
                 params: message.get("params").cloned().unwrap_or(Value::Null),
+                session: message
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
             });
         }
     }

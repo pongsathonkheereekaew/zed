@@ -1,10 +1,13 @@
 //! A stand-in Chromium for hermetic tests: a process that writes
 //! `DevToolsActivePort` into its `--user-data-dir` and answers CDP discovery
-//! and the CDP methods cedian and a Puppeteer-style client use, with one
-//! page whose navigations emit `Page.frameNavigated`, a console line and a
-//! network exchange. `Fake.personInput` stands in for the person clicking
-//! in the window; any `Input.*` command fires the page's input listener too,
-//! as real CDP input does.
+//! and the CDP methods cedian and a Puppeteer-style client use. It starts
+//! with one page, `P1`; `Target.createTarget` and `Target.closeTarget` open
+//! and close more, and a browser connection that asked for
+//! `Target.setAutoAttach` gets a flat session on each. A page's navigations
+//! emit `Page.frameNavigated`, a console line and a network exchange.
+//! `Fake.personInput` stands in for the person clicking in the window, and
+//! `Fake.childNavigate` for a child frame navigating; any `Input.*` command
+//! fires the page's input listener too, as real CDP input does.
 
 use base64::Engine as _;
 use parking_lot::Mutex;
@@ -24,11 +27,111 @@ pub const PNG: &[u8] = &[
     0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
 ];
 
-#[derive(Default)]
 struct Page {
     url: String,
-    listeners: Vec<mpsc::Sender<String>>,
+    frame: String,
+}
+
+/// Who an event goes to: a page socket, or a flat session on a browser
+/// socket.
+struct Listener {
+    target: String,
+    session: Option<String>,
+    tx: mpsc::Sender<String>,
+}
+
+#[derive(Default)]
+struct Browser {
+    pages: std::collections::BTreeMap<String, Page>,
+    next_page: u64,
+    next_session: u64,
     request: u64,
+    listeners: Vec<Listener>,
+    /// Browser sockets that asked for auto-attach or target discovery.
+    auto_attach: Vec<mpsc::Sender<String>>,
+    discover: Vec<mpsc::Sender<String>>,
+}
+
+impl Browser {
+    fn open_page(&mut self, url: &str) -> String {
+        self.next_page += 1;
+        let id = format!("P{}", self.next_page);
+        self.pages.insert(
+            id.clone(),
+            Page {
+                url: url.to_string(),
+                frame: format!("F{}", self.next_page),
+            },
+        );
+        let info = json!({"targetId": id, "type": "page", "url": url});
+        let created = event(None, "Target.targetCreated", json!({"targetInfo": info}));
+        self.discover.retain(|tx| tx.send(created.clone()).is_ok());
+        for tx in self.auto_attach.clone() {
+            self.attach(&id, tx);
+        }
+        id
+    }
+
+    fn attach(&mut self, target: &str, tx: mpsc::Sender<String>) {
+        self.next_session += 1;
+        let session = format!("S{}", self.next_session);
+        let url = self
+            .pages
+            .get(target)
+            .map(|p| p.url.clone())
+            .unwrap_or_default();
+        let _ = tx.send(event(
+            None,
+            "Target.attachedToTarget",
+            json!({
+                "sessionId": session,
+                "targetInfo": {"targetId": target, "type": "page", "url": url},
+                "waitingForDebugger": false,
+            }),
+        ));
+        self.listeners.push(Listener {
+            target: target.to_string(),
+            session: Some(session),
+            tx,
+        });
+    }
+
+    fn close_page(&mut self, target: &str) {
+        self.pages.remove(target);
+        let mut kept = Vec::new();
+        for l in self.listeners.drain(..) {
+            if l.target != target {
+                kept.push(l);
+            } else if let Some(session) = &l.session {
+                let _ = l.tx.send(event(
+                    None,
+                    "Target.detachedFromTarget",
+                    json!({"sessionId": session, "targetId": target}),
+                ));
+            }
+        }
+        self.listeners = kept;
+        let destroyed = event(None, "Target.targetDestroyed", json!({"targetId": target}));
+        self.discover
+            .retain(|tx| tx.send(destroyed.clone()).is_ok());
+    }
+
+    fn broadcast(&mut self, target: &str, method: &str, params: Value) {
+        self.listeners.retain(|l| {
+            l.target != target
+                || l.tx
+                    .send(event(l.session.as_deref(), method, params.clone()))
+                    .is_ok()
+        });
+    }
+}
+
+fn event(session: Option<&str>, method: &str, params: Value) -> String {
+    let mut event = json!({"method": method, "params": params});
+    if let Some(session) = session {
+        event["sessionId"] = json!(session);
+    }
+    event.to_string()
 }
 
 /// Whether `args` are a browser launch rather than a test run.
@@ -49,43 +152,50 @@ pub fn run(args: &[String]) -> i32 {
         format!("{port}\n/devtools/browser/fake\n"),
     )
     .expect("DevToolsActivePort");
-    let page = Arc::new(Mutex::new(Page {
-        url: "about:blank".to_string(),
-        ..Page::default()
-    }));
+    let browser = Arc::new(Mutex::new(Browser::default()));
+    browser.lock().open_page("about:blank");
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        let page = page.clone();
+        let browser = browser.clone();
         std::thread::spawn(move || {
-            let _ = connection(stream, port, &page);
+            let _ = connection(stream, port, &browser);
         });
     }
     0
 }
 
-fn connection(stream: TcpStream, port: u16, page: &Arc<Mutex<Page>>) -> Result<(), String> {
+fn connection(stream: TcpStream, port: u16, browser: &Arc<Mutex<Browser>>) -> Result<(), String> {
     let mut buf = [0u8; 4096];
     let n = stream.peek(&mut buf).map_err(|e| e.to_string())?;
-    let head = String::from_utf8_lossy(&buf[..n]).to_lowercase();
-    if head.contains("upgrade: websocket") {
-        return websocket(stream, page);
+    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+    let path = head.split_whitespace().nth(1).unwrap_or("/").to_string();
+    if head.to_lowercase().contains("upgrade: websocket") {
+        let target = path.strip_prefix("/devtools/page/").map(str::to_string);
+        return websocket(stream, target, browser);
     }
     let mut stream = stream;
-    let n = stream.read(&mut buf).map_err(|e| e.to_string())?;
-    let head = String::from_utf8_lossy(&buf[..n]);
-    let path = head.split_whitespace().nth(1).unwrap_or("/");
+    stream.read(&mut buf).map_err(|e| e.to_string())?;
     let ws = format!("ws://127.0.0.1:{port}");
-    let body = match path {
+    let body = match path.as_str() {
         "/json/version" => json!({
             "Browser": "FakeChromium/1",
             "webSocketDebuggerUrl": format!("{ws}/devtools/browser/fake"),
         }),
-        "/json/list" | "/json" => json!([{
-            "id": "P1",
-            "type": "page",
-            "url": page.lock().url,
-            "webSocketDebuggerUrl": format!("{ws}/devtools/page/P1"),
-        }]),
+        "/json/list" | "/json" => Value::Array(
+            browser
+                .lock()
+                .pages
+                .iter()
+                .map(|(id, page)| {
+                    json!({
+                        "id": id,
+                        "type": "page",
+                        "url": page.url,
+                        "webSocketDebuggerUrl": format!("{ws}/devtools/page/{id}"),
+                    })
+                })
+                .collect(),
+        ),
         _ => json!({}),
     }
     .to_string();
@@ -98,20 +208,47 @@ fn connection(stream: TcpStream, port: u16, page: &Arc<Mutex<Page>>) -> Result<(
         .map_err(|e| e.to_string())
 }
 
-fn websocket(stream: TcpStream, page: &Arc<Mutex<Page>>) -> Result<(), String> {
+/// A page socket (`target` set) or the browser socket.
+fn websocket(
+    stream: TcpStream,
+    target: Option<String>,
+    browser: &Arc<Mutex<Browser>>,
+) -> Result<(), String> {
     let mut socket = tungstenite::accept(stream).map_err(|e| e.to_string())?;
     socket
         .get_ref()
         .set_read_timeout(Some(Duration::from_millis(5)))
         .map_err(|e| e.to_string())?;
     let (tx, rx) = mpsc::channel();
-    page.lock().listeners.push(tx);
+    if let Some(target) = &target {
+        browser.lock().listeners.push(Listener {
+            target: target.clone(),
+            session: None,
+            tx: tx.clone(),
+        });
+    }
     loop {
         match socket.read() {
             Ok(Message::Text(text)) => {
                 let request: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-                let result = answer(&request, page);
-                let reply = json!({"id": request["id"], "result": result});
+                let session = request["sessionId"].as_str().map(str::to_string);
+                let page = match &session {
+                    Some(session) => browser
+                        .lock()
+                        .listeners
+                        .iter()
+                        .find(|l| l.session.as_deref() == Some(session))
+                        .map(|l| l.target.clone()),
+                    None => target.clone(),
+                };
+                let result = match page {
+                    Some(page) => answer_page(&request, &page, browser),
+                    None => answer_browser(&request, browser, &tx),
+                };
+                let mut reply = json!({"id": request["id"], "result": result});
+                if let Some(session) = session {
+                    reply["sessionId"] = json!(session);
+                }
                 socket
                     .send(Message::Text(reply.to_string().into()))
                     .map_err(|e| e.to_string())?;
@@ -130,6 +267,38 @@ fn websocket(stream: TcpStream, page: &Arc<Mutex<Page>>) -> Result<(), String> {
     }
 }
 
+fn answer_browser(
+    request: &Value,
+    browser: &Arc<Mutex<Browser>>,
+    tx: &mpsc::Sender<String>,
+) -> Value {
+    let params = &request["params"];
+    let mut browser = browser.lock();
+    match request["method"].as_str().unwrap_or_default() {
+        "Target.setDiscoverTargets" => {
+            browser.discover.push(tx.clone());
+            json!({})
+        }
+        "Target.setAutoAttach" => {
+            browser.auto_attach.push(tx.clone());
+            let pages: Vec<String> = browser.pages.keys().cloned().collect();
+            for page in pages {
+                browser.attach(&page, tx.clone());
+            }
+            json!({})
+        }
+        "Target.createTarget" => {
+            let id = browser.open_page(params["url"].as_str().unwrap_or("about:blank"));
+            json!({"targetId": id})
+        }
+        "Target.closeTarget" => {
+            browser.close_page(params["targetId"].as_str().unwrap_or_default());
+            json!({"success": true})
+        }
+        _ => json!({}),
+    }
+}
+
 fn input_payload() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -139,61 +308,62 @@ fn input_payload() -> String {
     json!({"type": "pointerdown", "time": now}).to_string()
 }
 
-fn broadcast(page: &mut Page, method: &str, params: Value) {
-    let event = json!({"method": method, "params": params}).to_string();
-    page.listeners.retain(|l| l.send(event.clone()).is_ok());
-}
-
-fn answer(request: &Value, page: &Arc<Mutex<Page>>) -> Value {
+fn answer_page(request: &Value, target: &str, browser: &Arc<Mutex<Browser>>) -> Value {
     let params = &request["params"];
-    let mut page = page.lock();
+    let mut browser = browser.lock();
+    let Some(page) = browser.pages.get(target) else {
+        return json!({});
+    };
+    let (url_now, frame) = (page.url.clone(), page.frame.clone());
     match request["method"].as_str().unwrap_or_default() {
         "Page.navigate" => {
             let url = params["url"].as_str().unwrap_or_default().to_string();
-            page.url = url.clone();
-            page.request += 1;
-            let id = page.request.to_string();
-            broadcast(
-                &mut page,
+            if let Some(page) = browser.pages.get_mut(target) {
+                page.url = url.clone();
+            }
+            browser.request += 1;
+            let id = browser.request.to_string();
+            browser.broadcast(
+                target,
                 "Network.requestWillBeSent",
                 json!({"requestId": id, "request": {"method": "GET", "url": url}}),
             );
-            broadcast(
-                &mut page,
+            browser.broadcast(
+                target,
                 "Page.frameNavigated",
-                json!({"frame": {"id": "F1", "url": url}}),
+                json!({"frame": {"id": frame, "url": url}}),
             );
-            broadcast(
-                &mut page,
+            browser.broadcast(
+                target,
                 "Network.responseReceived",
                 json!({"requestId": id, "response": {"url": url, "status": 200}}),
             );
-            broadcast(
-                &mut page,
+            browser.broadcast(
+                target,
                 "Runtime.consoleAPICalled",
                 json!({"type": "log", "args": [{"type": "string", "value": format!("loaded {url}")}]}),
             );
-            json!({"frameId": "F1"})
+            json!({"frameId": frame})
         }
-        "Page.getFrameTree" => json!({"frameTree": {"frame": {"id": "F1", "url": page.url}}}),
+        "Fake.childNavigate" => {
+            browser.broadcast(
+                target,
+                "Page.frameNavigated",
+                json!({"frame": {"id": format!("{frame}-child"), "parentId": frame, "url": params["url"]}}),
+            );
+            json!({})
+        }
+        "Page.getFrameTree" => json!({"frameTree": {"frame": {"id": frame, "url": url_now}}}),
         "Page.captureScreenshot" => {
             json!({"data": base64::engine::general_purpose::STANDARD.encode(PNG)})
         }
         "Runtime.evaluate" => {
-            let html = format!("<html><body>{}</body></html>", page.url);
-            json!({"result": {"type": "object", "value": {"url": page.url, "title": "fake", "html": html}}})
+            let html = format!("<html><body>{url_now}</body></html>");
+            json!({"result": {"type": "object", "value": {"url": url_now, "title": "fake", "html": html}}})
         }
-        "Fake.personInput" => {
-            broadcast(
-                &mut page,
-                "Runtime.bindingCalled",
-                json!({"name": "cedianInput", "payload": input_payload()}),
-            );
-            json!({})
-        }
-        method if method.starts_with("Input.") => {
-            broadcast(
-                &mut page,
+        method if method == "Fake.personInput" || method.starts_with("Input.") => {
+            browser.broadcast(
+                target,
                 "Runtime.bindingCalled",
                 json!({"name": "cedianInput", "payload": input_payload()}),
             );

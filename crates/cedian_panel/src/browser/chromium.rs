@@ -47,6 +47,12 @@ impl Chromium {
     }
 }
 
+impl Chromium {
+    pub fn exited(&mut self) -> bool {
+        !matches!(self.child.try_wait(), Ok(None))
+    }
+}
+
 impl Drop for Chromium {
     fn drop(&mut self) {
         let _ = self.child.kill();

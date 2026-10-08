@@ -73,6 +73,7 @@ fn main() {
     run("frames_are_bound_to_the_browser", || {
         frames_are_bound_to_the_browser(&root)
     });
+    run("every_tab_is_followed", || every_tab_is_followed(&root));
     run("the_persons_input_wins", || the_persons_input_wins(&root));
     run("the_person_preempts_continuous_agent_input", || {
         the_person_preempts_continuous_agent_input(&root)
@@ -322,6 +323,74 @@ fn frames_are_bound_to_the_browser(root: &std::path::Path) {
     let both = gate.evaluate(&[on_a, on_b], &now);
     assert_eq!(both.status, GateStatus::Passed, "{}", both.reason);
     assert_eq!(both.deciding, ["shot-b"]);
+}
+
+fn every_tab_is_followed(root: &std::path::Path) {
+    let host = BrowserHost::open(root.join("tabs-profile"), exe(), || {}).unwrap();
+    let version: Value = serde_json::from_str(&get(&host.url(), "/json/version").unwrap()).unwrap();
+    let (mut browser, _) =
+        tungstenite::connect(version["webSocketDebuggerUrl"].as_str().unwrap()).unwrap();
+    let created = call(
+        &mut browser,
+        "Target.createTarget",
+        json!({"url": "about:blank"}),
+    );
+    let second = created["targetId"].as_str().unwrap().to_string();
+    let list: Value = serde_json::from_str(&get(&host.url(), "/json/list").unwrap()).unwrap();
+    let ws_of = |id: &str| {
+        list.as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == id)
+            .and_then(|t| t["webSocketDebuggerUrl"].as_str())
+            .unwrap()
+            .to_string()
+    };
+    let (mut tab2, _) = tungstenite::connect(ws_of(&second)).unwrap();
+    let seq = host.state().seq;
+    call(
+        &mut tab2,
+        "Page.navigate",
+        json!({"url": "https://two.test/"}),
+    );
+    wait_until("a navigation in the new tab advances the sequence", || {
+        host.state().seq == seq + 1
+    });
+    assert_eq!(host.state().url, "https://two.test/");
+
+    call(
+        &mut tab2,
+        "Fake.childNavigate",
+        json!({"url": "https://ad.test/"}),
+    );
+    let (mut first, _) = tungstenite::connect(ws_of("P1")).unwrap();
+    call(
+        &mut first,
+        "Page.navigate",
+        json!({"url": "https://one.test/"}),
+    );
+    wait_until("the first tab's navigation", || host.state().seq == seq + 2);
+    assert_eq!(
+        host.state().url,
+        "https://one.test/",
+        "a child frame does not advance the sequence; the first tab's main frame does"
+    );
+
+    call(
+        &mut browser,
+        "Target.closeTarget",
+        json!({"targetId": "P1"}),
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        host.state().running,
+        "closing a tab keeps the browser running"
+    );
+    let capture = host.capture().unwrap();
+    assert_eq!(
+        capture.url, "https://two.test/",
+        "captures re-point to the open tab"
+    );
 }
 
 fn send(socket: &mut tungstenite::WebSocket<impl Read + Write>, id: u64, method: &str) {

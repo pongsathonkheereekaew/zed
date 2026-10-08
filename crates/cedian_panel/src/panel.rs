@@ -21,7 +21,7 @@ use crate::dialogs::OpenDialog;
 use crate::import::{self, ImportOutcome, Mark};
 use crate::omp_link::{AnswerError, LaunchSpec, LinkEvent, OmpLink, Prompt};
 use crate::omp_settings::OmpSettings;
-use crate::review::{ReviewError, ReviewEvent, TaskReview};
+use crate::review::{ReviewError, TaskReview};
 use cedian_agent::Thread;
 use cedian_omp::{RouterEvent, UserAnswer};
 use cedian_review::HunkStatus;
@@ -316,16 +316,7 @@ impl CedianPanel {
     /// The Revert turn button: reject every pending hunk the turn made.
     pub fn revert_turn(&mut self, turn: u32, cx: &mut Context<Self>) {
         let result = self.review.revert_turn(turn, cx).map(|event| {
-            if let ReviewEvent::TurnReverted {
-                turn,
-                reverted,
-                stale,
-            } = event
-            {
-                self.notice = Some(format!(
-                    "turn {turn} reverted: {reverted} hunk(s) put back, {stale} STALE kept"
-                ));
-            }
+            self.notice = Some(event.to_string());
         });
         self.report_review(result, cx);
     }
@@ -571,6 +562,7 @@ impl CedianPanel {
             }
             RouterEvent::AgentStart if self.turn == Turn::Queued => self.turn = Turn::Streaming,
             RouterEvent::Settled => {
+                self.review.end_turn();
                 if let Turn::Failed(reason) = std::mem::replace(&mut self.turn, Turn::Idle) {
                     self.notice = Some(format!("turn failed: {reason}"));
                 }
@@ -930,7 +922,7 @@ impl CedianPanel {
                                     .on_click(cx.listener(|this, _, _, cx| this.accept_all(cx))),
                             ),
                     )
-                    .when(turn > 0, |row| {
+                    .when(turn > 0 && self.turn == Turn::Idle, |row| {
                         row.child(
                             div()
                                 .debug_selector(|| "cedian-revert-turn".to_string())
@@ -1464,6 +1456,13 @@ mod tests {
             .unwrap();
     }
 
+    fn settled(f: &Fixture, cx: &mut TestAppContext) {
+        f.window
+            .update(cx, |panel, _, cx| panel.on_event(RouterEvent::Settled, cx))
+            .unwrap();
+        cx.run_until_parked();
+    }
+
     fn tool_end(f: &Fixture, cx: &mut TestAppContext, id: &str) {
         let event = RouterEvent::ToolEnd {
             tool_call_id: id.to_string(),
@@ -1640,6 +1639,7 @@ mod tests {
         tool_end(&f, cx, "c1");
         let mut vcx = VisualTestContext::from_window(f.window.into(), cx);
         click(&mut vcx, "cedian-review-toggle");
+        settled(&f, &mut vcx);
         click(&mut vcx, "cedian-revert-turn");
         assert_eq!(buffer.read_with(&vcx, |b, _| b.text()), ORIGINAL);
         let notice = f
@@ -1648,7 +1648,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             notice.as_deref(),
-            Some("turn 1 reverted: 1 hunk(s) put back, 0 STALE kept")
+            Some(
+                "turn 1 reverted: 1 hunk(s) put back, 0 STALE kept, \
+                 0 changed again by a later turn, kept"
+            )
         );
     }
 

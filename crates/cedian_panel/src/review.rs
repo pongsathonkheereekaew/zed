@@ -45,6 +45,10 @@ pub enum ReviewError {
     NoTurn {
         turn: u32,
     },
+    /// The turn is still streaming; revert it once it settles.
+    TurnInFlight {
+        turn: u32,
+    },
 }
 
 impl std::fmt::Display for ReviewError {
@@ -67,6 +71,9 @@ impl std::fmt::Display for ReviewError {
                 path.display()
             ),
             Self::NoTurn { turn } => write!(f, "no turn {turn}"),
+            Self::TurnInFlight { turn } => {
+                write!(f, "turn {turn} is still running; revert it once it settles")
+            }
         }
     }
 }
@@ -92,7 +99,27 @@ pub enum ReviewEvent {
         turn: u32,
         reverted: usize,
         stale: usize,
+        /// Changes a later turn wrote over; they stay (revert that turn first).
+        overwritten: usize,
     },
+}
+
+impl std::fmt::Display for ReviewEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TurnReverted {
+                turn,
+                reverted,
+                stale,
+                overwritten,
+            } => write!(
+                f,
+                "turn {turn} reverted: {reverted} hunk(s) put back, {stale} STALE kept, \
+                 {overwritten} changed again by a later turn, kept"
+            ),
+            other => write!(f, "{other:?}"),
+        }
+    }
 }
 
 /// One agent transaction the task made to a buffer.
@@ -101,6 +128,10 @@ pub struct AgentTxn {
     pub tool_call_id: String,
     pub turn: u32,
     pub transaction: TransactionId,
+    /// For a revert's restore transaction: the part of it that put this
+    /// call's text back (the whole transaction is cedian's, so its own
+    /// edited ranges would attribute nothing).
+    pub restored: Option<Range<Anchor>>,
 }
 
 /// One reviewable change: `old` in baseline offsets, `new` in current ones,
@@ -116,17 +147,17 @@ pub struct ReviewHunk {
     pub status: HunkStatus,
     /// The agent calls whose edits this hunk covers, oldest first.
     pub tool_call_ids: Vec<String>,
+    /// The hunk's identity across rebuilds (baseline rows + text after).
+    pub key: HunkKey,
 }
 
-impl ReviewHunk {
-    fn key(&self, baseline: &text::BufferSnapshot) -> HunkKey {
-        let start = baseline.offset_to_point(self.old.start).row as usize;
-        let end = baseline.offset_to_point(self.old.end).row as usize;
-        HunkKey {
-            before_start: start,
-            before_count: end.saturating_sub(start),
-            after_text: self.new_text.trim_end_matches('\n').to_string(),
-        }
+fn key_of(baseline: &text::BufferSnapshot, old: &Range<usize>, new_text: &str) -> HunkKey {
+    let start = baseline.offset_to_point(old.start).row as usize;
+    let end = baseline.offset_to_point(old.end).row as usize;
+    HunkKey {
+        before_start: start,
+        before_count: end.saturating_sub(start),
+        after_text: new_text.trim_end_matches('\n').to_string(),
     }
 }
 
@@ -141,6 +172,13 @@ pub enum TurnKind {
     },
 }
 
+#[derive(Default)]
+struct TurnRevert {
+    edits: Vec<(Range<usize>, String)>,
+    stale: usize,
+    overwritten: usize,
+}
+
 /// Per-buffer review state.
 pub struct FileReview {
     buffer: Entity<Buffer>,
@@ -153,10 +191,22 @@ pub struct FileReview {
     /// Set when OMP wrote the disk while the buffer had unsaved edits, so
     /// nothing was imported (decision 5).
     stale_import: Option<String>,
-    resolved: HashMap<HunkKey, HunkStatus>,
+    /// Accepted hunks, each with the agent transactions the accept covered;
+    /// a new agent transaction producing the same hunk is a new change to
+    /// review. `None` for a resolution restored from the persisted records.
+    /// A rejected hunk has no resolution: its text is back to the baseline,
+    /// and if it reappears (undo of the reject, an agent retry) it is a
+    /// live hunk again.
+    resolved: HashMap<HunkKey, Option<Vec<TransactionId>>>,
+    /// Hunks a reject put back. One that reappears with the same text is
+    /// the agent's text returning (an undo of the reject), not a user edit.
+    rejected: collections::HashSet<HunkKey>,
     reported_stale: collections::HashSet<HunkKey>,
     hunks: Vec<ReviewHunk>,
     built_at: clock::Global,
+    /// The buffer at each turn's first agent edit to it, so a turn reverts
+    /// to its own start, not to the task baseline.
+    turn_starts: Vec<(u32, text::BufferSnapshot)>,
 }
 
 impl FileReview {
@@ -169,9 +219,11 @@ impl FileReview {
             user_edits: Vec::new(),
             stale_import: None,
             resolved: HashMap::default(),
+            rejected: collections::HashSet::default(),
             reported_stale: collections::HashSet::default(),
             hunks: Vec::new(),
             built_at: clock::Global::new(),
+            turn_starts: Vec::new(),
         }
     }
 
@@ -213,17 +265,17 @@ impl FileReview {
         // A call's edits are attributed by row: a pure deletion is an empty
         // range that sits at a line start, which must not credit the call
         // with the line above it.
-        let agent: Vec<(String, Vec<Range<u32>>)> = self
+        let agent: Vec<(&AgentTxn, Vec<Range<u32>>)> = self
             .agent_txns
             .iter()
             .map(|t| {
-                (
-                    t.tool_call_id.clone(),
-                    buffer
+                let ranges: Vec<Range<usize>> = match &t.restored {
+                    Some(r) => vec![r.start.to_offset(&snapshot)..r.end.to_offset(&snapshot)],
+                    None => buffer
                         .edited_ranges_for_transaction_id::<usize>(t.transaction)
-                        .map(|r| rows_of(&snapshot, &r))
                         .collect(),
-                )
+                };
+                (t, ranges.iter().map(|r| rows_of(&snapshot, r)).collect())
             })
             .collect();
         let mut newly_stale = Vec::new();
@@ -242,38 +294,143 @@ impl FileReview {
                         .offset_to_point(new.end)
                         .row
                         .max(snapshot.offset_to_point(new.start).row + 1);
-                let mut hunk = ReviewHunk {
+                let key = key_of(&self.baseline, &old, &new_text);
+                let calls: Vec<&AgentTxn> = agent
+                    .iter()
+                    .filter(|(_, call_rows)| {
+                        call_rows
+                            .iter()
+                            .any(|r| r.start < rows.end && rows.start < r.end)
+                    })
+                    .map(|(t, _)| *t)
+                    .collect();
+                let accepted = match self.resolved.get(&key) {
+                    Some(None) => true,
+                    Some(Some(txns)) => calls.iter().all(|t| txns.contains(&t.transaction)),
+                    None => false,
+                };
+                if !accepted {
+                    self.resolved.remove(&key);
+                }
+                let status = if accepted {
+                    HunkStatus::Accepted
+                } else if user.iter().any(|r| touches(&new, r)) {
+                    HunkStatus::Stale
+                } else if calls.is_empty() {
+                    HunkStatus::Unattributed
+                } else {
+                    HunkStatus::Pending
+                };
+                if status == HunkStatus::Stale && self.reported_stale.insert(key.clone()) {
+                    newly_stale.push(key.clone());
+                }
+                ReviewHunk {
                     old,
                     new,
                     rows,
                     old_text,
                     new_text,
-                    status: HunkStatus::Pending,
-                    tool_call_ids: Vec::new(),
-                };
-                hunk.tool_call_ids = agent
-                    .iter()
-                    .filter(|(_, rows)| {
-                        rows.iter()
-                            .any(|r| r.start < hunk.rows.end && hunk.rows.start < r.end)
-                    })
-                    .map(|(id, _)| id.clone())
-                    .collect();
-                let key = hunk.key(&self.baseline);
-                hunk.status = match self.resolved.get(&key) {
-                    Some(status) => *status,
-                    None if user.iter().any(|r| touches(&hunk.new, r)) => HunkStatus::Stale,
-                    None if hunk.tool_call_ids.is_empty() => HunkStatus::Unattributed,
-                    None => HunkStatus::Pending,
-                };
-                if hunk.status == HunkStatus::Stale && self.reported_stale.insert(key.clone()) {
-                    newly_stale.push(key);
+                    status,
+                    tool_call_ids: calls.iter().fold(Vec::new(), |mut ids, t| {
+                        if !ids.contains(&t.tool_call_id) {
+                            ids.push(t.tool_call_id.clone());
+                        }
+                        ids
+                    }),
+                    key,
                 }
-                hunk
             })
             .collect();
+        let mut revived: Vec<Range<usize>> = Vec::new();
+        for hunk in &mut self.hunks {
+            if self.rejected.remove(&hunk.key) && hunk.status == HunkStatus::Stale {
+                hunk.status = HunkStatus::Pending;
+                self.reported_stale.remove(&hunk.key);
+                newly_stale.retain(|k| k != &hunk.key);
+                revived.push(hunk.new.clone());
+            }
+        }
+        self.user_edits.retain(|r| {
+            let r = r.start.to_offset(&snapshot)..r.end.to_offset(&snapshot);
+            !revived.iter().any(|h| touches(h, &r))
+        });
         self.built_at = snapshot.version().clone();
         newly_stale
+    }
+
+    /// What reverting turn `n` does to this buffer: the turn's changes are
+    /// the line hunks between its start snapshot and the next turn's (or
+    /// now). Each maps to current offsets through the later edits, unless a
+    /// later edit touches it (`overwritten`) or a user edit does (`stale`).
+    fn turn_revert(&self, n: u32, cx: &App) -> TurnRevert {
+        let mut plan = TurnRevert::default();
+        let Some(i) = self.turn_starts.iter().position(|(t, _)| *t == n) else {
+            return plan;
+        };
+        let start = &self.turn_starts[i].1;
+        let snapshot = self.buffer.read(cx).text_snapshot();
+        let end = self
+            .turn_starts
+            .get(i + 1)
+            .map_or_else(|| snapshot.clone(), |(_, s)| s.clone());
+        let turn_edits: Vec<text::Edit<usize>> = end.edits_since(start.version()).collect();
+        let later_edits: Vec<text::Edit<usize>> = snapshot.edits_since(end.version()).collect();
+        // A later change that left the text as it was (a reverted later
+        // turn) did not write over anything.
+        let later: Vec<(Range<usize>, Range<usize>)> = line_hunks(&end, &snapshot, &later_edits)
+            .into_iter()
+            .filter(|(old, new)| {
+                let before: String = end.text_for_range(old.clone()).collect();
+                let after: String = snapshot.text_for_range(new.clone()).collect();
+                before != after
+            })
+            .collect();
+        let user: Vec<Range<usize>> = self
+            .user_edits
+            .iter()
+            .map(|r| r.start.to_offset(&snapshot)..r.end.to_offset(&snapshot))
+            .collect();
+        let accepted: Vec<Range<usize>> = self
+            .hunks
+            .iter()
+            .filter(|h| h.status == HunkStatus::Accepted)
+            .map(|h| h.new.clone())
+            .collect();
+        for (old, new) in line_hunks(start, &end, &turn_edits) {
+            let old_text: String = start.text_for_range(old.clone()).collect();
+            let new_text: String = end.text_for_range(new.clone()).collect();
+            if old_text == new_text {
+                continue;
+            }
+            if later.iter().any(|(old, _)| touches(&new, old)) {
+                plan.overwritten += 1;
+                continue;
+            }
+            let delta: i64 = later
+                .iter()
+                .filter(|(old, _)| old.end <= new.start)
+                .map(|(old, now)| now.len() as i64 - old.len() as i64)
+                .sum();
+            let now = (new.start as i64 + delta) as usize..(new.end as i64 + delta) as usize;
+            if user.iter().any(|r| touches(&now, r)) {
+                plan.stale += 1;
+                continue;
+            }
+            if accepted.iter().any(|r| touches(&now, r)) {
+                continue;
+            }
+            plan.edits.push((now, old_text));
+        }
+        plan
+    }
+
+    /// The agent transactions behind a hunk's calls.
+    fn txns_of(&self, hunk: &ReviewHunk) -> Vec<TransactionId> {
+        self.agent_txns
+            .iter()
+            .filter(|t| hunk.tool_call_ids.contains(&t.tool_call_id))
+            .map(|t| t.transaction)
+            .collect()
     }
 }
 
@@ -359,6 +516,8 @@ pub struct TaskReview {
     task_id: String,
     files: Vec<FileReview>,
     turns: Vec<(u32, TurnKind)>,
+    /// A prompt turn is streaming: its revert waits for it to settle.
+    turn_open: bool,
     events: Vec<ReviewEvent>,
 }
 
@@ -368,6 +527,7 @@ impl TaskReview {
             task_id: task_id.to_string(),
             files: Vec::new(),
             turns: Vec::new(),
+            turn_open: false,
             events: Vec::new(),
         }
     }
@@ -395,7 +555,17 @@ impl TaskReview {
     pub fn begin_turn(&mut self) -> u32 {
         let n = self.turns.last().map_or(1, |(n, _)| n + 1);
         self.turns.push((n, TurnKind::Prompt));
+        self.turn_open = true;
         n
+    }
+
+    /// The prompt turn settled (its agent is done).
+    pub fn end_turn(&mut self) {
+        self.turn_open = false;
+    }
+
+    pub fn turn_open(&self) -> bool {
+        self.turn_open
     }
 
     pub fn current_turn(&self) -> u32 {
@@ -438,7 +608,7 @@ impl TaskReview {
             // The file was only ever refused: the task's first edit to it
             // is this one, and edits before it are never hunks.
             file.last_seen = baseline.version().clone();
-            file.baseline = baseline;
+            file.baseline = baseline.clone();
             file.user_edits.clear();
         }
         let buffer = buffer.read(cx);
@@ -453,10 +623,14 @@ impl TaskReview {
         if started_later {
             file.fold_user_edits(buffer);
         }
+        if !file.turn_starts.iter().any(|(t, _)| *t == turn) {
+            file.turn_starts.push((turn, baseline));
+        }
         file.agent_txns.push(AgentTxn {
             tool_call_id: tool_call_id.to_string(),
             turn,
             transaction,
+            restored: None,
         });
         file.last_seen = buffer.version();
         file.stale_import = None;
@@ -526,9 +700,9 @@ impl TaskReview {
         })?;
         match hunk.status {
             HunkStatus::Pending | HunkStatus::Unattributed | HunkStatus::Stale => {
-                let key = hunk.key(&file.baseline);
+                let txns = file.txns_of(hunk);
+                file.resolved.insert(hunk.key.clone(), Some(txns));
                 file.hunks[index].status = HunkStatus::Accepted;
-                file.resolved.insert(key, HunkStatus::Accepted);
                 Ok(())
             }
             HunkStatus::Interrupted => Err(ReviewError::BadTransition {
@@ -573,18 +747,17 @@ impl TaskReview {
                 path: path.to_path_buf(),
             });
         }
-        let key = hunk.key(&file.baseline);
         let txn = restore(
             &file.buffer,
             vec![(hunk.new.clone(), hunk.old_text.clone())],
             cx,
         );
         file.last_seen = file.buffer.read(cx).version();
-        file.resolved.insert(key.clone(), HunkStatus::Rejected);
+        file.rejected.insert(hunk.key.clone());
         let turn = file.agent_txns.last().map_or(0, |t| t.turn);
         self.events.push(ReviewEvent::HunkRejected {
             path: path.to_path_buf(),
-            key,
+            key: hunk.key,
             turn,
             tool_call_id: hunk.tool_call_ids.last().cloned().unwrap_or_default(),
         });
@@ -598,11 +771,11 @@ impl TaskReview {
         let mut accepted = Vec::new();
         for file in &mut self.files {
             let path = path_of(file.buffer.read(cx), cx);
-            for (i, hunk) in file.hunks.iter_mut().enumerate() {
-                if hunk.status == HunkStatus::Pending {
-                    let key = hunk.key(&file.baseline);
-                    hunk.status = HunkStatus::Accepted;
-                    file.resolved.insert(key, HunkStatus::Accepted);
+            for i in 0..file.hunks.len() {
+                if file.hunks[i].status == HunkStatus::Pending {
+                    let txns = file.txns_of(&file.hunks[i]);
+                    file.resolved.insert(file.hunks[i].key.clone(), Some(txns));
+                    file.hunks[i].status = HunkStatus::Accepted;
                     accepted.push((path.clone(), i));
                 }
             }
@@ -610,18 +783,22 @@ impl TaskReview {
         accepted
     }
 
-    /// Revert turn `n`: reject every pending hunk the turn's calls produced,
-    /// one transaction per buffer, so one undo per buffer redoes it. Stale
-    /// hunks are skipped and counted. Reverting a revert undoes its
-    /// transactions, which puts the turn's text back.
+    /// Revert turn `n`: put back, for every change the turn made, the text
+    /// the buffer had when the turn first touched it, one transaction per
+    /// buffer, so one undo per buffer redoes it. A change the user edited
+    /// since (STALE) or a later turn wrote over is kept and counted; an
+    /// accepted one stays. Reverting a revert undoes its transactions.
     pub fn revert_turn(&mut self, n: u32, cx: &mut App) -> Result<ReviewEvent, ReviewError> {
+        if self.turn_open && self.current_turn() == n {
+            return Err(ReviewError::TurnInFlight { turn: n });
+        }
         let kind = self
             .turns
             .iter()
             .find(|(t, _)| *t == n)
             .map(|(_, k)| k.clone())
             .ok_or(ReviewError::NoTurn { turn: n })?;
-        let (reverted, stale, transactions) = match kind {
+        let (reverted, stale, overwritten, transactions) = match kind {
             TurnKind::Revert { transactions, .. } => {
                 let mut undone = 0;
                 for (buffer, txn) in &transactions {
@@ -633,52 +810,66 @@ impl TaskReview {
                     }
                 }
                 self.rebuild(cx);
-                (undone, 0, Vec::new())
+                (undone, 0, 0, Vec::new())
             }
             TurnKind::Prompt => {
                 self.rebuild(cx);
                 let mut reverted = 0;
                 let mut stale = 0;
+                let mut overwritten = 0;
                 let mut transactions = Vec::new();
                 for file in &mut self.files {
-                    let calls: Vec<&str> = file
-                        .agent_txns
-                        .iter()
-                        .filter(|t| t.turn == n)
-                        .map(|t| t.tool_call_id.as_str())
-                        .collect();
-                    let mut edits = Vec::new();
-                    let mut keys = Vec::new();
-                    for hunk in &file.hunks {
-                        if !hunk
-                            .tool_call_ids
-                            .iter()
-                            .any(|id| calls.contains(&id.as_str()))
-                        {
-                            continue;
-                        }
-                        match hunk.status {
-                            HunkStatus::Pending | HunkStatus::Unattributed => {
-                                edits.push((hunk.new.clone(), hunk.old_text.clone()));
-                                keys.push(hunk.key(&file.baseline));
-                            }
-                            HunkStatus::Stale => stale += 1,
-                            _ => {}
-                        }
-                    }
-                    if edits.is_empty() {
+                    let plan = file.turn_revert(n, cx);
+                    stale += plan.stale;
+                    overwritten += plan.overwritten;
+                    if plan.edits.is_empty() {
                         continue;
                     }
-                    reverted += edits.len();
-                    let txn = restore(&file.buffer, edits, cx);
-                    file.last_seen = file.buffer.read(cx).version();
-                    for key in keys {
-                        file.resolved.insert(key, HunkStatus::Rejected);
+                    reverted += plan.edits.len();
+                    // The text put back is the earlier turns' work: credit
+                    // each restored range to their calls that had the hunk.
+                    let earlier: Vec<(Range<usize>, usize, Vec<(String, u32)>)> = plan
+                        .edits
+                        .iter()
+                        .map(|(range, text)| {
+                            let calls = file
+                                .hunks
+                                .iter()
+                                .filter(|h| touches(&h.new, range))
+                                .flat_map(|h| {
+                                    file.agent_txns
+                                        .iter()
+                                        .filter(|t| {
+                                            t.turn < n && h.tool_call_ids.contains(&t.tool_call_id)
+                                        })
+                                        .map(|t| (t.tool_call_id.clone(), t.turn))
+                                })
+                                .collect();
+                            (range.clone(), text.len(), calls)
+                        })
+                        .collect();
+                    let txn = restore(&file.buffer, plan.edits, cx);
+                    let snapshot = file.buffer.read(cx).text_snapshot();
+                    let mut delta: i64 = 0;
+                    for (range, len, calls) in earlier {
+                        let start = (range.start as i64 + delta) as usize;
+                        let restored = snapshot.anchor_at(start, text::Bias::Right)
+                            ..snapshot.anchor_at(start + len, text::Bias::Left);
+                        delta += len as i64 - range.len() as i64;
+                        for (tool_call_id, turn) in calls {
+                            file.agent_txns.push(AgentTxn {
+                                tool_call_id,
+                                turn,
+                                transaction: txn,
+                                restored: Some(restored.clone()),
+                            });
+                        }
                     }
+                    file.last_seen = snapshot.version().clone();
                     transactions.push((file.buffer.clone(), txn));
                 }
                 self.rebuild(cx);
-                (reverted, stale, transactions)
+                (reverted, stale, overwritten, transactions)
             }
         };
         let next = self.turns.last().map_or(1, |(n, _)| n + 1);
@@ -693,6 +884,7 @@ impl TaskReview {
             turn: n,
             reverted,
             stale,
+            overwritten,
         };
         self.events.push(event.clone());
         Ok(event)
@@ -705,10 +897,10 @@ impl TaskReview {
             .iter()
             .flat_map(|f| {
                 let path = path_of(f.buffer.read(cx), cx);
-                f.resolved.iter().map(move |(key, status)| StatusRecord {
+                f.resolved.keys().map(move |key| StatusRecord {
                     path: path.clone(),
                     key: key.clone(),
-                    status: *status,
+                    status: HunkStatus::Accepted,
                 })
             })
             .collect();
@@ -725,8 +917,11 @@ impl TaskReview {
     /// Restore persisted resolutions (applied on the next rebuild).
     pub fn restore_statuses(&mut self, records: Vec<StatusRecord>, cx: &App) {
         for record in records {
+            if record.status != HunkStatus::Accepted {
+                continue;
+            }
             if let Ok(i) = self.file_by_path(&record.path, cx) {
-                self.files[i].resolved.insert(record.key, record.status);
+                self.files[i].resolved.insert(record.key, None);
             }
         }
         self.rebuild(cx);
@@ -930,8 +1125,93 @@ mod tests {
         cx.update(|cx| f.review.rebuild(cx));
         assert_eq!(
             statuses(&f),
-            vec![HunkStatus::Rejected],
-            "the resolution is remembered"
+            vec![HunkStatus::Pending],
+            "the agent text is back, so it is a live hunk again"
+        );
+    }
+
+    /// 4a: the agent retries the same edit after a reject; the new live hunk
+    /// is pending, not the old resolution.
+    #[gpui::test]
+    async fn an_agent_retry_after_a_reject_is_pending(cx: &mut TestAppContext) {
+        let mut f = setup(cx).await;
+        agent_writes(&mut f, "c1", "alpha\nBETA\ngamma\n", cx).await;
+        let path = cx.update(|cx| f.review.path(&f.review.files()[0], cx));
+        cx.update(|cx| f.review.reject(&path, 0, cx)).unwrap();
+        f.project
+            .update(cx, |p, cx| p.save_buffer(f.buffer.clone(), cx))
+            .await
+            .unwrap();
+        agent_writes(&mut f, "c2", "alpha\nBETA\ngamma\n", cx).await;
+        let hunks = f.review.files()[0].hunks();
+        assert_eq!(hunks.len(), 1, "{hunks:?}");
+        assert_eq!(hunks[0].status, HunkStatus::Pending);
+        assert_eq!(hunks[0].tool_call_ids, vec!["c2".to_string()]);
+    }
+
+    /// An accepted hunk the agent rewrites with a new transaction is a new
+    /// change to review.
+    #[gpui::test]
+    async fn an_agent_rewrite_of_an_accepted_hunk_is_pending(cx: &mut TestAppContext) {
+        let mut f = setup(cx).await;
+        agent_writes(&mut f, "c1", "alpha\nBETA\ngamma\n", cx).await;
+        let path = cx.update(|cx| f.review.path(&f.review.files()[0], cx));
+        cx.update(|cx| f.review.accept(&path, 0, cx)).unwrap();
+        agent_writes(&mut f, "c2", "alpha\nbeta\ngamma\n", cx).await;
+        assert!(f.review.files()[0].hunks().is_empty(), "back to baseline");
+        agent_writes(&mut f, "c3", "alpha\nBETA\ngamma\n", cx).await;
+        assert_eq!(statuses(&f), vec![HunkStatus::Pending]);
+        let records = cx.update(|cx| f.review.status_records(cx));
+        assert!(records.is_empty(), "{records:?}");
+    }
+
+    /// Two turns rewrite the same line: reverting turn 2 gives turn 1's
+    /// text, not the baseline; reverting turn 1 under turn 2 is refused.
+    #[gpui::test]
+    async fn revert_turn_restores_the_turns_own_start(cx: &mut TestAppContext) {
+        let mut f = setup(cx).await;
+        agent_writes(&mut f, "c1", "alpha\nONE\ngamma\n", cx).await;
+        f.review.begin_turn();
+        agent_writes(&mut f, "c2", "alpha\nTWO\ngamma\n", cx).await;
+        f.review.end_turn();
+        let event = cx.update(|cx| f.review.revert_turn(2, cx)).unwrap();
+        assert_eq!(
+            event,
+            ReviewEvent::TurnReverted {
+                turn: 2,
+                reverted: 1,
+                stale: 0,
+                overwritten: 0,
+            }
+        );
+        assert_eq!(text(&f, cx), "alpha\nONE\ngamma\n");
+        let hunks = f.review.files()[0].hunks();
+        assert_eq!(hunks.len(), 1, "{hunks:?}");
+        assert_eq!(hunks[0].status, HunkStatus::Pending);
+        assert_eq!(hunks[0].tool_call_ids, vec!["c1".to_string()]);
+    }
+
+    #[gpui::test]
+    async fn revert_of_a_turn_a_later_turn_changed_is_refused(cx: &mut TestAppContext) {
+        let mut f = setup(cx).await;
+        agent_writes(&mut f, "c1", "alpha\nONE\ngamma\n", cx).await;
+        f.review.begin_turn();
+        agent_writes(&mut f, "c2", "alpha\nTWO\ngamma\n", cx).await;
+        f.review.end_turn();
+        let event = cx.update(|cx| f.review.revert_turn(1, cx)).unwrap();
+        assert_eq!(
+            event,
+            ReviewEvent::TurnReverted {
+                turn: 1,
+                reverted: 0,
+                stale: 0,
+                overwritten: 1,
+            }
+        );
+        assert_eq!(text(&f, cx), "alpha\nTWO\ngamma\n", "turn 2's text stays");
+        assert!(
+            event.to_string().contains("changed again by a later turn"),
+            "{event}"
         );
     }
 
@@ -1079,13 +1359,15 @@ mod tests {
         f.review.begin_turn();
         agent_writes(&mut f, "c2", "ALPHA\nBETA\ngamma\ndelta\n", cx).await;
         user_types(&f, 22..22, " by user", cx);
+        f.review.end_turn();
         let event = cx.update(|cx| f.review.revert_turn(2, cx)).unwrap();
         assert_eq!(
             event,
             ReviewEvent::TurnReverted {
                 turn: 2,
                 reverted: 1,
-                stale: 1
+                stale: 1,
+                overwritten: 0,
             }
         );
         assert_eq!(
@@ -1104,6 +1386,20 @@ mod tests {
         });
         cx.update(|cx| f.review.revert_turn(1, cx)).unwrap();
         assert_eq!(text(&f, cx), "alpha\nbeta\ngamma\ndelta by user\n");
+    }
+
+    #[gpui::test]
+    async fn revert_of_a_streaming_turn_is_refused(cx: &mut TestAppContext) {
+        let mut f = setup(cx).await;
+        agent_writes(&mut f, "c1", "alpha\nBETA\ngamma\n", cx).await;
+        assert_eq!(
+            cx.update(|cx| f.review.revert_turn(1, cx)),
+            Err(ReviewError::TurnInFlight { turn: 1 })
+        );
+        assert_eq!(text(&f, cx), "alpha\nBETA\ngamma\n");
+        f.review.end_turn();
+        cx.update(|cx| f.review.revert_turn(1, cx)).unwrap();
+        assert_eq!(text(&f, cx), ORIGINAL);
     }
 
     /// Autosave plus the watcher racing ahead: the user's saved transaction

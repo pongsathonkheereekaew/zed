@@ -86,8 +86,8 @@ impl Drop for Chromium {
 }
 
 fn close(port: u16, child: &mut Child, limit: Duration) {
-    browser_close(port, limit.min(Duration::from_secs(2)));
     let deadline = Instant::now() + limit;
+    browser_close(port, deadline.min(Instant::now() + Duration::from_secs(2)));
     while Instant::now() < deadline {
         if !matches!(child.try_wait(), Ok(None)) {
             return;
@@ -112,16 +112,20 @@ fn kill(child: &mut Child) {
     let _ = child.wait();
 }
 
-/// Ask the Chromium on `port` to close itself.
-fn browser_close(port: u16, limit: Duration) {
-    let Some(url) = http_get(port, "/json/version").ok().and_then(|body| {
-        let version: serde_json::Value = serde_json::from_str(&body).ok()?;
-        Some(version.get("webSocketDebuggerUrl")?.as_str()?.to_string())
-    }) else {
+/// Ask the Chromium on `port` to close itself, giving up at `deadline`.
+fn browser_close(port: u16, deadline: Instant) {
+    let left = || deadline.saturating_duration_since(Instant::now());
+    let Some(url) = http_get_within(port, "/json/version", left())
+        .ok()
+        .and_then(|body| {
+            let version: serde_json::Value = serde_json::from_str(&body).ok()?;
+            Some(version.get("webSocketDebuggerUrl")?.as_str()?.to_string())
+        })
+    else {
         return;
     };
-    if let Ok(mut client) = super::cdp::CdpClient::connect(&url) {
-        let _ = client.call("Browser.close", serde_json::json!({}), limit);
+    if let Ok(mut client) = super::cdp::CdpClient::connect_within(&url, left()) {
+        let _ = client.call("Browser.close", serde_json::json!({}), left());
     }
 }
 
@@ -151,7 +155,7 @@ fn close_leftover(port_file: &Path) {
     if http_get(port, "/json/version").is_err() {
         return;
     }
-    browser_close(port, Duration::from_secs(2));
+    browser_close(port, Instant::now() + Duration::from_secs(2));
     let deadline = Instant::now() + CLOSE_LIMIT;
     while Instant::now() < deadline && TcpStream::connect(("127.0.0.1", port)).is_ok() {
         std::thread::sleep(Duration::from_millis(50));
@@ -214,10 +218,19 @@ fn wait_for_port(port_file: &Path, child: &mut Child) -> Result<u16, String> {
 /// One `GET` to the debugging port. Chromium answers only HTTP/1.1 with an
 /// IP `Host`, and may keep the connection open past the body.
 pub fn http_get(port: u16, path: &str) -> Result<String, String> {
-    let mut stream =
-        TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("browser port: {e}"))?;
+    http_get_within(port, path, Duration::from_secs(5))
+}
+
+/// [`http_get`] that gives up after `limit`.
+fn http_get_within(port: u16, path: &str, limit: Duration) -> Result<String, String> {
+    if limit.is_zero() {
+        return Err("browser port: out of time".to_string());
+    }
+    let deadline = Instant::now() + limit;
+    let mut stream = TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), limit)
+        .map_err(|e| format!("browser port: {e}"))?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_write_timeout(Some(limit))
         .map_err(|e| e.to_string())?;
     let request =
         format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
@@ -227,6 +240,10 @@ pub fn http_get(port: u16, path: &str) -> Result<String, String> {
     let mut raw = Vec::new();
     let mut buf = [0u8; 8192];
     loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() || stream.set_read_timeout(Some(left)).is_err() {
+            break;
+        }
         match stream.read(&mut buf) {
             Ok(0) | Err(_) => break,
             Ok(n) => raw.extend_from_slice(&buf[..n]),
@@ -256,4 +273,35 @@ fn body_complete(raw: &[u8]) -> bool {
                 .then(|| v.trim().parse::<usize>().ok())?
         })
         .is_some_and(|len| body.len() >= len)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn close_now_keeps_its_deadline_when_chromium_hangs() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let held =
+            std::thread::spawn(move || listener.incoming().flatten().take(4).collect::<Vec<_>>());
+        let mut command = Command::new("sleep");
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let child = command.arg("60").spawn().unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        let mut chromium = Chromium {
+            child: Some(child),
+            port,
+        };
+
+        let start = Instant::now();
+        chromium.close_now(Duration::from_millis(500));
+        let elapsed = start.elapsed();
+
+        assert!(elapsed < Duration::from_secs(1), "close took {elapsed:?}");
+        // SAFETY: signal 0 only checks whether the group exists.
+        assert_eq!(unsafe { libc::killpg(pid, 0) }, -1, "group still alive");
+        drop(held);
+    }
 }

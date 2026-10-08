@@ -28,6 +28,37 @@ pub struct CdpClient {
 impl CdpClient {
     pub fn connect(url: &str) -> Result<Self, String> {
         let (socket, _) = tungstenite::connect(url).map_err(|e| format!("cdp connect: {e}"))?;
+        Self::from_socket(socket)
+    }
+
+    /// [`Self::connect`] to a plain `ws://` URL, giving up after `limit`.
+    pub fn connect_within(url: &str, limit: Duration) -> Result<Self, String> {
+        if limit.is_zero() {
+            return Err("cdp connect: out of time".to_string());
+        }
+        let deadline = Instant::now() + limit;
+        let uri: tungstenite::http::Uri = url.parse().map_err(|e| format!("cdp connect: {e}"))?;
+        let addr = std::net::ToSocketAddrs::to_socket_addrs(&(
+            uri.host().unwrap_or_default(),
+            uri.port_u16().unwrap_or(80),
+        ))
+        .map_err(|e| format!("cdp connect: {e}"))?
+        .next()
+        .ok_or_else(|| "cdp connect: no address".to_string())?;
+        let tcp =
+            TcpStream::connect_timeout(&addr, limit).map_err(|e| format!("cdp connect: {e}"))?;
+        let left = deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(1));
+        tcp.set_read_timeout(Some(left))
+            .and_then(|()| tcp.set_write_timeout(Some(left)))
+            .map_err(|e| format!("cdp: {e}"))?;
+        let (socket, _) = tungstenite::client(url, MaybeTlsStream::Plain(tcp))
+            .map_err(|e| format!("cdp connect: {e}"))?;
+        Self::from_socket(socket)
+    }
+
+    fn from_socket(socket: Socket) -> Result<Self, String> {
         if let MaybeTlsStream::Plain(tcp) = socket.get_ref() {
             tcp.set_read_timeout(Some(Duration::from_millis(20)))
                 .map_err(|e| format!("cdp: {e}"))?;

@@ -726,21 +726,15 @@ impl TaskReview {
         file.fold_user_edits_except(buffer, &agent);
         // A fold made after the call's mark that lies wholly inside the
         // transaction is this import landing early (the file's window was
-        // closed by another outcome), not the user's. Unless the fold saw
-        // the import land after it: then it is a keystroke the write kept
-        // (OMP read the autosaved file), the user's. A deletion (an empty
-        // range) is kept too: unsure means STALE (ADR-0006).
+        // closed by another outcome), not the user's: a keystroke in the
+        // window is unsaved or saved at the import, and either refuses it.
         let snapshot = buffer.text_snapshot();
         file.user_edits.retain(|e| {
-            let r = e.range.start.to_offset(&snapshot)..e.range.end.to_offset(&snapshot);
-            if r.is_empty() || !e.folded_at.changed_since(baseline.version()) {
+            if !e.folded_at.changed_since(baseline.version()) {
                 return true;
             }
-            let inside = agent.iter().any(|a| a.start <= r.start && r.end <= a.end);
-            let edited_after = snapshot
-                .edits_since::<usize>(&e.folded_at)
-                .any(|edit| touches(&edit.new, &r));
-            !inside || edited_after
+            let r = e.range.start.to_offset(&snapshot)..e.range.end.to_offset(&snapshot);
+            !agent.iter().any(|a| a.start <= r.start && r.end <= a.end)
         });
         file.importing.remove(tool_call_id);
         if !file.turn_starts.iter().any(|(t, _)| *t == turn) {

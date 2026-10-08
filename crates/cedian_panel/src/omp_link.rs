@@ -115,19 +115,19 @@ pub struct LaunchSpec {
 
 impl LaunchSpec {
     /// Resolve settings, policy and paths for `workdir`. The app registers
-    /// `cedian_worktree_request` unless project writes are denied (it writes
-    /// `.worktrees/` and a branch); the panel adds its `cedian://` scheme.
+    /// `cedian_worktree_request` only when project writes are allowed (it
+    /// writes `.worktrees/` and a branch with no dialog); the panel adds its `cedian://` scheme.
     pub fn resolve(workdir: &Path) -> Result<Self, String> {
         let settings = cedian_shell::resolve_settings(workdir).map_err(|e| e.to_string())?;
         let binary = cedian_shell::launch::omp_binary()?;
         let choice = settings.policy_for(workdir, RunKind::Interactive);
         let state_dir = cedian_shell::state::dir(workdir)?;
-        let (tools, names) = if settings.permissions.project_write == cedian_shell::Verdict::Deny {
-            (Vec::new(), Vec::new())
-        } else {
+        let (tools, names) = if cedian_shell::launch::registers_worktree_request(&settings) {
             let tool =
                 cedian_worker::worktree_request_tool(workdir.to_path_buf(), state_dir.clone());
             (vec![tool], vec![cedian_worker::WORKTREE_REQUEST_TOOL])
+        } else {
+            (Vec::new(), Vec::new())
         };
         let mut policy = cedian_shell::launch::spawn_policy(&settings, choice.policy, &names);
         let policy_note = match choice.policy {

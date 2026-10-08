@@ -154,8 +154,8 @@ pub(crate) fn dispatch(args: Vec<String>, in_shell: bool) -> Result<(), String> 
 
 /// The complete cedian host-tool set for these settings (ADR-0004: one
 /// `set_host_tools` call replaces the whole set, so register all of it).
-/// `cedian_worktree_request` writes `.worktrees/` + a branch: absent when
-/// project writes are denied.
+/// `cedian_worktree_request` writes `.worktrees/` + a branch: present only
+/// when project writes are allowed.
 fn host_tool_names(settings: &cedian_shell::Settings) -> Vec<&'static str> {
     let mut names = vec![
         cedian_workspace::APPLY_EDIT_TOOL,
@@ -164,7 +164,7 @@ fn host_tool_names(settings: &cedian_shell::Settings) -> Vec<&'static str> {
         review_agent::REVIEW_REQUEST_TOOL,
         corrections::CORRECTION_CLASS_TOOL,
     ];
-    if settings.permissions.project_write != cedian_shell::Verdict::Deny {
+    if cedian_shell::launch::registers_worktree_request(settings) {
         names.push(cedian_worker::WORKTREE_REQUEST_TOOL);
     }
     names
@@ -1237,8 +1237,13 @@ mod tests {
         {
             assert!(cedian_workflow::is_channel_call(name, ""), "{name}");
         }
-        settings.permissions.project_write = cedian_shell::Verdict::Deny;
-        assert!(!host_tool_names(&settings).contains(&cedian_worker::WORKTREE_REQUEST_TOOL));
+        for verdict in [cedian_shell::Verdict::Ask, cedian_shell::Verdict::Deny] {
+            settings.permissions.project_write = verdict;
+            assert!(
+                !host_tool_names(&settings).contains(&cedian_worker::WORKTREE_REQUEST_TOOL),
+                "a worktree request makes a tree with no dialog: only under allow (ADR-0012)"
+            );
+        }
     }
 
     #[test]

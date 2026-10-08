@@ -9,6 +9,13 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// Whether `cedian_worktree_request` is registered. It makes a tree and a
+/// branch with no dialog of its own, so only project writes that need no
+/// approval allow it (ADR-0012 strict-wins).
+pub fn registers_worktree_request(settings: &Settings) -> bool {
+    settings.permissions.project_write == Verdict::Allow
+}
+
 /// Map `[permissions]` onto the OMP spawn policy (ADR-0020). Under the
 /// default policy it only tightens: `dangerous = allow` still leaves the exec
 /// floor at `prompt` (strict-wins, ADR-0012), and yolo is unrepresentable.

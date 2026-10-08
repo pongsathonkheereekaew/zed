@@ -27,6 +27,7 @@ use crate::review::{ReviewError, TaskReview};
 use cedian_agent::Thread;
 use cedian_omp::{RouterEvent, UserAnswer};
 use cedian_review::{HunkKey, HunkStatus};
+use cedian_workflow::{CurrentState, Evidence, Gate, GateResult, Outcome};
 use cedian_workspace::{capture_ambient, render_snapshot};
 use collections::{HashMap, HashSet, IndexMap};
 use editor::{Editor, actions::Paste};
@@ -38,6 +39,9 @@ use gpui::{
 };
 use language::{Buffer, BufferEvent};
 use omp_rpc::{ExtensionUiRequest, ImageContent};
+
+/// The gate every panel browser capture is evidence for.
+pub const BROWSER_GATE: &str = "browser";
 use project::Project;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -170,6 +174,8 @@ pub struct CedianPanel {
     /// the panel.
     browser: Option<Arc<BrowserHost>>,
     _browser_events: Option<Task<()>>,
+    /// Evidence from the panel's browser captures, each bound to its frame.
+    browser_evidence: Vec<Evidence>,
     /// Answers OMP's `cedian://` reads.
     _context: Option<Task<()>>,
 }
@@ -221,6 +227,7 @@ impl CedianPanel {
             _events: None,
             browser: None,
             _browser_events: None,
+            browser_evidence: Vec::new(),
             _context: None,
         };
         if this.workspace_root(cx).is_some() {
@@ -544,6 +551,24 @@ impl CedianPanel {
         cx.notify();
     }
 
+    /// The state gates are judged against: the shared browser's current
+    /// frame sequence, so a capture from an earlier frame reads `stale-frame`.
+    pub fn current_state(&self) -> CurrentState {
+        let mut state = CurrentState::default();
+        state.frame_seq = self
+            .browser
+            .as_ref()
+            .map(|b| b.state())
+            .filter(|s| s.running)
+            .map(|s| s.seq);
+        state
+    }
+
+    /// `gate` judged on the panel's browser evidence, now.
+    pub fn evaluate_gate(&self, gate: &Gate) -> GateResult {
+        gate.evaluate(&self.browser_evidence, &self.current_state())
+    }
+
     /// Capture the shared page: screenshot, DOM, console and network.
     pub fn capture_browser(&mut self, cx: &mut Context<Self>) {
         let Some(host) = self.browser.clone() else {
@@ -551,13 +576,26 @@ impl CedianPanel {
         };
         let task = cx.background_spawn(async move { host.capture() });
         cx.spawn(async move |this, cx| {
-            if let Err(e) = task.await {
-                this.update(cx, |this, cx| {
-                    this.notice = Some(format!("browser capture failed: {e}"));
-                    cx.notify();
-                })
-                .ok();
-            }
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(capture) => {
+                        let code = this.current_state().bind(&[]);
+                        this.browser_evidence.push(
+                            capture
+                                .evidence(
+                                    &format!("browser-frame-{}", capture.seq),
+                                    &[BROWSER_GATE],
+                                    Outcome::Pass,
+                                )
+                                .with_code_state(code),
+                        );
+                    }
+                    Err(e) => this.notice = Some(format!("browser capture failed: {e}")),
+                }
+                cx.notify();
+            })
+            .ok();
         })
         .detach();
     }

@@ -462,6 +462,27 @@ async fn exit(cx: &mut TestAppContext, root: &Path) {
         json!({"url": "https://exit.test/"}),
     );
     wait_until("the navigation", || host.state().seq > a.seq);
+    let gate = Gate::register(
+        cedian_panel::BROWSER_GATE,
+        GateKind::Visual,
+        false,
+        GatePredicate {
+            kinds: vec![],
+            min_items: 1,
+            require_ok: true,
+            fresh: true,
+            feature: None,
+        },
+        false,
+    )
+    .unwrap();
+    let only_a = window.update(cx, |p, _, _| p.evaluate_gate(&gate)).unwrap();
+    assert_ne!(only_a.status, GateStatus::Passed, "{}", only_a.reason);
+    assert!(
+        only_a.reason.contains("1 stale"),
+        "A is stale-frame: {}",
+        only_a.reason
+    );
     window.update(cx, |p, _, cx| p.capture_browser(cx)).unwrap();
     let b = wait_capture(cx, &window, a.seq);
     assert_eq!(
@@ -473,17 +494,30 @@ async fn exit(cx: &mut TestAppContext, root: &Path) {
         rendered(&mut vcx, "cedian-browser-capture").is_some(),
         "the latest capture is shown inline"
     );
-
-    let mut now = CurrentState::from_files([("a.rs".to_string(), b"x".as_slice())]);
-    now.frame_seq = Some(host.state().seq);
-    let on_a = a
-        .evidence("a", &["looks"], Outcome::Pass)
-        .with_code_state(now.bind(&[]));
-    let on_b = b
-        .evidence("b", &["looks"], Outcome::Pass)
-        .with_code_state(now.bind(&[]));
-    assert!(on_a.stale_reason(&now).unwrap().starts_with("stale-frame"));
-    assert_eq!(on_b.stale_reason(&now), None, "B is current");
+    let wait_gate = |cx: &mut TestAppContext| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            cx.run_until_parked();
+            let result = window.update(cx, |p, _, _| p.evaluate_gate(&gate)).unwrap();
+            if result.status == GateStatus::Passed || Instant::now() > deadline {
+                return result;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let both = wait_gate(cx);
+    assert_eq!(both.status, GateStatus::Passed, "{}", both.reason);
+    assert_eq!(
+        both.deciding.len(),
+        1,
+        "only B decides: {:?}",
+        both.deciding
+    );
+    assert!(
+        both.deciding[0].ends_with(&b.seq.to_string()),
+        "{:?}",
+        both.deciding
+    );
 
     let ws2 = root.join("ws2");
     cedian_fake_omp::install_replay(

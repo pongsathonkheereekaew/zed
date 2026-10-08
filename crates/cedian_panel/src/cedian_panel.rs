@@ -11,4 +11,4 @@ pub mod panel;
 pub mod review;
 
 pub use omp_settings::OmpSettings;
-pub use panel::{CedianPanel, Connection, DIALOG_TIMEOUT, ToggleFocus, Turn, init};
+pub use panel::{BROWSER_GATE, CedianPanel, Connection, DIALOG_TIMEOUT, ToggleFocus, Turn, init};

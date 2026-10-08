@@ -56,6 +56,10 @@ pub enum LinkEvent {
     PromptFailed(String),
     /// Stop's abort did not reach OMP.
     AbortFailed(String),
+    /// OMP took a mid-turn steer or follow-up.
+    QueueSent,
+    /// A mid-turn steer or follow-up did not reach OMP's queue.
+    QueueRefused(String),
     /// OMP's answer to a Steer on subagent `id`.
     SubagentSteered {
         id: String,
@@ -436,6 +440,23 @@ impl OmpLink {
     /// OMP's process id, once it has started.
     pub fn pid(&self) -> Option<u32> {
         Some(self.pid.load(Ordering::Relaxed)).filter(|pid| *pid != 0)
+    }
+
+    /// Steer the running turn (`steer`) or queue a message after it
+    /// (`follow_up`), off the UI thread; OMP's `queue_update` shows it.
+    pub fn queue(&self, text: String, steer: bool) {
+        let not_running = LinkEvent::QueueRefused("OMP is not running".to_string());
+        self.off_thread(not_running, move |control, _| {
+            let sent = if steer {
+                control.steer(&text)
+            } else {
+                control.follow_up(&text)
+            };
+            match sent {
+                Ok(()) => LinkEvent::QueueSent,
+                Err(e) => LinkEvent::QueueRefused(e.to_string()),
+            }
+        });
     }
 
     /// Steer subagent `id` off the UI thread; the answer comes back as

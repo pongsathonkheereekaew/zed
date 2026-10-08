@@ -14,8 +14,15 @@
 {"dir":"in","frame":{"id":"req_5","message":"one","type":"prompt"}}
 {"dir":"out","frame":{"command":"prompt","id":"req_5","success":true,"type":"response"}}
 {"dir":"out","frame":{"type":"agent_start"}}
+{"dir":"in","frame":{"id":"req_s1","message":"faster","type":"steer"}}
+{"dir":"out","frame":{"command":"steer","id":"req_s1","success":true,"type":"response"}}
+{"dir":"out","frame":{"type":"queue_update","steering":["faster"],"followUp":[]}}
+{"dir":"in","frame":{"id":"req_f1","message":"two","type":"follow_up"}}
+{"dir":"out","frame":{"command":"follow_up","id":"req_f1","success":true,"type":"response"}}
+{"dir":"out","frame":{"type":"queue_update","steering":["faster"],"followUp":["two"]}}
 {"dir":"in","frame":{"id":"req_6","type":"abort"}}
 {"dir":"out","frame":{"command":"abort","id":"req_6","success":true,"type":"response"}}
+{"dir":"out","frame":{"type":"queue_update","steering":[],"followUp":[]}}
 {"dir":"out","frame":{"agentInvoked":true,"id":"req_5","sessionSettled":true,"status":"aborted","type":"prompt_result"}}
 {"dir":"out","frame":{"type":"session_settled"}}
 {"dir":"in","frame":{"id":"req_7","message":"three","type":"prompt"}}

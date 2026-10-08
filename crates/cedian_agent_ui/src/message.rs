@@ -100,7 +100,11 @@ impl From<ToolCallStatus> for ToolCardStatus {
 pub fn render_thread(events: &[ThreadEvent]) -> (Vec<MessageModel>, Vec<ToolCard>) {
     let mut messages = Vec::new();
     let mut cards = Vec::new();
-    for event in events {
+    // OMP's queue is one snapshot: only the latest is what is queued now.
+    let last_queue = events
+        .iter()
+        .rposition(|e| matches!(e, ThreadEvent::Queue { .. }));
+    for (index, event) in events.iter().enumerate() {
         match event {
             ThreadEvent::User { text } => {
                 messages.push(MessageModel {
@@ -154,7 +158,7 @@ pub fn render_thread(events: &[ThreadEvent]) -> (Vec<MessageModel>, Vec<ToolCard
                 steering,
                 follow_up,
             } => {
-                if !steering.is_empty() || !follow_up.is_empty() {
+                if Some(index) == last_queue && (!steering.is_empty() || !follow_up.is_empty()) {
                     messages.push(MessageModel {
                         role: MessageRole::User,
                         text: format!("queued: {} / {}", steering.join(", "), follow_up.join(", ")),
@@ -184,6 +188,19 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, MessageRole::Thinking);
         assert_eq!(msgs[1].role, MessageRole::Assistant);
+    }
+
+    #[test]
+    fn only_the_latest_queue_snapshot_shows() {
+        let queue = |s: &[&str]| ThreadEvent::Queue {
+            steering: s.iter().map(|x| x.to_string()).collect(),
+            follow_up: Vec::new(),
+        };
+        let (msgs, _) = render_thread(&[queue(&["a"]), queue(&["a", "b"])]);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].text, "queued: a, b / ");
+        let (msgs, _) = render_thread(&[queue(&["a"]), queue(&[])]);
+        assert!(msgs.is_empty(), "an emptied queue shows no chip");
     }
 
     #[test]

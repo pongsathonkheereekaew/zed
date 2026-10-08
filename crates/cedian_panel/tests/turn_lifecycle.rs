@@ -4,8 +4,9 @@
 //!
 //! 1. Stop while the prompt is still queued: it never reaches OMP (the
 //!    fixture's first prompt is "one", and replay checks the text);
-//! 2. Send while a turn runs is refused, so a second prompt never streams
-//!    as idle; Stop aborts the turn;
+//! 2. while a turn runs, Steer sends `steer` and Send queues `follow_up`
+//!    (ADR-0050 decision 3), both shown as OMP's queue chip; Stop aborts
+//!    the turn once and the chip follows OMP's queue;
 //! 3. a prompt OMP rejects returns the panel to idle with the reason;
 //! 4. an answer OMP got but the audit lost fails the turn with exactly one
 //!    abort (a second would meet the next recorded prompt and end the
@@ -116,16 +117,43 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
         "OMP never ran it: {transcript:?}"
     );
 
-    // 2. One turn at a time.
+    // 2. While a turn runs, Steer sends `steer` and Send queues a
+    // `follow_up` (replay checks both texts); OMP's queue shows as a chip;
+    // Stop aborts the turn, which ends once, and the chip shows what OMP
+    // reports after it.
     assert_eq!(submit(cx, &window, "one").0, Turn::Queued);
     wait(cx, &window, "turn one to stream", |p| {
         p.turn() == &Turn::Streaming
     });
+    window
+        .update(cx, |p, window, cx| {
+            p.set_prompt("faster", window, cx);
+            p.steer(window, cx);
+        })
+        .unwrap();
+    wait(cx, &window, "the steer chip", |p| {
+        p.transcript()
+            .iter()
+            .any(|l| l.ends_with("queued: faster / "))
+    });
     let (turn, notice) = submit(cx, &window, "two");
-    assert_eq!(turn, Turn::Streaming, "turn one still runs");
-    assert!(notice.contains("a turn is running"), "{notice}");
+    assert_eq!(
+        (turn, notice.as_str()),
+        (Turn::Streaming, ""),
+        "turn one still runs"
+    );
+    wait(cx, &window, "the follow-up chip", |p| {
+        p.transcript()
+            .iter()
+            .any(|l| l.ends_with("queued: faster / two"))
+    });
     window.update(cx, |p, _, cx| p.stop_turn(cx)).unwrap();
     wait(cx, &window, "turn one to stop", |p| p.turn() == &Turn::Idle);
+    let transcript = window.update(cx, |p, _, _| p.transcript()).unwrap();
+    assert!(
+        !transcript.iter().any(|l| l.contains("queued:")),
+        "OMP emptied its queue on the abort: {transcript:?}"
+    );
     assert_ready(cx, &window);
 
     // 3. OMP rejects the prompt.

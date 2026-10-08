@@ -862,6 +862,8 @@ impl CedianPanel {
                 }
             }
             LinkEvent::AuditFailed(e) => self.audit_failed(e, cx),
+            LinkEvent::QueueSent => {}
+            LinkEvent::QueueRefused(e) => self.notice = Some(format!("OMP did not queue it: {e}")),
             LinkEvent::SubagentSteered { id, result } => {
                 let note = match result {
                     Ok(()) => "steered".to_string(),
@@ -953,10 +955,14 @@ impl CedianPanel {
         if text.trim().is_empty() {
             return;
         }
-        if self.turn != Turn::Idle {
-            self.notice = Some("a turn is running; stop it first".to_string());
-            cx.notify();
-            return;
+        match self.turn {
+            Turn::Idle => {}
+            Turn::Streaming => return self.queue(false, window, cx),
+            _ => {
+                self.notice = Some("the turn is starting or stopping; wait for it".to_string());
+                cx.notify();
+                return;
+            }
         }
         if self.connection == Connection::NotStarted {
             self.start(window, cx);
@@ -983,6 +989,31 @@ impl CedianPanel {
         self.review.begin_turn();
         self.notice = None;
         self.set_turn(Turn::Queued);
+        cx.notify();
+    }
+
+    /// The Steer button: `text` goes into the running turn.
+    pub fn steer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.turn == Turn::Streaming {
+            self.queue(true, window, cx);
+        }
+    }
+
+    /// Steer (`steer`) or queue after the turn (`follow_up`, ADR-0050
+    /// decision 3). The chip comes from OMP's own `queue_update`.
+    fn queue(&mut self, steer: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.input.read(cx).text(cx);
+        if text.trim().is_empty() {
+            return;
+        }
+        let Some(link) = &self.link else {
+            self.notice = Some("OMP is not running; restart it".to_string());
+            cx.notify();
+            return;
+        };
+        link.queue(text, steer);
+        self.input.update(cx, |editor, cx| editor.clear(window, cx));
+        self.notice = None;
         cx.notify();
     }
 
@@ -1865,9 +1896,16 @@ impl Render for CedianPanel {
                     .child(div().flex_1().child(self.input.clone()))
                     .child(
                         Button::new("cedian-send", "Send")
-                            .disabled(!idle)
+                            .disabled(!idle && self.turn != Turn::Streaming)
                             .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
                     )
+                    .when(self.turn == Turn::Streaming, |row| {
+                        row.child(div().debug_selector(|| "cedian-steer".to_string()).child(
+                            Button::new("cedian-steer", "Steer").on_click(
+                                cx.listener(|this, _, window, cx| this.steer(window, cx)),
+                            ),
+                        ))
+                    })
                     .when(stoppable, |row| {
                         row.child(
                             div().debug_selector(|| "cedian-stop".to_string()).child(

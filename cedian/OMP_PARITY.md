@@ -14,8 +14,9 @@ The one home for **per-feature OMP coverage** ([ADR-0034](https://github.com/pon
 |---|---|---|
 | `negotiate_protocol` | runtime handshake (v2) | headless |
 | `prompt`, `abort` | composer send (images pasted into the composer go as `images`) / Stop button while a turn streams (Stop first cancels any open dialog, audited `abstain`); an audit write failure aborts the turn once (S9 U4) | native |
-| `steer` | steer while a turn runs | headless |
-| `follow_up`, `abort_and_prompt`, `abort_and_restore_queue` | composer queue actions | planned S9 |
+| `steer` | the Steer button while a turn streams sends the composer text into the running turn (S9 U8, ADR-0050 decision 3); `cedian shell` `steer` headless | native |
+| `follow_up` | Send (Enter) while a turn streams queues the text after the turn; the chip is OMP's latest `queue_update` (S9 U8, ADR-0050 decision 3) | native |
+| `abort_and_prompt`, `abort_and_restore_queue` | composer queue actions | planned S9 |
 | `remove_queued_message`, `promote_queued_message` | queued-message chips | planned S9 |
 | `set_steering_mode`, `set_follow_up_mode`, `set_interrupt_mode` | composer settings | planned S9 |
 | `get_state` | runtime state / status line | headless |

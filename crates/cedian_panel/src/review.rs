@@ -529,6 +529,8 @@ pub struct TaskReview {
     turns: Vec<(u32, TurnKind)>,
     /// A prompt turn is streaming: its revert waits for it to settle.
     turn_open: bool,
+    /// Files OMP wrote that could not be opened, with the reason.
+    unreviewable: Vec<(PathBuf, String)>,
     events: Vec<ReviewEvent>,
 }
 
@@ -539,7 +541,20 @@ impl TaskReview {
             files: Vec::new(),
             turns: Vec::new(),
             turn_open: false,
+            unreviewable: Vec::new(),
             events: Vec::new(),
+        }
+    }
+
+    pub fn unreviewable(&self) -> &[(PathBuf, String)] {
+        &self.unreviewable
+    }
+
+    /// OMP wrote `path` but it could not be opened for review.
+    pub fn could_not_review(&mut self, path: PathBuf, reason: String) {
+        match self.unreviewable.iter_mut().find(|(p, _)| *p == path) {
+            Some(entry) => entry.1 = reason,
+            None => self.unreviewable.push((path, reason)),
         }
     }
 
@@ -552,9 +567,11 @@ impl TaskReview {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.files
-            .iter()
-            .all(|f| f.hunks.is_empty() && f.stale_import.is_none())
+        self.unreviewable.is_empty()
+            && self
+                .files
+                .iter()
+                .all(|f| f.hunks.is_empty() && f.stale_import.is_none())
     }
 
     /// Events since the last drain, oldest first.

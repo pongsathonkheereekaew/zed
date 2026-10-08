@@ -65,12 +65,17 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
-/// One edit-class tool call in flight: the buffers marked before its write,
-/// and how many files it names that are still being opened.
+/// One edit-class tool call in flight: the open buffers marked before its
+/// write, and the files it names that are not open, with their disk text
+/// at the tool's start (`None`: absent then). Those are opened only at the
+/// tool's end, so the write is a hunk against that text however the open
+/// and the write race (a new file is one all-added hunk).
 struct CallMarks {
     marks: Vec<(Entity<Buffer>, Mark)>,
-    opening: usize,
-    /// `ToolEnd` came (with its `is_error`) before every open finished.
+    unopened: Vec<(PathBuf, Option<String>)>,
+    /// Disk reads of unopened files still in flight.
+    reading: usize,
+    /// `ToolEnd` came (with its `is_error`) before every read finished.
     ended: Option<bool>,
 }
 
@@ -856,31 +861,23 @@ impl CedianPanel {
             tool_call_id.clone(),
             CallMarks {
                 marks,
-                opening: to_open.len(),
+                unopened: Vec::new(),
+                reading: to_open.len(),
                 ended: None,
             },
         );
+        let fs = self.project.read(cx).fs().clone();
         for path in to_open {
-            let open = self
-                .project
-                .update(cx, |p, cx| p.open_local_buffer(path.clone(), cx));
+            let fs = fs.clone();
             let id = tool_call_id.clone();
             cx.spawn(async move |this, cx| {
-                let opened = open.await;
+                let before = fs.load(&path).await.ok();
                 this.update(cx, |this, cx| {
                     let Some(call) = this.calls.get_mut(&id) else {
                         return;
                     };
-                    match opened {
-                        Ok(buffer) => {
-                            let mark = buffer.update(cx, |b, _| import::begin(b));
-                            call.marks.push((buffer, mark));
-                        }
-                        Err(e) => {
-                            log::error!("cedian: cannot open {} for review: {e}", path.display())
-                        }
-                    }
-                    call.opening -= 1;
+                    call.unopened.push((path, before));
+                    call.reading -= 1;
                     this.import_when_ready(id, cx);
                 })
                 .ok();
@@ -889,12 +886,14 @@ impl CedianPanel {
         }
     }
 
-    /// Import a call's marks once its `ToolEnd` came and every open finished.
+    /// Import a call's files once its `ToolEnd` came and every disk read
+    /// finished: open the files that were not open, then import each file
+    /// as one transaction.
     fn import_when_ready(&mut self, tool_call_id: String, cx: &mut Context<Self>) {
         let ready = self
             .calls
             .get(&tool_call_id)
-            .is_some_and(|c| c.opening == 0 && c.ended.is_some());
+            .is_some_and(|c| c.reading == 0 && c.ended.is_some());
         if !ready {
             return;
         }
@@ -902,8 +901,28 @@ impl CedianPanel {
         if call.ended == Some(true) {
             return;
         }
+        let project = self.project.clone();
         cx.spawn(async move |this, cx| {
-            for (buffer, mark) in call.marks {
+            let mut marks = call.marks;
+            for (path, before) in call.unopened {
+                let opened = project
+                    .update(cx, |p, cx| p.open_local_buffer(path.clone(), cx))
+                    .await;
+                match opened {
+                    Ok(buffer) => {
+                        let before = before.unwrap_or_default();
+                        let mark = buffer.update(cx, |b, cx| import::begin_from(b, &before, cx));
+                        marks.push((buffer, mark));
+                    }
+                    Err(e) => {
+                        this.update(cx, |this, _| {
+                            this.review.could_not_review(path, e.to_string());
+                        })
+                        .ok();
+                    }
+                }
+            }
+            for (buffer, mark) in marks {
                 let outcome = import::finish(buffer.clone(), mark.clone(), cx).await;
                 this.update(cx, |this, cx| {
                     match outcome {
@@ -918,13 +937,19 @@ impl CedianPanel {
                             this.review.import_refused(&buffer, &tool_call_id, cx)
                         }
                         Ok(ImportOutcome::Unchanged) => {}
-                        Err(e) => log::error!("cedian: import failed: {e}"),
+                        Err(e) => {
+                            let path = buffer.read(cx).file().map(|f| f.full_path(cx));
+                            this.review
+                                .could_not_review(path.unwrap_or_default(), e.to_string());
+                        }
                     }
                     this.watch_reviewed_buffers(cx);
                     this.after_review_change(cx);
                 })
                 .ok();
             }
+            this.update(cx, |this, cx| this.after_review_change(cx))
+                .ok();
         })
         .detach();
     }
@@ -984,6 +1009,22 @@ impl CedianPanel {
                 )
             })
             .collect();
+        for (path, reason) in self.review.unreviewable().to_vec() {
+            let selector = format!("cedian-unreviewed-{}", path.display());
+            body = body.child(
+                v_flex()
+                    .gap_1()
+                    .debug_selector(move || selector)
+                    .child(Label::new(path.display().to_string()).size(LabelSize::Small))
+                    .child(
+                        Label::new(format!(
+                            "OMP wrote this file; it could not be reviewed: {reason}"
+                        ))
+                        .size(LabelSize::Small)
+                        .color(Color::Warning),
+                    ),
+            );
+        }
         for (path, stale_import, hunks) in files {
             let name = path.display().to_string();
             let mut section = v_flex()
@@ -1580,15 +1621,109 @@ mod tests {
         assert_eq!(open, 2, "other.txt is open now");
     }
 
+    /// The write lands before the file is open: the disk text at the tool's
+    /// start is the baseline, so the write is still one pending hunk.
     #[gpui::test]
-    async fn a_tool_end_before_the_open_finishes_still_imports(cx: &mut TestAppContext) {
+    async fn a_write_landing_before_the_open_is_still_a_hunk(cx: &mut TestAppContext) {
         let (f, _buffer) = fixture(cx).await;
         tool_start(&f, cx, "c1", &["other.txt"]);
+        cx.run_until_parked();
+        let open = f.project.read_with(cx, |p, cx| p.opened_buffers(cx).len());
+        assert_eq!(open, 1, "the file is not opened before the write lands");
         omp_writes(&f, "/ws/other.txt", "ONE\ntwo\n").await;
         tool_end(&f, cx, "c1");
         let got = hunks(&f, cx);
+        assert_eq!(
+            got,
+            vec![(
+                "ws/other.txt".to_string(),
+                HunkStatus::Pending,
+                vec!["c1".to_string()]
+            )]
+        );
+        let (old, new) = f
+            .window
+            .update(cx, |panel, _, _| {
+                let h = &panel.review.files()[0].hunks()[0];
+                (h.old_text.clone(), h.new_text.clone())
+            })
+            .unwrap();
+        assert_eq!((old.as_str(), new.as_str()), ("one\n", "ONE\n"));
+    }
+
+    /// A write that creates a file: one all-added hunk; reject empties it.
+    #[gpui::test]
+    async fn a_new_file_is_one_added_hunk_and_reject_empties_it(cx: &mut TestAppContext) {
+        let (f, _buffer) = fixture(cx).await;
+        tool_start(&f, cx, "c1", &["fresh.txt"]);
+        cx.run_until_parked();
+        omp_writes(&f, "/ws/fresh.txt", "hello\nworld\n").await;
+        tool_end(&f, cx, "c1");
+        let got = hunks(&f, cx);
         assert_eq!(got.len(), 1, "{got:?}");
-        assert_eq!(got[0].0, "ws/other.txt");
+        assert_eq!(got[0].0, "ws/fresh.txt");
+        let (path, key, old, new) = f
+            .window
+            .update(cx, |panel, _, cx| {
+                let file = &panel.review.files()[0];
+                let h = &file.hunks()[0];
+                (
+                    panel.review.path(file, cx),
+                    h.key.clone(),
+                    h.old_text.clone(),
+                    h.new_text.clone(),
+                )
+            })
+            .unwrap();
+        assert_eq!((old.as_str(), new.as_str()), ("", "hello\nworld\n"));
+        let buffer = f
+            .window
+            .update(cx, |panel, _, _| panel.review.files()[0].buffer().clone())
+            .unwrap();
+        f.window
+            .update(cx, |panel, _, cx| panel.reject_hunk(&path, &key, cx))
+            .unwrap();
+        assert_eq!(buffer.read_with(cx, |b, _| b.text()), "");
+    }
+
+    /// A file OMP wrote that could not be opened or imported is still shown.
+    #[gpui::test]
+    async fn a_file_that_could_not_be_reviewed_is_shown(cx: &mut TestAppContext) {
+        let (f, _buffer) = fixture(cx).await;
+        f.window
+            .update(cx, |panel, _, cx| {
+                panel
+                    .review
+                    .could_not_review(PathBuf::from("/ws/out.txt"), "permission denied".into());
+                assert!(!panel.review.is_empty());
+                cx.notify();
+            })
+            .unwrap();
+        let mut vcx = VisualTestContext::from_window(f.window.into(), cx);
+        click(&mut vcx, "cedian-review-toggle");
+        assert!(
+            vcx.debug_bounds("cedian-unreviewed-/ws/out.txt").is_some(),
+            "the file is on screen with its reason"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_file_that_cannot_be_opened_is_shown_as_unreviewed(cx: &mut TestAppContext) {
+        let (f, _buffer) = fixture(cx).await;
+        tool_start(&f, cx, "c1", &["/elsewhere/out.txt"]);
+        cx.run_until_parked();
+        tool_end(&f, cx, "c1");
+        let shown = f
+            .window
+            .update(cx, |panel, _, _| panel.review.unreviewable().to_vec())
+            .unwrap();
+        assert_eq!(shown.len(), 1, "{shown:?}");
+        assert_eq!(shown[0].0, PathBuf::from("/elsewhere/out.txt"));
+        let empty = f
+            .window
+            .update(cx, |panel, _, _| panel.review.is_empty())
+            .unwrap();
+        assert!(!empty, "the file shows in review");
     }
 
     #[gpui::test]

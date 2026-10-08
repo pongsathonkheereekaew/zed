@@ -12,7 +12,7 @@
 //! untouched (`Buffer::reload` itself does not check dirtiness).
 
 use anyhow::Result;
-use gpui::{AsyncApp, Entity};
+use gpui::{AsyncApp, Context, Entity};
 use language::Buffer;
 use text::TransactionId;
 
@@ -53,6 +53,23 @@ pub fn begin(buffer: &mut Buffer) -> Mark {
         start: buffer.text_snapshot(),
         start_top: top(buffer),
     }
+}
+
+/// [`begin`] for a buffer opened after the tool started, from the disk
+/// text the tool started from. If the write already landed in what the
+/// buffer loaded, the buffer is set back to that text first, as saved
+/// state and outside the undo history, so the write imports as the one
+/// transaction on top of it.
+pub fn begin_from(buffer: &mut Buffer, text_at_start: &str, cx: &mut Context<Buffer>) -> Mark {
+    if buffer.text() != text_at_start {
+        buffer.set_text(text_at_start, cx);
+        if let Some(txn) = top(buffer) {
+            buffer.forget_transaction(txn);
+        }
+        let mtime = buffer.file().and_then(|f| f.disk_state().mtime());
+        buffer.did_reload(buffer.version(), buffer.line_ending(), mtime, cx);
+    }
+    begin(buffer)
 }
 
 /// Load the disk text and import it as one transaction. The import applies
@@ -253,6 +270,46 @@ mod tests {
             buffer.read_with(cx, |b, _| b.text()),
             "USER alpha\nbeta\ngamma\n"
         );
+    }
+
+    /// A file opened after OMP wrote it: the text the tool started from
+    /// (read from the disk before the write) is the baseline, so the write
+    /// is one undoable transaction and the buffer is clean afterwards.
+    #[gpui::test]
+    async fn a_buffer_opened_after_the_write_takes_the_pre_write_text_as_baseline(
+        cx: &mut TestAppContext,
+    ) {
+        let (fs, project, _notes) = setup(cx).await;
+        fs.insert_tree("/ws", json!({"other.txt": "one\ntwo\n"}))
+            .await;
+        fs.save(
+            Path::new("/ws/other.txt"),
+            &"ONE\ntwo\n".into(),
+            LineEnding::Unix,
+        )
+        .await
+        .unwrap();
+        let buffer = project
+            .update(cx, |p, cx| p.open_local_buffer("/ws/other.txt", cx))
+            .await
+            .unwrap();
+        let mark = buffer.update(cx, |b, cx| begin_from(b, "one\ntwo\n", cx));
+        assert_eq!(mark.start().text(), "one\ntwo\n");
+        let outcome = finish(buffer.clone(), mark, &mut cx.to_async())
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        let ImportOutcome::Imported(txn) = outcome else {
+            panic!("{outcome:?}");
+        };
+        buffer.update(cx, |b, cx| {
+            assert_eq!(b.text(), "ONE\ntwo\n");
+            assert!(!b.is_dirty());
+            assert!(!b.has_conflict());
+            assert_eq!(b.undo(cx), Some(txn), "one undo is the agent's write");
+            assert_eq!(b.text(), "one\ntwo\n");
+            assert_eq!(b.undo(cx), None, "nothing under it");
+        });
     }
 
     #[gpui::test]

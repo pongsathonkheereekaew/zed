@@ -11,15 +11,28 @@
 //! 3. The person's input wins: input in the window during a turn holds
 //!    OMP's next browser message until the person lets the agent continue
 //!    or the turn ends; OMP's own `Input.*` and input outside a turn do not.
+//! 4. The U7 exit through the real panel, OMP played by fake-omp: the spawn
+//!    overlay carries `browser.cdpUrl` (the panel's endpoint) and
+//!    `browser.relay: false`; OMP's first connection starts the browser;
+//!    capture A, navigate, capture B in the panel: the sequence advances,
+//!    the panel shows B inline, evidence on A reads `stale-frame` and B
+//!    passes. "Open browser" starts another workspace's browser.
+//! 5. `--ignored`: the same capture/navigate/capture against a real
+//!    Chromium, when one is installed (it opens a window).
 //!
-//! Harness off: launched with `--user-data-dir` this binary is the browser.
+//! Harness off: launched with `--user-data-dir` this binary is the browser;
+//! with `--mode` (or `config`) it is fake-omp.
 
 use cedian_panel::browser::{BrowserHost, fake};
+use cedian_panel::{CedianPanel, Connection};
 use cedian_workflow::{CurrentState, Gate, GateKind, GatePredicate, GateStatus, Outcome};
+use gpui::{Modifiers, TestAppContext, VisualTestContext, WindowHandle};
+use project::Project;
 use serde_json::{Value, json};
+use settings::SettingsStore;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 fn main() {
@@ -27,9 +40,30 @@ fn main() {
     if fake::is_launch(&args) {
         std::process::exit(fake::run(&args));
     }
+    match args.first().map(String::as_str) {
+        Some("--mode") => std::process::exit(cedian_fake_omp::run(&args)),
+        Some("config") => std::process::exit(cedian_fake_omp::config_get(&args)),
+        _ => {}
+    }
     let root = std::env::temp_dir().join(format!("cedian-u7-browser-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(root.join("ws")).unwrap();
+    std::fs::create_dir_all(root.join("ws2")).unwrap();
+    std::fs::write(root.join("cedian.toml"), "schema = 1\n").unwrap();
+    let root = root.canonicalize().unwrap();
+    // SAFETY: single-threaded here; nothing else reads the environment yet.
+    unsafe {
+        std::env::set_var("CEDIAN_CONFIG", root.join("cedian.toml"));
+        std::env::set_var("CEDIAN_STATE_DIR", root.join("state"));
+        std::env::set_var("HOME", root.join("home"));
+        std::env::set_var("CEDIAN_OMP_BINARY", std::env::current_exe().unwrap());
+        std::env::set_var("CEDIAN_CHROMIUM", std::env::current_exe().unwrap());
+    }
+    if args.iter().any(|a| a == "--ignored") {
+        run("live_chromium_frames", || live_chromium_frames(&root));
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    }
     run("first_connection_starts_the_browser", || {
         first_connection_starts_the_browser(&root)
     });
@@ -37,6 +71,21 @@ fn main() {
         frames_are_bound_to_the_browser(&root)
     });
     run("the_persons_input_wins", || the_persons_input_wins(&root));
+    let exit_root = root.clone();
+    run("u7_exit_through_the_panel", move || {
+        gpui::run_test_once(
+            0,
+            Box::new(move |dispatcher| {
+                let exec = std::sync::Arc::new(dispatcher.clone());
+                let mut cx = TestAppContext::build(dispatcher.clone(), Some("browser"));
+                gpui::ForegroundExecutor::new(exec).block_test(exit(&mut cx, &exit_root));
+                cx.run_until_parked();
+                cx.update(|cx| cx.quit());
+                cx.run_until_parked();
+                dispatcher.drain_tasks();
+            }),
+        )
+    });
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -289,4 +338,198 @@ fn the_persons_input_wins(root: &std::path::Path) {
         "released when the turn ends"
     );
     assert!(!host.state().preempted);
+}
+
+const LAUNCH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/app_launch.jsonl"
+);
+
+async fn exit(cx: &mut TestAppContext, root: &Path) {
+    cx.executor().allow_parking();
+    cx.update(|cx| {
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        theme_settings::init(theme::LoadThemes::JustBase, cx);
+        editor::init(cx);
+    });
+    let ws = root.join("ws");
+    let omp_dir = cedian_shell::state::dir(&ws).unwrap().join("omp");
+    cedian_fake_omp::install_replay(&omp_dir, Path::new(LAUNCH)).unwrap();
+    let project = Project::test(fs::RealFs::new(None, cx.executor()), [ws.as_path()], cx).await;
+    let window = cx.add_window(|window, cx| CedianPanel::new(project.clone(), window, cx));
+    let mut vcx = VisualTestContext::from_window(window.into(), cx);
+    wait_ready(cx, &window);
+
+    let host = window
+        .update(cx, |p, _, _| p.browser().cloned())
+        .unwrap()
+        .expect("the panel opened the workspace's browser endpoint");
+    let overlay: Value =
+        serde_json::from_str(&std::fs::read_to_string(omp_dir.join("cedian-overlay.yml")).unwrap())
+            .unwrap();
+    assert_eq!(
+        overlay["browser"],
+        json!({"cdpUrl": host.url(), "relay": false}),
+        "OMP is pointed at the app's browser"
+    );
+    assert!(!host.state().running, "nothing starts before OMP connects");
+
+    let version: Value = serde_json::from_str(&get(&host.url(), "/json/version").unwrap()).unwrap();
+    assert!(version["webSocketDebuggerUrl"].is_string());
+    assert!(
+        host.state().running,
+        "OMP's first connection started the browser"
+    );
+
+    window.update(cx, |p, _, cx| p.capture_browser(cx)).unwrap();
+    let a = wait_capture(cx, &window, 0);
+    let list: Value = serde_json::from_str(&get(&host.url(), "/json/list").unwrap()).unwrap();
+    let (mut omp, _) =
+        tungstenite::connect(list[0]["webSocketDebuggerUrl"].as_str().unwrap()).unwrap();
+    call(
+        &mut omp,
+        "Page.navigate",
+        json!({"url": "https://exit.test/"}),
+    );
+    wait_until("the navigation", || host.state().seq > a.seq);
+    window.update(cx, |p, _, cx| p.capture_browser(cx)).unwrap();
+    let b = wait_capture(cx, &window, a.seq);
+    assert_eq!(
+        b.seq,
+        a.seq + 1,
+        "the frame sequence advances across captures"
+    );
+    assert!(
+        rendered(&mut vcx, "cedian-browser-capture").is_some(),
+        "the latest capture is shown inline"
+    );
+
+    let mut now = CurrentState::from_files([("a.rs".to_string(), b"x".as_slice())]);
+    now.frame_seq = Some(host.state().seq);
+    let on_a = a
+        .evidence("a", &["looks"], Outcome::Pass)
+        .with_code_state(now.bind(&[]));
+    let on_b = b
+        .evidence("b", &["looks"], Outcome::Pass)
+        .with_code_state(now.bind(&[]));
+    assert!(on_a.stale_reason(&now).unwrap().starts_with("stale-frame"));
+    assert_eq!(on_b.stale_reason(&now), None, "B is current");
+
+    let ws2 = root.join("ws2");
+    cedian_fake_omp::install_replay(
+        &cedian_shell::state::dir(&ws2).unwrap().join("omp"),
+        Path::new(LAUNCH),
+    )
+    .unwrap();
+    let project2 = Project::test(fs::RealFs::new(None, cx.executor()), [ws2.as_path()], cx).await;
+    let window2 = cx.add_window(|window, cx| CedianPanel::new(project2.clone(), window, cx));
+    let mut vcx2 = VisualTestContext::from_window(window2.into(), cx);
+    wait_ready(cx, &window2);
+    let host2 = window2
+        .update(cx, |p, _, _| p.browser().cloned())
+        .unwrap()
+        .unwrap();
+    assert_ne!(host2.url(), host.url(), "one browser per workspace");
+    assert!(!host2.state().running);
+    let bounds = rendered(&mut vcx2, "cedian-open-browser").expect("Open browser button");
+    vcx2.simulate_click(bounds.center(), Modifiers::none());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !host2.state().running {
+        assert!(Instant::now() < deadline, "Open browser started nothing");
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn rendered(
+    vcx: &mut VisualTestContext,
+    selector: &'static str,
+) -> Option<gpui::Bounds<gpui::Pixels>> {
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    vcx.debug_bounds(selector)
+}
+
+fn wait_ready(cx: &mut TestAppContext, window: &WindowHandle<CedianPanel>) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        cx.run_until_parked();
+        let connection = window.update(cx, |p, _, _| p.connection().clone()).unwrap();
+        match connection {
+            Connection::Ready { .. } => return,
+            Connection::Stopped(e) => panic!("OMP stopped: {e}"),
+            _ => {}
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for OMP");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_capture(
+    cx: &mut TestAppContext,
+    window: &WindowHandle<CedianPanel>,
+    after: u64,
+) -> cedian_panel::browser::Capture {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        cx.run_until_parked();
+        let latest = window
+            .update(cx, |p, _, _| p.browser().and_then(|b| b.state().latest))
+            .unwrap();
+        if let Some(capture) = latest.filter(|c| c.seq > after) {
+            return capture;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for a capture");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn live_chromium_frames(root: &Path) {
+    // SAFETY: single-threaded here.
+    unsafe { std::env::remove_var("CEDIAN_CHROMIUM") };
+    let Some(chromium) = cedian_panel::browser::executable() else {
+        println!("skipped: no Chrome or Chromium installed");
+        return;
+    };
+    let host = BrowserHost::open(root.join("live-profile"), Some(chromium), || {}).unwrap();
+    let list: Value = serde_json::from_str(&get(&host.url(), "/json/list").unwrap()).unwrap();
+    let page = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["type"] == "page")
+        .unwrap();
+    let (mut omp, _) =
+        tungstenite::connect(page["webSocketDebuggerUrl"].as_str().unwrap()).unwrap();
+    call(
+        &mut omp,
+        "Page.navigate",
+        json!({"url": "data:text/html,<title>a</title><script>console.log('hello a')</script>"}),
+    );
+    wait_until("page a", || host.state().url.starts_with("data:"));
+    let a = host.capture().unwrap();
+    assert!(a.png.starts_with(b"\x89PNG"), "a real screenshot");
+    assert_eq!(a.title, "a");
+    call(
+        &mut omp,
+        "Page.navigate",
+        json!({"url": "data:text/html,<title>b</title>"}),
+    );
+    wait_until("page b", || host.state().seq > a.seq);
+    let b = host.capture().unwrap();
+    assert_eq!(b.title, "b");
+    assert!(b.seq > a.seq, "the frame sequence advances across captures");
+    let mut now = CurrentState::default();
+    now.frame_seq = Some(host.state().seq);
+    assert!(
+        a.evidence("a", &[], Outcome::Pass)
+            .stale_reason(&now)
+            .unwrap()
+            .starts_with("stale-frame")
+    );
+    println!(
+        "(console on a: {:?}; seq {} -> {})",
+        a.console, a.seq, b.seq
+    );
 }

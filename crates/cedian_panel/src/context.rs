@@ -525,7 +525,9 @@ mod tests {
         let private = read("cedian://buffer/.env", cx).await.unwrap_err();
         assert!(private.contains("private"), "{private}");
         let link = read("cedian://buffer/link.txt", cx).await.unwrap_err();
-        assert!(link.contains("outside"), "{link}");
+        assert!(link.contains("escapes"), "{link}");
+        let link_key = read("cedian://buffer//link.txt", cx).await.unwrap_err();
+        assert!(link_key.contains("outside"), "{link_key}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

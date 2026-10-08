@@ -22,6 +22,8 @@ pub struct AmbientSnapshot {
 pub const MAX_SELECTION_CHARS: usize = 500;
 /// Max diagnostics lines in the snapshot (full list via `cedian://diagnostics`).
 pub const MAX_DIAGNOSTICS_LINES: usize = 20;
+/// Max chars of one diagnostic line in the snapshot.
+pub const MAX_DIAGNOSTIC_CHARS: usize = 200;
 
 /// Buffer key (`/rel`) as the agent should name it: workspace-relative.
 /// OMP runs with the workspace as cwd and reads `/rel` as an absolute path.
@@ -43,19 +45,19 @@ pub fn capture_ambient(host: &dyn WorkspaceHost) -> AmbientSnapshot {
         }
         Some(format!("{} bytes {start}-{end}\n{snippet}", rel(&path)))
     });
-    // Diagnostics for the active file first, then others, bounded.
-    let mut diagnostics = Vec::new();
-    if let Some(active) = host.active_file() {
-        for d in host.diagnostics(&active) {
-            diagnostics.push(render_diagnostic(&d));
-        }
-    }
+    // The active file's, most severe first, then earliest.
+    let mut found = host
+        .active_file()
+        .map(|active| host.diagnostics(&active))
+        .unwrap_or_default();
+    found.sort_by_key(|d| (d.severity, d.line));
     AmbientSnapshot {
         active_file,
         selection,
-        diagnostics: diagnostics
-            .into_iter()
+        diagnostics: found
+            .iter()
             .take(MAX_DIAGNOSTICS_LINES)
+            .map(render_diagnostic)
             .collect(),
     }
 }
@@ -66,7 +68,14 @@ fn render_diagnostic(d: &Diagnostic) -> String {
         crate::DiagnosticSeverity::Warning => "warning",
         crate::DiagnosticSeverity::Info => "info",
     };
-    format!("{sev} {}:{} {}", rel(&d.path), d.line, d.message)
+    let message = d.message.split_whitespace().collect::<Vec<_>>().join(" ");
+    let line = format!("{sev} {}:{} {message}", rel(&d.path), d.line);
+    if line.chars().count() <= MAX_DIAGNOSTIC_CHARS {
+        return line;
+    }
+    let mut short: String = line.chars().take(MAX_DIAGNOSTIC_CHARS - 1).collect();
+    short.push('…');
+    short
 }
 
 /// Render the snapshot as a compact pre-prompt block. Empty sections omitted.
@@ -127,5 +136,35 @@ mod tests {
         assert!(rendered.contains("active-file: a.rs"));
         assert!(rendered.contains("selection:\na.rs bytes 0-2\nfn"));
         assert!(rendered.contains("error a.rs:0 boom"));
+    }
+
+    /// The 20 kept are the most severe, then the earliest, each one line of
+    /// at most 200 chars.
+    #[test]
+    fn snapshot_keeps_the_worst_diagnostics_on_one_short_line_each() {
+        use crate::DiagnosticSeverity::{Error, Info, Warning};
+        let host = HostTools::new(Path::new("/"));
+        host.open(Path::new("/a.rs"), "");
+        host.set_active_file(Some(PathBuf::from("/a.rs")));
+        let at = |line, severity, message: &str| Diagnostic {
+            path: PathBuf::from("/a.rs"),
+            line,
+            severity,
+            message: message.to_string(),
+        };
+        let mut diagnostics: Vec<_> = (0..25).map(|line| at(line, Info, "hint")).collect();
+        diagnostics.push(at(40, Error, "late"));
+        diagnostics.push(at(30, Error, "early"));
+        diagnostics.push(at(35, Warning, &format!("first\n{}", "x".repeat(300))));
+        host.publish_diagnostics(Path::new("/a.rs"), diagnostics);
+        let snap = capture_ambient(&host);
+        assert_eq!(snap.diagnostics.len(), MAX_DIAGNOSTICS_LINES);
+        assert_eq!(snap.diagnostics[0], "error a.rs:30 early");
+        assert_eq!(snap.diagnostics[1], "error a.rs:40 late");
+        assert!(snap.diagnostics[2].starts_with("warning a.rs:35 first x"));
+        assert_eq!(snap.diagnostics[3], "info a.rs:0 hint");
+        for line in &snap.diagnostics {
+            assert!(!line.contains('\n') && line.chars().count() <= MAX_DIAGNOSTIC_CHARS);
+        }
     }
 }

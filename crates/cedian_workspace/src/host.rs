@@ -47,7 +47,8 @@ pub struct Diagnostic {
 }
 
 /// Diagnostic severity (LSP subset).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Ordered most severe first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DiagnosticSeverity {
     Error,
@@ -164,6 +165,7 @@ impl HostTools {
         // spellings (`/tmp/...` vs `/private/tmp/...`) while workdir is
         // canonical. `canonicalize` needs existence — lexical `/tmp`
         // fallback needs none.
+        let path = &self.workdir.join(path);
         let canon = path.canonicalize().unwrap_or_else(|_| {
             let s = path.to_string_lossy();
             if s.starts_with("/tmp/") {
@@ -573,6 +575,21 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    /// A relative path names a file of the workspace, whatever the
+    /// process's cwd holds.
+    #[test]
+    fn relative_path_resolves_against_the_workdir() {
+        let dir = std::env::temp_dir().join(format!("cedian-resolve-rel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let h = HostTools::new(&dir);
+        // The crate's own Cargo.toml exists in the test's cwd, not in `dir`.
+        assert_eq!(
+            h.resolve(Path::new("Cargo.toml")),
+            Ok(PathBuf::from("/Cargo.toml"))
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

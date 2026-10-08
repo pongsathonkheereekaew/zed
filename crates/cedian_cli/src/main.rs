@@ -1024,6 +1024,7 @@ fn cmd_worker(workdir: &Path, args: &[String]) -> Result<(), String> {
             let kind = args.get(2).ok_or(usage)?;
             let title = args.get(3).ok_or(usage)?;
             let base = worker_base(args, 4)?;
+            let _lock = cedian_worker::Registry::lock(&state).map_err(|e| e.to_string())?;
             let (mut reg, _) = cedian_worker::Registry::open(&state).map_err(|e| e.to_string())?;
             let mut head = cedian_worker::spawn(workdir, id, &base).map_err(|e| e.to_string())?;
             head.status = cedian_worker::WorkerStatus::Running;
@@ -1062,6 +1063,7 @@ fn cmd_worker(workdir: &Path, args: &[String]) -> Result<(), String> {
                 .get(1)
                 .ok_or("usage: cedian worker merge-back <id> [--base <branch>]")?;
             let base = worker_base(args, 2)?;
+            let _lock = cedian_worker::Registry::lock(&state).map_err(|e| e.to_string())?;
             let (mut reg, _) = cedian_worker::Registry::open(&state).map_err(|e| e.to_string())?;
             let head = reg
                 .get(id)
@@ -1090,6 +1092,7 @@ fn cmd_worker(workdir: &Path, args: &[String]) -> Result<(), String> {
             if args.len() > 2 {
                 return Err("usage: cedian worker remove <id>".to_string());
             }
+            let _lock = cedian_worker::Registry::lock(&state).map_err(|e| e.to_string())?;
             let (mut reg, _) = cedian_worker::Registry::open(&state).map_err(|e| e.to_string())?;
             let head = reg
                 .get(id)

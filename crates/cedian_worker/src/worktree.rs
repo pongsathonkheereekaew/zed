@@ -111,6 +111,14 @@ pub fn remove(repo: &Path, head: &WorkerHead) -> Result<(), WorkerError> {
     Ok(())
 }
 
+/// Throw away a tree [`spawn`] just made and its branch, which hold no work
+/// yet; used when the request it was made for fails after it.
+pub(crate) fn discard(repo: &Path, head: &WorkerHead) -> Result<(), WorkerError> {
+    git(repo, &["worktree", "remove", "--force", &head.worktree])?;
+    git(repo, &["branch", "-D", &head.branch])?;
+    Ok(())
+}
+
 /// What merging the worker branch into `base` would do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergePlan {

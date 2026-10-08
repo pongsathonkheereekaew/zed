@@ -2,6 +2,7 @@
 //! creates. Mechanism only — the same `spawn` + [`Registry`] row the
 //! `cedian worker spawn` verb uses; OMP keeps the orchestration policy.
 
+use crate::worktree::discard;
 use crate::{Registry, WorkerError, WorkerStatus, spawn, validate_id};
 use omp_rpc::HostTool;
 use serde_json::{Map, Value, json};
@@ -45,7 +46,10 @@ fn missing_brief_fields(args: &Map<String, Value>) -> Vec<&'static str> {
 /// `args`, record it in the registry under `state` (the repo's cedian state
 /// dir) and store the brief beside it as revision 1. A request without a
 /// whole brief, or whose id the registry already has, is refused BEFORE
-/// `git worktree add`, so a refused request never leaves a tree behind.
+/// `git worktree add`; the brief is stored before the tree is made, and a
+/// later failure takes tree and brief back, so a failed request leaves
+/// neither and every row has its brief (ADR-0033). The registry lock is
+/// held throughout: OMP runs host tool calls in parallel.
 pub fn request_worktree(
     repo: &Path,
     state: &Path,
@@ -67,14 +71,24 @@ pub fn request_worktree(
         "" => "HEAD",
         b => b,
     };
+    let _lock = Registry::lock(state).map_err(|e| e.to_string())?;
     let (mut reg, _) = Registry::open(state).map_err(|e| e.to_string())?;
     if reg.get(id).is_some() {
         return Err(WorkerError::Exists(id.to_string()).to_string());
     }
     validate_id(id).map_err(|e| e.to_string())?;
     let briefs = state.join("briefs");
-    std::fs::create_dir_all(&briefs).map_err(|e| format!("briefs: {e}"))?;
-    let mut head = spawn(repo, id, base).map_err(|e| e.to_string())?;
+    let brief = briefs.join(format!("{id}.1.json"));
+    std::fs::create_dir_all(&briefs)
+        .and_then(|()| std::fs::write(&brief, Value::Object(args.clone()).to_string()))
+        .map_err(|e| format!("brief: {e}"))?;
+    let mut head = match spawn(repo, id, base) {
+        Ok(head) => head,
+        Err(e) => {
+            let _ = std::fs::remove_file(&brief);
+            return Err(e.to_string());
+        }
+    };
     head.status = WorkerStatus::Running;
     head.task_title = text("goal").to_string();
     head.kind = text("kind").to_string();
@@ -84,11 +98,17 @@ pub fn request_worktree(
         repo.join(&head.worktree).display(),
         head.branch
     );
-    reg.insert(head).map_err(|e| e.to_string())?;
-    reg.save(state).map_err(|e| e.to_string())?;
-    let brief = Value::Object(args.clone());
-    std::fs::write(briefs.join(format!("{id}.1.json")), brief.to_string())
-        .map_err(|e| format!("brief: {e}"))?;
+    let saved = reg
+        .insert(head.clone())
+        .and_then(|()| reg.save(state))
+        .map_err(|e| e.to_string());
+    if let Err(e) = saved {
+        let _ = std::fs::remove_file(&brief);
+        return Err(match discard(repo, &head) {
+            Ok(()) => e,
+            Err(left) => format!("{e}; its tree was left behind: {left}"),
+        });
+    }
     Ok(reply)
 }
 
@@ -187,6 +207,45 @@ mod tests {
         assert!(!repo.join(".worktrees/w1").exists());
         assert!(Registry::open(&state(&repo)).unwrap().0.get("w1").is_none());
         assert!(!state(&repo).join("briefs/w1.1.json").exists());
+    }
+
+    #[test]
+    fn parallel_requests_each_keep_their_row() {
+        let repo = fixture();
+        let ids: Vec<String> = (0..8).map(|n| format!("p{n}")).collect();
+        let results: Vec<Result<String, String>> = std::thread::scope(|s| {
+            let handles: Vec<_> = ids
+                .iter()
+                .map(|id| {
+                    let repo = &repo;
+                    s.spawn(move || request_worktree(repo, &state(repo), &args(brief(id))))
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for result in &results {
+            assert!(result.is_ok(), "{result:?}");
+        }
+        let (reg, _) = Registry::open(&state(&repo)).unwrap();
+        let rows: Vec<&str> = reg.all().map(|head| head.id.as_str()).collect();
+        assert_eq!(rows, ids, "a parallel request lost its row");
+    }
+
+    #[test]
+    fn a_brief_that_cannot_be_stored_leaves_no_tree_and_no_row() {
+        let repo = fixture();
+        let stuck = state(&repo).join("briefs/w1.1.json");
+        std::fs::create_dir_all(&stuck).unwrap();
+        let err = request_worktree(&repo, &state(&repo), &args(brief("w1"))).unwrap_err();
+        assert!(err.contains("brief"), "{err}");
+        assert!(
+            !repo.join(".worktrees/w1").exists(),
+            "no tree without its brief"
+        );
+        assert!(Registry::open(&state(&repo)).unwrap().0.get("w1").is_none());
+        std::fs::remove_dir(&stuck).unwrap();
+        request_worktree(&repo, &state(&repo), &args(brief("w1"))).expect("a retry succeeds");
+        assert!(stuck.is_file());
     }
 
     #[test]

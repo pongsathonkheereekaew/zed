@@ -107,6 +107,21 @@ impl Default for Registry {
 }
 
 impl Registry {
+    /// Take the registry's lock under `state` (created if missing), held
+    /// until the file is dropped. Every open-change-save holds it, the app's
+    /// host tool and the CLI alike, so no writer saves over another's row.
+    pub fn lock(state: &Path) -> Result<std::fs::File, WorkerError> {
+        std::fs::create_dir_all(state).map_err(|e| WorkerError::Io(e.to_string()))?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(state.join("workers.lock"))
+            .map_err(|e| WorkerError::Io(e.to_string()))?;
+        file.lock().map_err(|e| WorkerError::Io(e.to_string()))?;
+        Ok(file)
+    }
+
     /// Open the registry; a missing file yields an empty one. Returns the
     /// registry plus whether the file already existed. An unreadable, corrupt
     /// or other-version file fails closed — never silently emptied, since the

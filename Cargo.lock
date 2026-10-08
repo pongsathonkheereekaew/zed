@@ -2868,6 +2868,7 @@ name = "cedian_panel"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "cedian_agent",
  "cedian_agent_ui",
  "cedian_fake_omp",
@@ -2893,6 +2894,7 @@ dependencies = [
  "text",
  "theme",
  "theme_settings",
+ "tungstenite 0.26.2",
  "ui",
  "util",
  "workspace",

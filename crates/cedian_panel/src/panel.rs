@@ -17,6 +17,7 @@
 //! view lists each file's hunks with Accept and Reject, Accept all, and
 //! Revert turn.
 
+use crate::browser::BrowserHost;
 use crate::context;
 use crate::dialogs::OpenDialog;
 use crate::import::{self, ImportOutcome, Mark};
@@ -38,7 +39,8 @@ use gpui::{
 use language::{Buffer, BufferEvent};
 use omp_rpc::{ExtensionUiRequest, ImageContent};
 use project::Project;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use ui::{Button, Label, prelude::*};
 use workspace::{
@@ -164,6 +166,10 @@ pub struct CedianPanel {
     /// The workspace whose active editor gives the selection OMP sees.
     workspace: Option<WeakEntity<Workspace>>,
     _events: Option<Task<()>>,
+    /// The workspace's Chromium, shared with OMP (ADR-0049); closed with
+    /// the panel.
+    browser: Option<Arc<BrowserHost>>,
+    _browser_events: Option<Task<()>>,
     /// Answers OMP's `cedian://` reads.
     _context: Option<Task<()>>,
 }
@@ -213,6 +219,8 @@ impl CedianPanel {
             show_settings: false,
             workspace: None,
             _events: None,
+            browser: None,
+            _browser_events: None,
             _context: None,
         };
         if this.workspace_root(cx).is_some() {
@@ -444,6 +452,9 @@ impl CedianPanel {
                 return;
             }
         };
+        if self.browser.is_none() {
+            self.open_browser_host(&spec.state_dir, cx);
+        }
         let (read_tx, read_rx) = mpsc::unbounded::<context::Read>();
         spec.uris.push(context::scheme(read_tx));
         let this = cx.entity().downgrade();
@@ -471,6 +482,47 @@ impl CedianPanel {
             }
         }));
         cx.notify();
+    }
+
+    /// Listen on the workspace's browser endpoint; Chromium starts on the
+    /// first connection.
+    fn open_browser_host(&mut self, state_dir: &Path, cx: &mut Context<Self>) {
+        let (tx, mut rx) = mpsc::unbounded::<()>();
+        match BrowserHost::open(
+            state_dir.join("browser-profile"),
+            crate::browser::executable(),
+            move || {
+                let _ = tx.unbounded_send(());
+            },
+        ) {
+            Ok(host) => self.browser = Some(Arc::new(host)),
+            Err(e) => {
+                self.notice = Some(e);
+                return;
+            }
+        }
+        self._browser_events = Some(cx.spawn(async move |this, cx| {
+            while rx.next().await.is_some() {
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    pub fn browser(&self) -> Option<&Arc<BrowserHost>> {
+        self.browser.as_ref()
+    }
+
+    /// The "Open browser" button: start Chromium now.
+    pub fn open_browser(&mut self, cx: &mut Context<Self>) {
+        let Some(host) = self.browser.clone() else {
+            return;
+        };
+        cx.background_spawn(async move {
+            let _ = host.start();
+        })
+        .detach();
     }
 
     /// The prompt as OMP gets it: the bounded snapshot of what the person
@@ -1397,6 +1449,15 @@ impl Render for CedianPanel {
                                     },
                                 )
                                 .on_click(cx.listener(|this, _, _, cx| this.toggle_review(cx))),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "cedian-open-browser".to_string())
+                            .child(
+                                Button::new("cedian-open-browser", "Open browser")
+                                    .disabled(self.browser.is_none())
+                                    .on_click(cx.listener(|this, _, _, cx| this.open_browser(cx))),
                             ),
                     )
                     .child(

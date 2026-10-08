@@ -167,9 +167,17 @@ fn forward(
     connection: u64,
     shared: &Shared,
 ) -> Result<(), String> {
+    // A message read while the person took the page is sent once released:
+    // the hold can start while a read waits.
+    let mut pending = None;
     while !shared.closed() {
         if !shared.held() {
-            if let Some(message) = read(client)? {
+            if pending.is_none() {
+                pending = read(client)?;
+            }
+            if !shared.held()
+                && let Some(message) = pending.take()
+            {
                 if let Message::Text(text) = &message
                     && let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
                     && let Some(method) = value.get("method").and_then(|m| m.as_str())

@@ -893,11 +893,19 @@ impl CedianPanel {
             .filter(|p| !buffers.iter().any(|(_, o)| o == *p))
             .cloned()
             .collect();
-        let marks = buffers
+        // A buffer dirty before the call differs from its disk: its disk
+        // text at the start is read, so a disk the call leaves alone is no
+        // outcome (a clean buffer's text is its disk text).
+        let mut dirty: Vec<(usize, PathBuf)> = Vec::new();
+        let marks: Vec<(Entity<Buffer>, Mark)> = buffers
             .into_iter()
-            .map(|(b, _)| {
+            .enumerate()
+            .map(|(i, (b, path))| {
                 self.review.observe(&b, &tool_call_id, cx);
                 let mark = b.update(cx, |b, _| import::begin(b));
+                if b.read(cx).is_dirty() {
+                    dirty.push((i, path));
+                }
                 (b, mark)
             })
             .collect();
@@ -906,11 +914,31 @@ impl CedianPanel {
             CallMarks {
                 marks,
                 unopened: Vec::new(),
-                reading: to_open.len(),
+                reading: to_open.len() + dirty.len(),
                 ended: None,
             },
         );
         let fs = self.project.read(cx).fs().clone();
+        for (i, path) in dirty {
+            let fs = fs.clone();
+            let id = tool_call_id.clone();
+            cx.spawn(async move |this, cx| {
+                let before = fs.load(&path).await.ok();
+                this.update(cx, |this, cx| {
+                    let Some(call) = this.calls.get_mut(&id) else {
+                        return;
+                    };
+                    if let Some(mut before) = before {
+                        text::LineEnding::normalize(&mut before);
+                        call.marks[i].1.set_disk_at_start(before);
+                    }
+                    call.reading -= 1;
+                    this.import_when_ready(id, cx);
+                })
+                .ok();
+            })
+            .detach();
+        }
         for path in to_open {
             let fs = fs.clone();
             let id = tool_call_id.clone();
@@ -1931,6 +1959,7 @@ mod tests {
         let (f, buffer) = fixture(cx).await;
         buffer.update(cx, |b, cx| b.edit([(0..0, "USER ")], None, cx));
         tool_start(&f, cx, "c1", &["notes.txt"]);
+        cx.run_until_parked();
         omp_writes(&f, "/ws/notes.txt", "alpha\nBETA\ngamma\n").await;
         tool_end(&f, cx, "c1");
         let reason = f
@@ -2412,6 +2441,47 @@ mod tests {
             )]
         );
         assert_eq!(other.read_with(cx, |b, _| b.text()), "USER one\ntwo\n");
+    }
+
+    /// A file already dirty before the call, named by the call but left as
+    /// it was on disk: the disk did not change, so it is no outcome. It is
+    /// not listed STALE and the person's text is kept.
+    #[gpui::test]
+    async fn a_named_file_dirty_before_the_call_whose_disk_is_unchanged_is_no_outcome(
+        cx: &mut TestAppContext,
+    ) {
+        let (f, _notes) = fixture(cx).await;
+        let other = f
+            .project
+            .update(cx, |p, cx| p.open_local_buffer("/ws/other.txt", cx))
+            .await
+            .unwrap();
+        other.update(cx, |b, cx| b.edit([(0..0, "USER ")], None, cx));
+        tool_start(&f, cx, "c1", &["notes.txt", "other.txt"]);
+        cx.run_until_parked();
+        omp_writes(&f, "/ws/notes.txt", "alpha\nBETA\ngamma\n").await;
+        tool_end(&f, cx, "c1");
+        let files: Vec<(String, Option<String>)> = f
+            .window
+            .update(cx, |panel, _, cx| {
+                panel
+                    .review
+                    .files()
+                    .iter()
+                    .map(|file| {
+                        (
+                            panel.review.path(file, cx).display().to_string(),
+                            file.stale_import().map(str::to_string),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap();
+        assert_eq!(files, vec![("ws/notes.txt".to_string(), None)]);
+        other.read_with(cx, |b, _| {
+            assert_eq!(b.text(), "USER one\ntwo\n");
+            assert!(b.is_dirty());
+        });
     }
 
     #[gpui::test]

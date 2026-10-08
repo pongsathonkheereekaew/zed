@@ -21,6 +21,10 @@ use text::TransactionId;
 pub struct Mark {
     start: text::BufferSnapshot,
     start_top: Option<TransactionId>,
+    /// The file's disk text when the tool started, when it was read: a
+    /// buffer dirty before the call differs from its disk, and only a disk
+    /// the tool changed is an outcome.
+    disk_at_start: Option<String>,
 }
 
 impl Mark {
@@ -28,6 +32,17 @@ impl Mark {
     /// on the task's first edit to it.
     pub fn start(&self) -> &text::BufferSnapshot {
         &self.start
+    }
+
+    /// Record the disk text read at the tool's start.
+    pub fn set_disk_at_start(&mut self, text: String) {
+        self.disk_at_start = Some(text);
+    }
+
+    fn disk_at_start(&self) -> String {
+        self.disk_at_start
+            .clone()
+            .unwrap_or_else(|| self.start.text())
     }
 }
 
@@ -52,6 +67,7 @@ pub fn begin(buffer: &mut Buffer) -> Mark {
     Mark {
         start: buffer.text_snapshot(),
         start_top: top(buffer),
+        disk_at_start: None,
     }
 }
 
@@ -89,8 +105,9 @@ pub fn begin_from(
 /// landed after it.
 ///
 /// A file the tool did not write (the disk still holds the text the call
-/// started from) is `Unchanged` whatever the buffer holds: the person's
-/// typing in an open file the call never touched is no outcome.
+/// started from, read at the mark when the buffer was dirty then) is
+/// `Unchanged` whatever the buffer holds: the person's typing in an open
+/// file the call never touched is no outcome.
 ///
 /// Whether the watcher raced ahead is decided by content, not by the undo
 /// stack: edits since [`begin`] that leave the buffer equal to the disk text
@@ -111,7 +128,7 @@ pub async fn finish(
     };
     let mut disk_text = load.await?;
     text::LineEnding::normalize(&mut disk_text);
-    if disk_text == mark.start.text() {
+    if disk_text == mark.disk_at_start() {
         return Ok(ImportOutcome::Unchanged);
     }
     if buffer.read_with(cx, |b, _| b.is_dirty()) {

@@ -131,9 +131,17 @@ const REVIEWER_DENY: &[&str] = &[
 
 /// The reviewer's whole built-in tool set (ADR-0043): `--tools` turns every
 /// other built-in off, and the flags after it keep a workspace from adding
-/// extensions, skills or language servers.
+/// extensions, skills or language servers. An explicit empty
+/// `--append-system-prompt` replaces OMP's `APPEND_SYSTEM.md` lookup, so
+/// neither the user's nor the workspace's file reaches a reviewer (ADR-0051).
 const REVIEWER_TOOLS: &str = "read,grep,glob,bash";
-const REVIEWER_FLAGS: &[&str] = &["--no-extensions", "--no-skills", "--no-lsp"];
+const REVIEWER_FLAGS: &[&str] = &[
+    "--no-extensions",
+    "--no-skills",
+    "--no-lsp",
+    "--append-system-prompt",
+    "",
+];
 
 /// The policy half of the profile, mapped from cedian settings by the caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -928,6 +936,11 @@ mod tests {
         for flag in ["--no-extensions", "--no-skills", "--no-lsp"] {
             assert!(plan.argv.iter().any(|a| a == flag), "{flag}");
         }
+        assert_eq!(
+            after("--append-system-prompt"),
+            "",
+            "no APPEND_SYSTEM.md reaches a reviewer"
+        );
         assert!(plan.dedupe_key.ends_with(":reviewer"));
         assert_eq!(
             plan.overlay_path,

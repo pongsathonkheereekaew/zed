@@ -257,13 +257,22 @@ impl Gate {
         }
     }
 
-    /// The event thread saw a run start or the session settle.
+    /// The event thread saw a run start or the session settle. The run that
+    /// starts once our prompt is sent is that prompt (aborted at once if
+    /// cancelled); any other is OMP's own. Both are decided under one lock,
+    /// so our run is never taken for OMP's.
     fn observe_run(&self, event: &RouterEvent) {
         match event {
             RouterEvent::AgentStart => {
                 let mut turn = self.turn.lock();
-                if turn.phase != Phase::Sent {
-                    turn.unprompted = true;
+                match turn.phase {
+                    Phase::Sent => {
+                        turn.phase = Phase::Started;
+                        if turn.cancelled {
+                            self.abort();
+                        }
+                    }
+                    _ => turn.unprompted = true,
                 }
             }
             RouterEvent::Settled => self.turn.lock().unprompted = false,
@@ -277,17 +286,6 @@ impl Gate {
                 }
             }
             _ => {}
-        }
-    }
-
-    /// OMP started the prompt it was sent: abort it at once if cancelled.
-    fn started(&self) {
-        let mut turn = self.turn.lock();
-        if turn.phase == Phase::Sent {
-            turn.phase = Phase::Started;
-            if turn.cancelled {
-                self.abort();
-            }
         }
     }
 
@@ -704,9 +702,6 @@ fn run(
     let forward_gate = Arc::clone(&gate);
     std::thread::spawn(move || {
         for event in router_events {
-            if matches!(event, RouterEvent::AgentStart) {
-                forward_gate.started();
-            }
             forward_gate.observe_run(&event);
             if let Err(e) = forward_gate.state.lock().observe(&event) {
                 let _ = forward.unbounded_send(LinkEvent::AuditFailed(e));

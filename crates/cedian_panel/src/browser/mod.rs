@@ -24,13 +24,32 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub use chromium::executable;
 
-/// How long after OMP sent an `Input.*` command a trusted input event is
-/// taken to be the agent's own.
-const AGENT_INPUT_WINDOW: Duration = Duration::from_millis(1000);
+/// Slack around an agent `Input.*` command's send and reply when matching a
+/// trusted input event's time to it.
+const INPUT_SLACK_MS: f64 = 10.0;
+/// How long an answered agent input is kept for matching late reports.
+const INPUT_KEEP_MS: f64 = 5000.0;
+
+/// One `Input.*` command OMP sent through the endpoint: its connection and
+/// id, sent and answered in wall-clock milliseconds.
+#[derive(Debug, Clone)]
+struct AgentInput {
+    connection: u64,
+    id: u64,
+    sent: f64,
+    answered: Option<f64>,
+}
+
+fn now_ms() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .unwrap_or_default()
+}
 
 /// One capture of the shared page, bound to the browser's frame sequence.
 #[derive(Debug, Clone)]
@@ -78,7 +97,7 @@ pub struct BrowserState {
     /// The person used the window during this turn: OMP's browser traffic
     /// is held until [`BrowserHost::resume`] or the turn ends.
     pub preempted: bool,
-    agent_input_at: Option<Instant>,
+    agent_inputs: Vec<AgentInput>,
 }
 
 struct Running {
@@ -227,17 +246,50 @@ impl Shared {
         outcome
     }
 
-    /// OMP sent an `Input.*` command: the trusted input that follows is its.
-    fn agent_input(&self) {
-        self.state.lock().agent_input_at = Some(Instant::now());
+    /// OMP sent `Input.*` command `id` on `connection`.
+    fn agent_input_sent(&self, connection: u64, id: u64) {
+        let now = now_ms();
+        let mut state = self.state.lock();
+        state
+            .agent_inputs
+            .retain(|i| i.answered.is_none_or(|at| now - at < INPUT_KEEP_MS));
+        state.agent_inputs.push(AgentInput {
+            connection,
+            id,
+            sent: now,
+            answered: None,
+        });
     }
 
-    /// A trusted input event in the page.
-    fn person_input(&self) {
+    /// Chromium answered message `id` on `connection`.
+    fn agent_input_answered(&self, connection: u64, id: u64) {
         let mut state = self.state.lock();
-        let agents = state
-            .agent_input_at
-            .is_some_and(|at| at.elapsed() < AGENT_INPUT_WINDOW);
+        if let Some(input) = state
+            .agent_inputs
+            .iter_mut()
+            .find(|i| i.connection == connection && i.id == id && i.answered.is_none())
+        {
+            input.answered = Some(now_ms());
+        }
+    }
+
+    fn has_agent_input_in_flight(&self, connection: u64) -> bool {
+        self.state
+            .lock()
+            .agent_inputs
+            .iter()
+            .any(|i| i.connection == connection && i.answered.is_none())
+    }
+
+    /// A trusted input event in the page, made at wall-clock `at` ms. It is
+    /// the agent's when an agent `Input.*` command was in flight then;
+    /// otherwise it is the person's.
+    fn person_input(&self, at: Option<f64>) {
+        let at = at.unwrap_or_else(now_ms);
+        let mut state = self.state.lock();
+        let agents = state.agent_inputs.iter().any(|i| {
+            i.sent - INPUT_SLACK_MS <= at && at <= i.answered.unwrap_or(f64::MAX) + INPUT_SLACK_MS
+        });
         if agents || !state.turn_active || state.preempted {
             return;
         }

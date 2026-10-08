@@ -74,6 +74,9 @@ fn main() {
         frames_are_bound_to_the_browser(&root)
     });
     run("the_persons_input_wins", || the_persons_input_wins(&root));
+    run("the_person_preempts_continuous_agent_input", || {
+        the_person_preempts_continuous_agent_input(&root)
+    });
     let exit_root = root.clone();
     run("u7_exit_through_the_panel", move || {
         gpui::run_test_once(
@@ -407,6 +410,51 @@ fn the_persons_input_wins(root: &std::path::Path) {
         "released when the turn ends"
     );
     assert!(!host.state().preempted);
+}
+
+fn the_person_preempts_continuous_agent_input(root: &std::path::Path) {
+    let profile = root.join("typing-profile");
+    let host = BrowserHost::open(profile.clone(), exe(), || {}).unwrap();
+    host.start().unwrap();
+    let list: Value = serde_json::from_str(&get(&host.url(), "/json/list").unwrap()).unwrap();
+    let page_ws = list[0]["webSocketDebuggerUrl"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let port = std::fs::read_to_string(profile.join("DevToolsActivePort")).unwrap();
+    let port = port.lines().next().unwrap().to_string();
+    let (mut person, _) =
+        tungstenite::connect(format!("ws://127.0.0.1:{port}/devtools/page/P1")).unwrap();
+    host.set_turn(true);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let agent = std::thread::spawn({
+        let stop = stop.clone();
+        move || {
+            let (mut omp, _) = tungstenite::connect(&page_ws).unwrap();
+            let mut id = 100;
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                send(&mut omp, id, "Input.dispatchKeyEvent");
+                reply(&mut omp, id, Duration::from_millis(200));
+                id += 1;
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !host.state().preempted,
+        "the agent's own typing is not the person's"
+    );
+    for id in 0..3 {
+        send(&mut person, id, "Fake.personInput");
+        std::thread::sleep(Duration::from_millis(70));
+    }
+    wait_until("the person preempts the typing agent", || {
+        host.state().preempted
+    });
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    host.set_turn(false);
+    agent.join().unwrap();
 }
 
 const LAUNCH: &str = concat!(

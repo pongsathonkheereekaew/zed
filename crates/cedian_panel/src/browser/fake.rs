@@ -130,6 +130,15 @@ fn websocket(stream: TcpStream, page: &Arc<Mutex<Page>>) -> Result<(), String> {
     }
 }
 
+fn input_payload() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+        * 1000.0;
+    json!({"type": "pointerdown", "time": now}).to_string()
+}
+
 fn broadcast(page: &mut Page, method: &str, params: Value) {
     let event = json!({"method": method, "params": params}).to_string();
     page.listeners.retain(|l| l.send(event.clone()).is_ok());
@@ -178,7 +187,7 @@ fn answer(request: &Value, page: &Arc<Mutex<Page>>) -> Value {
             broadcast(
                 &mut page,
                 "Runtime.bindingCalled",
-                json!({"name": "cedianInput", "payload": "pointerdown"}),
+                json!({"name": "cedianInput", "payload": input_payload()}),
             );
             json!({})
         }
@@ -186,7 +195,7 @@ fn answer(request: &Value, page: &Arc<Mutex<Page>>) -> Value {
             broadcast(
                 &mut page,
                 "Runtime.bindingCalled",
-                json!({"name": "cedianInput", "payload": "pointerdown"}),
+                json!({"name": "cedianInput", "payload": input_payload()}),
             );
             json!({})
         }

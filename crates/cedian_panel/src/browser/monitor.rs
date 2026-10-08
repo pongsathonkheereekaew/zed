@@ -18,7 +18,8 @@ const INPUT_BINDING: &str = "cedianInput";
 /// Reports trusted (person- or CDP-made) input to cedian's binding.
 const INPUT_LISTENER: &str = "(() => { if (window.__cedianInput) return; window.__cedianInput = 1; \
 for (const t of ['pointerdown', 'keydown', 'wheel']) addEventListener(t, e => { \
-if (e.isTrusted && window.cedianInput) window.cedianInput(t); }, true); })()";
+if (e.isTrusted && window.cedianInput) window.cedianInput(JSON.stringify({type: t, \
+time: performance.timeOrigin + e.timeStamp})); }, true); })()";
 
 pub(super) type CaptureRequests = mpsc::Sender<mpsc::Sender<Result<Capture, String>>>;
 
@@ -137,7 +138,7 @@ fn apply(
     notifications: Vec<Notification>,
     requests: &mut HashMap<String, String>,
 ) {
-    let mut person = false;
+    let mut person = None;
     {
         let mut state = shared.state.lock();
         for Notification { method, params } in notifications {
@@ -203,14 +204,17 @@ fn apply(
                     );
                 }
                 "Runtime.bindingCalled" if text(&params, "/name") == INPUT_BINDING => {
-                    person = true;
+                    let at = serde_json::from_str::<Value>(&text(&params, "/payload"))
+                        .ok()
+                        .and_then(|p| p.get("time")?.as_f64());
+                    person = Some(at);
                 }
                 _ => {}
             }
         }
     }
-    if person {
-        shared.person_input();
+    if let Some(at) = person {
+        shared.person_input(at);
     }
     (shared.changed)();
 }

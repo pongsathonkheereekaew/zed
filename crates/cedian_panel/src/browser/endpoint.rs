@@ -6,11 +6,13 @@ use super::chromium::http_get;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
 const SLICE: Duration = Duration::from_millis(5);
+static NEXT_CONNECTION: AtomicU64 = AtomicU64::new(1);
 
 pub(super) fn serve(listener: TcpListener, shared: Arc<Shared>) {
     std::thread::spawn(move || {
@@ -151,16 +153,17 @@ fn websocket(stream: TcpStream, shared: &Arc<Shared>) -> Result<(), String> {
         tcp.set_read_timeout(Some(SLICE))
             .map_err(|e| e.to_string())?;
     }
+    let connection = NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed);
     while !shared.closed() {
         if !shared.held() {
             if let Some(message) = read(&mut client)? {
                 if let Message::Text(text) = &message
-                    && serde_json::from_str::<serde_json::Value>(text)
-                        .ok()
-                        .and_then(|v| v.get("method")?.as_str().map(|m| m.starts_with("Input.")))
-                        .unwrap_or(false)
+                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
+                    && let Some(method) = value.get("method").and_then(|m| m.as_str())
+                    && method.starts_with("Input.")
+                    && let Some(id) = value.get("id").and_then(|id| id.as_u64())
                 {
-                    shared.agent_input();
+                    shared.agent_input_sent(connection, id);
                 }
                 upstream.send(message).map_err(|e| e.to_string())?;
             }
@@ -168,6 +171,13 @@ fn websocket(stream: TcpStream, shared: &Arc<Shared>) -> Result<(), String> {
             std::thread::sleep(SLICE);
         }
         if let Some(message) = read(&mut upstream)? {
+            if let Message::Text(text) = &message
+                && shared.has_agent_input_in_flight(connection)
+                && let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
+                && let Some(id) = value.get("id").and_then(|id| id.as_u64())
+            {
+                shared.agent_input_answered(connection, id);
+            }
             client.send(message).map_err(|e| e.to_string())?;
         }
     }

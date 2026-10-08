@@ -258,9 +258,21 @@ impl FileReview {
     }
 
     fn fold_user_edits(&mut self, buffer: &Buffer) {
+        self.fold_user_edits_except(buffer, &[]);
+    }
+
+    /// Every edit since `last_seen` is the user's, except one lying inside
+    /// a range in `agent` (an imported transaction's own edits). An edit
+    /// only partly inside stays the user's: unsure means STALE.
+    fn fold_user_edits_except(&mut self, buffer: &Buffer, agent: &[Range<usize>]) {
         let snapshot = buffer.text_snapshot();
-        for (_, range) in snapshot.anchored_edits_since::<usize>(&self.last_seen) {
-            self.user_edits.push(range);
+        for (edit, range) in snapshot.anchored_edits_since::<usize>(&self.last_seen) {
+            let inside = agent
+                .iter()
+                .any(|a| a.start <= edit.new.start && edit.new.end <= a.end);
+            if !inside {
+                self.user_edits.push(range);
+            }
         }
         self.last_seen = snapshot.version().clone();
     }
@@ -668,17 +680,13 @@ impl TaskReview {
             file.user_edits.clear();
         }
         let buffer = buffer.read(cx);
-        // Edits between the last accounting and the transaction's start are
-        // the user's (a transaction autosave wrote, under the watcher's
-        // reload of OMP's write). The reload erased their text, so the only
-        // trace is the version gap: every edit since then counts as theirs
-        // (unsure means STALE, never an overwrite).
-        let started_later = buffer
-            .get_transaction(transaction)
-            .is_some_and(|t| !file.last_seen.observed_all(&t.start));
-        if started_later {
-            file.fold_user_edits(buffer);
-        }
+        // Edits since the last accounting outside the transaction are the
+        // user's (a transaction autosave wrote, under the watcher's reload
+        // of OMP's write).
+        let agent: Vec<Range<usize>> = buffer
+            .edited_ranges_for_transaction_id::<usize>(transaction)
+            .collect();
+        file.fold_user_edits_except(buffer, &agent);
         file.importing = false;
         if !file.turn_starts.iter().any(|(t, _)| *t == turn) {
             file.turn_starts.push((turn, baseline));
@@ -1563,28 +1571,32 @@ mod tests {
 
     /// Autosave plus the watcher racing ahead: the user's saved transaction
     /// during the call sits under the watcher's reload of OMP's write. The
-    /// import is the watcher's transaction; the user's lines are STALE, not
-    /// a pending agent hunk. A clean later import clears the file's STALE.
+    /// import is the watcher's transaction; the user's line is STALE, and
+    /// the agent's line elsewhere is a pending hunk, not STALE with it.
     #[gpui::test]
     async fn a_user_transaction_under_the_watchers_reload_is_stale(cx: &mut TestAppContext) {
         let mut f = setup(cx).await;
         cx.update(|cx| f.review.observe(&f.buffer, cx));
         let mark = f.buffer.update(cx, |b, _| import::begin(b));
         let baseline = mark.start().clone();
-        user_types(&f, 6..10, "by user", cx);
+        user_types(&f, 0..5, "by user", cx);
         f.project
             .update(cx, |p, cx| p.save_buffer(f.buffer.clone(), cx))
             .await
             .unwrap();
         f.fs.save(
             Path::new(NOTES),
-            &"alpha\nBETA\ngamma\n".into(),
+            &"by user\nBETA\ngamma\n".into(),
             LineEnding::Unix,
         )
         .await
         .unwrap();
         cx.run_until_parked();
-        assert_eq!(text(&f, cx), "alpha\nBETA\ngamma\n", "the watcher reloaded");
+        assert_eq!(
+            text(&f, cx),
+            "by user\nBETA\ngamma\n",
+            "the watcher reloaded"
+        );
         let outcome = import::finish(f.buffer.clone(), mark, &mut cx.to_async())
             .await
             .unwrap();
@@ -1592,7 +1604,13 @@ mod tests {
             panic!("{outcome:?}");
         };
         cx.update(|cx| f.review.agent_edited(&f.buffer, "c1", txn, baseline, cx));
-        assert_eq!(statuses(&f), vec![HunkStatus::Stale]);
+        let hunks = f.review.files()[0].hunks();
+        let seen: Vec<(u32, HunkStatus)> = hunks.iter().map(|h| (h.rows.start, h.status)).collect();
+        assert_eq!(
+            seen,
+            vec![(0, HunkStatus::Stale), (1, HunkStatus::Pending)],
+            "{hunks:?}"
+        );
     }
 
     #[gpui::test]

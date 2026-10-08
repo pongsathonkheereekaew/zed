@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Free build output when the disk runs low (8 GB machine, small disk): the
+# incremental cache, and every executable in target/debug/deps except the
+# newest of each name. Only build output; a later build recreates it.
+# `script/cedian-prune [min-free-GB]`, default 5; does nothing above it.
+set -euo pipefail
+cd "$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
+min_gb=${1:-5}
+free_gb() { df -Pk . | awk 'NR==2 { print int($4 / 1048576) }'; }
+[ "$(free_gb)" -ge "$min_gb" ] && exit 0
+echo "cedian-prune: $(free_gb) GB free, under ${min_gb} GB; pruning build output" >&2
+rm -rf target/debug/incremental
+deps=target/debug/deps
+if [ -d "$deps" ]; then
+  ls -t "$deps" | grep -E '^[a-z0-9_]+-[0-9a-f]{16}$' | awk -F- 'seen[$1]++' |
+    while read -r f; do
+      if [ -x "$deps/$f" ]; then rm -f "$deps/$f"; fi
+    done
+fi
+echo "cedian-prune: $(free_gb) GB free now" >&2

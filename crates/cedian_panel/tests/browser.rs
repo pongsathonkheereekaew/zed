@@ -64,6 +64,9 @@ fn main() {
         let _ = std::fs::remove_dir_all(&root);
         return;
     }
+    run("the_endpoint_refuses_web_pages", || {
+        the_endpoint_refuses_web_pages(&root)
+    });
     run("first_connection_starts_the_browser", || {
         first_connection_starts_the_browser(&root)
     });
@@ -140,6 +143,72 @@ fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// The raw status line for `request` sent to `url`'s endpoint.
+fn raw(url: &str, request: &str) -> String {
+    let mut stream = TcpStream::connect(url.trim_start_matches("http://")).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut out = Vec::new();
+    let _ = stream.read_to_end(&mut out);
+    String::from_utf8_lossy(&out)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn the_endpoint_refuses_web_pages(root: &std::path::Path) {
+    let host = BrowserHost::open(root.join("refuse-profile"), exe(), || {}).unwrap();
+    let own = host.url().trim_start_matches("http://").to_string();
+    let rebound = raw(
+        &host.url(),
+        "GET /json/version HTTP/1.1\r\nHost: evil.example\r\n\r\n",
+    );
+    assert!(
+        rebound.starts_with("HTTP/1.1 403"),
+        "foreign Host: {rebound}"
+    );
+    let page = raw(
+        &host.url(),
+        &format!(
+            "GET /devtools/page/P1 HTTP/1.1\r\nHost: {own}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nOrigin: http://evil.example\r\n\r\n"
+        ),
+    );
+    assert!(
+        page.starts_with("HTTP/1.1 403"),
+        "upgrade with an Origin: {page}"
+    );
+    let fetch = raw(
+        &host.url(),
+        &format!("GET /json/list HTTP/1.1\r\nHost: {own}\r\nOrigin: http://evil.example\r\n\r\n"),
+    );
+    assert!(
+        fetch.starts_with("HTTP/1.1 403"),
+        "fetch with an Origin: {fetch}"
+    );
+    let other = raw(
+        &host.url(),
+        &format!("GET /json/new?https://x.test HTTP/1.1\r\nHost: {own}\r\n\r\n"),
+    );
+    assert!(
+        other.starts_with("HTTP/1.1 404"),
+        "only discovery paths: {other}"
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!host.state().running, "a refused request starts nothing");
+    let local = raw(
+        &host.url(),
+        &format!(
+            "GET /json/version HTTP/1.1\r\nHost: localhost:{}\r\n\r\n",
+            own.rsplit(':').next().unwrap()
+        ),
+    );
+    assert!(local.starts_with("HTTP/1.1 200"), "localhost Host: {local}");
 }
 
 fn first_connection_starts_the_browser(root: &std::path::Path) {

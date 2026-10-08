@@ -31,16 +31,48 @@ pub(super) fn serve(listener: TcpListener, shared: Arc<Shared>) {
 
 fn connection(stream: TcpStream, shared: &Arc<Shared>) -> Result<(), String> {
     let head = peek_head(&stream)?;
-    let upgrade = head.lines().any(|l| {
-        l.split_once(':').is_some_and(|(k, v)| {
-            k.eq_ignore_ascii_case("upgrade") && v.trim().eq_ignore_ascii_case("websocket")
+    let own = stream.local_addr().map_err(|e| e.to_string())?.port();
+    let header = |name: &str| {
+        head.lines().skip(1).find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| v.trim().to_string())
         })
-    });
-    if upgrade {
-        websocket(stream, shared)
-    } else {
-        discovery(stream, &head, shared)
+    };
+    let path = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .unwrap_or_default()
+        .to_string();
+    let upgrade = header("upgrade").is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
+    // Chromium refuses a foreign Host (DNS rebinding) and any Origin on its
+    // own; this proxy dials it without either, so it has to refuse them here.
+    // OMP and Puppeteer send no Origin.
+    let host_ok = header("host")
+        .is_some_and(|h| h == format!("127.0.0.1:{own}") || h == format!("localhost:{own}"));
+    if !host_ok || header("origin").is_some() {
+        return refuse(stream, &head, "403 Forbidden");
     }
+    if upgrade && path.starts_with("/devtools/") {
+        websocket(stream, shared)
+    } else if !upgrade && matches!(path.as_str(), "/json/version" | "/json/list" | "/json") {
+        discovery(stream, &head, &path, own, shared)
+    } else {
+        refuse(stream, &head, "404 Not Found")
+    }
+}
+
+fn refuse(mut stream: TcpStream, head: &str, status: &str) -> Result<(), String> {
+    let mut sink = vec![0u8; head.len() + 4];
+    stream.read_exact(&mut sink).map_err(|e| e.to_string())?;
+    stream
+        .write_all(
+            format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .map_err(|e| e.to_string())
 }
 
 fn peek_head(stream: &TcpStream) -> Result<String, String> {
@@ -64,18 +96,17 @@ fn peek_head(stream: &TcpStream) -> Result<String, String> {
 
 /// `GET /json/...`: start the browser, ask it, and point its WebSocket URLs
 /// back at this endpoint.
-fn discovery(mut stream: TcpStream, head: &str, shared: &Arc<Shared>) -> Result<(), String> {
+fn discovery(
+    mut stream: TcpStream,
+    head: &str,
+    path: &str,
+    own: u16,
+    shared: &Arc<Shared>,
+) -> Result<(), String> {
     let mut sink = vec![0u8; head.len() + 4];
     stream.read_exact(&mut sink).map_err(|e| e.to_string())?;
-    let path = head
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .unwrap_or("/json/version")
-        .to_string();
-    let own = stream.local_addr().map_err(|e| e.to_string())?.port();
     let reply = shared.start().and_then(|port| {
-        http_get(port, &path).map(|body| {
+        http_get(port, path).map(|body| {
             body.replace(&format!("127.0.0.1:{port}"), &format!("127.0.0.1:{own}"))
                 .replace(&format!("localhost:{port}"), &format!("127.0.0.1:{own}"))
         })

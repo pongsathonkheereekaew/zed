@@ -29,9 +29,9 @@ pub enum ReviewError {
     NoFile {
         path: PathBuf,
     },
-    BadHunk {
+    /// The hunk the user acted on is no longer there, or not as they saw it.
+    Moved {
         path: PathBuf,
-        index: usize,
     },
     /// Resolving from this status is not allowed (a stale hunk is never
     /// rejected; an interrupted one is never resolved).
@@ -55,7 +55,9 @@ impl std::fmt::Display for ReviewError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoFile { path } => write!(f, "{} is not under review", path.display()),
-            Self::BadHunk { path, index } => write!(f, "no hunk {index} in {}", path.display()),
+            Self::Moved { path } => {
+                write!(f, "the change in {} moved; review again", path.display())
+            }
             Self::BadTransition {
                 status: HunkStatus::Stale,
             } => write!(
@@ -424,6 +426,15 @@ impl FileReview {
         plan
     }
 
+    fn hunk_index(&self, key: &HunkKey, path: &std::path::Path) -> Result<usize, ReviewError> {
+        self.hunks
+            .iter()
+            .position(|h| &h.key == key)
+            .ok_or_else(|| ReviewError::Moved {
+                path: path.to_path_buf(),
+            })
+    }
+
     /// The agent transactions behind a hunk's calls.
     fn txns_of(&self, hunk: &ReviewHunk) -> Vec<TransactionId> {
         self.agent_txns
@@ -689,15 +700,13 @@ impl TaskReview {
     pub fn accept(
         &mut self,
         path: &std::path::Path,
-        index: usize,
+        key: &HunkKey,
         cx: &App,
     ) -> Result<(), ReviewError> {
         let i = self.file_by_path(path, cx)?;
         let file = &mut self.files[i];
-        let hunk = file.hunks.get(index).ok_or_else(|| ReviewError::BadHunk {
-            path: path.to_path_buf(),
-            index,
-        })?;
+        let index = file.hunk_index(key, path)?;
+        let hunk = &file.hunks[index];
         match hunk.status {
             HunkStatus::Pending | HunkStatus::Unattributed | HunkStatus::Stale => {
                 let txns = file.txns_of(hunk);
@@ -718,19 +727,12 @@ impl TaskReview {
     pub fn reject(
         &mut self,
         path: &std::path::Path,
-        index: usize,
+        key: &HunkKey,
         cx: &mut App,
     ) -> Result<TransactionId, ReviewError> {
         let i = self.file_by_path(path, cx)?;
         let file = &mut self.files[i];
-        let hunk = file
-            .hunks
-            .get(index)
-            .cloned()
-            .ok_or_else(|| ReviewError::BadHunk {
-                path: path.to_path_buf(),
-                index,
-            })?;
+        let hunk = file.hunks[file.hunk_index(key, path)?].clone();
         if matches!(
             hunk.status,
             HunkStatus::Stale
@@ -1033,6 +1035,10 @@ mod tests {
         f.buffer.read_with(cx, |b, _| b.text())
     }
 
+    fn key(f: &Fixture, index: usize) -> HunkKey {
+        f.review.files()[0].hunks()[index].key.clone()
+    }
+
     fn statuses(f: &Fixture) -> Vec<HunkStatus> {
         f.review.files()[0]
             .hunks()
@@ -1076,7 +1082,11 @@ mod tests {
                 (original, written)
             );
             let path = cx.update(|cx| f.review.path(&f.review.files()[0], cx));
-            cx.update(|cx| f.review.reject(&path, 0, cx)).unwrap();
+            {
+                let k = key(&f, 0);
+                cx.update(|cx| f.review.reject(&path, &k, cx))
+            }
+            .unwrap();
             assert_eq!(text(&f, cx), original, "reject restored {written:?}");
         }
     }
@@ -1086,7 +1096,11 @@ mod tests {
         let mut f = setup(cx).await;
         agent_writes(&mut f, "c1", "alpha\nBETA\ngamma\n", cx).await;
         let path = cx.update(|cx| f.review.path(&f.review.files()[0], cx));
-        cx.update(|cx| f.review.reject(&path, 0, cx)).unwrap();
+        {
+            let k = key(&f, 0);
+            cx.update(|cx| f.review.reject(&path, &k, cx))
+        }
+        .unwrap();
         assert_eq!(text(&f, cx), ORIGINAL, "reject restored the baseline");
         let events = f.review.drain_events();
         assert_eq!(
@@ -1113,7 +1127,11 @@ mod tests {
         let mut f = setup(cx).await;
         agent_writes(&mut f, "c1", "alpha\nBETA\ngamma\n", cx).await;
         let path = cx.update(|cx| f.review.path(&f.review.files()[0], cx));
-        let txn = cx.update(|cx| f.review.reject(&path, 0, cx)).unwrap();
+        let txn = {
+            let k = key(&f, 0);
+            cx.update(|cx| f.review.reject(&path, &k, cx))
+        }
+        .unwrap();
         f.buffer.update(cx, |b, cx| {
             assert_eq!(b.undo(cx), Some(txn), "one undo is the reject");
             assert_eq!(
@@ -1137,7 +1155,11 @@ mod tests {
         let mut f = setup(cx).await;
         agent_writes(&mut f, "c1", "alpha\nBETA\ngamma\n", cx).await;
         let path = cx.update(|cx| f.review.path(&f.review.files()[0], cx));
-        cx.update(|cx| f.review.reject(&path, 0, cx)).unwrap();
+        {
+            let k = key(&f, 0);
+            cx.update(|cx| f.review.reject(&path, &k, cx))
+        }
+        .unwrap();
         f.project
             .update(cx, |p, cx| p.save_buffer(f.buffer.clone(), cx))
             .await
@@ -1156,7 +1178,11 @@ mod tests {
         let mut f = setup(cx).await;
         agent_writes(&mut f, "c1", "alpha\nBETA\ngamma\n", cx).await;
         let path = cx.update(|cx| f.review.path(&f.review.files()[0], cx));
-        cx.update(|cx| f.review.accept(&path, 0, cx)).unwrap();
+        {
+            let k = key(&f, 0);
+            cx.update(|cx| f.review.accept(&path, &k, cx))
+        }
+        .unwrap();
         agent_writes(&mut f, "c2", "alpha\nbeta\ngamma\n", cx).await;
         assert!(f.review.files()[0].hunks().is_empty(), "back to baseline");
         agent_writes(&mut f, "c3", "alpha\nBETA\ngamma\n", cx).await;
@@ -1263,7 +1289,10 @@ mod tests {
         cx.update(|cx| f.review.rebuild(cx));
         let path = cx.update(|cx| f.review.path(&f.review.files()[0], cx));
         assert_eq!(
-            cx.update(|cx| f.review.reject(&path, 0, cx)),
+            {
+                let k = key(&f, 0);
+                cx.update(|cx| f.review.reject(&path, &k, cx))
+            },
             Err(ReviewError::BadTransition {
                 status: HunkStatus::Stale
             })
@@ -1282,7 +1311,11 @@ mod tests {
         user_types(&f, 10..10, " by user", cx);
         cx.update(|cx| f.review.rebuild(cx));
         let path = cx.update(|cx| f.review.path(&f.review.files()[0], cx));
-        cx.update(|cx| f.review.accept(&path, 0, cx)).unwrap();
+        {
+            let k = key(&f, 0);
+            cx.update(|cx| f.review.accept(&path, &k, cx))
+        }
+        .unwrap();
         cx.update(|cx| f.review.rebuild(cx));
         assert_eq!(statuses(&f), vec![HunkStatus::Accepted]);
         assert_eq!(
@@ -1331,7 +1364,10 @@ mod tests {
         let path = cx.update(|cx| f.review.path(&f.review.files()[0], cx));
         user_types(&f, 0..0, "zero\n", cx);
         assert!(matches!(
-            cx.update(|cx| f.review.reject(&path, 0, cx)),
+            {
+                let k = key(&f, 0);
+                cx.update(|cx| f.review.reject(&path, &k, cx))
+            },
             Err(ReviewError::Outdated { .. })
         ));
         assert_eq!(text(&f, cx), "zero\nalpha\nBETA\ngamma\n");

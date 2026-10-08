@@ -24,15 +24,16 @@ use crate::omp_settings::OmpSettings;
 use crate::review::{ReviewError, TaskReview};
 use cedian_agent::Thread;
 use cedian_omp::{RouterEvent, UserAnswer};
-use cedian_review::HunkStatus;
-use collections::{HashMap, IndexMap};
+use cedian_review::{HunkKey, HunkStatus};
+use collections::{HashMap, HashSet, IndexMap};
 use editor::{Editor, actions::Paste};
 use futures::{StreamExt, channel::mpsc};
 use gpui::{
     Action, AnyElement, App, AsyncWindowContext, ClipboardEntry, Context, ElementId, Entity,
-    EventEmitter, FocusHandle, Focusable, Pixels, Render, Task, WeakEntity, Window, actions, px,
+    EntityId, EventEmitter, FocusHandle, Focusable, Pixels, Render, Subscription, Task, WeakEntity,
+    Window, actions, px,
 };
-use language::Buffer;
+use language::{Buffer, BufferEvent};
 use omp_rpc::{ExtensionUiRequest, ImageContent};
 use project::Project;
 use std::path::PathBuf;
@@ -135,6 +136,10 @@ pub struct CedianPanel {
     connection: Connection,
     calls: HashMap<String, CallMarks>,
     review: TaskReview,
+    /// The reviewed buffers whose edits rebuild the review (so render only
+    /// shows what is there).
+    watched: HashSet<EntityId>,
+    buffer_subscriptions: Vec<Subscription>,
     show_review: bool,
     turn: Turn,
     /// The last thing the person should know that is not on a dialog: a
@@ -178,6 +183,8 @@ impl CedianPanel {
             connection: Connection::NotStarted,
             calls: HashMap::default(),
             review: TaskReview::new("panel"),
+            watched: HashSet::default(),
+            buffer_subscriptions: Vec::new(),
             show_review: false,
             turn: Turn::Idle,
             notice: None,
@@ -290,19 +297,39 @@ impl CedianPanel {
         self.after_review_change(cx);
     }
 
-    /// The Accept button of one hunk.
-    pub fn accept_hunk(&mut self, path: &std::path::Path, index: usize, cx: &mut Context<Self>) {
-        self.review.rebuild(cx);
-        let result = self.review.accept(path, index, cx);
+    /// The Accept button of one hunk: the one the person saw, by identity;
+    /// a hunk that moved since is refused with a notice.
+    pub fn accept_hunk(&mut self, path: &std::path::Path, key: &HunkKey, cx: &mut Context<Self>) {
+        let result = self.review.accept(path, key, cx);
         self.report_review(result, cx);
     }
 
     /// The Reject button of one hunk: the baseline lines come back as one
     /// transaction (one native undo restores the agent's text).
-    pub fn reject_hunk(&mut self, path: &std::path::Path, index: usize, cx: &mut Context<Self>) {
-        self.review.rebuild(cx);
-        let result = self.review.reject(path, index, cx).map(|_| ());
+    pub fn reject_hunk(&mut self, path: &std::path::Path, key: &HunkKey, cx: &mut Context<Self>) {
+        let result = self.review.reject(path, key, cx).map(|_| ());
         self.report_review(result, cx);
+    }
+
+    /// Rebuild the review on every edit to a reviewed buffer.
+    fn watch_reviewed_buffers(&mut self, cx: &mut Context<Self>) {
+        let buffers: Vec<Entity<Buffer>> = self
+            .review
+            .files()
+            .iter()
+            .map(|f| f.buffer().clone())
+            .filter(|b| !self.watched.contains(&b.entity_id()))
+            .collect();
+        for buffer in buffers {
+            self.watched.insert(buffer.entity_id());
+            self.buffer_subscriptions
+                .push(cx.subscribe(&buffer, |this, _, event, cx| {
+                    if matches!(event, BufferEvent::Edited { .. }) {
+                        this.review.rebuild(cx);
+                        this.after_review_change(cx);
+                    }
+                }));
+        }
     }
 
     /// The Accept all button: every pending hunk; STALE ones stay.
@@ -893,6 +920,7 @@ impl CedianPanel {
                         Ok(ImportOutcome::Unchanged) => {}
                         Err(e) => log::error!("cedian: import failed: {e}"),
                     }
+                    this.watch_reviewed_buffers(cx);
                     this.after_review_change(cx);
                 })
                 .ok();
@@ -902,7 +930,6 @@ impl CedianPanel {
     }
 
     fn render_review(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        self.review.rebuild(cx);
         let turn = self.review.current_turn();
         let mut body = v_flex()
             .id("cedian-review")
@@ -1002,18 +1029,18 @@ impl CedianPanel {
                 let reject = matches!(hunk.status, HunkStatus::Pending | HunkStatus::Unattributed);
                 let mut buttons = h_flex().gap_1();
                 if accept {
-                    let (p, s) = (path.clone(), selector("accept"));
+                    let (p, k, s) = (path.clone(), hunk.key.clone(), selector("accept"));
                     buttons = buttons.child(div().debug_selector(|| s.clone()).child(
                         Button::new(ElementId::Name(s.clone().into()), "Accept").on_click(
-                            cx.listener(move |this, _, _, cx| this.accept_hunk(&p, index, cx)),
+                            cx.listener(move |this, _, _, cx| this.accept_hunk(&p, &k, cx)),
                         ),
                     ));
                 }
                 if reject {
-                    let (p, s) = (path.clone(), selector("reject"));
+                    let (p, k, s) = (path.clone(), hunk.key.clone(), selector("reject"));
                     buttons = buttons.child(div().debug_selector(|| s.clone()).child(
                         Button::new(ElementId::Name(s.clone().into()), "Reject").on_click(
-                            cx.listener(move |this, _, _, cx| this.reject_hunk(&p, index, cx)),
+                            cx.listener(move |this, _, _, cx| this.reject_hunk(&p, &k, cx)),
                         ),
                     ));
                 }
@@ -1629,6 +1656,57 @@ mod tests {
                 "one undo restores the reject"
             );
         });
+    }
+
+    /// The person restores hunk A by hand and then acts on the Reject they
+    /// saw on it: the click carries A's identity, so nothing happens to B,
+    /// which now sits where A was. (The harness redraws on the edit, so the
+    /// stale frame's handler is invoked directly.)
+    #[gpui::test]
+    async fn a_click_on_a_hunk_that_moved_does_nothing_to_the_next_one(cx: &mut TestAppContext) {
+        let (f, buffer) = fixture(cx).await;
+        tool_start(&f, cx, "c1", &["notes.txt"]);
+        omp_writes(&f, "/ws/notes.txt", "ALPHA\nbeta\nGAMMA\n").await;
+        tool_end(&f, cx, "c1");
+        let mut vcx = VisualTestContext::from_window(f.window.into(), cx);
+        click(&mut vcx, "cedian-review-toggle");
+        assert!(vcx.debug_bounds("cedian-reject-ws/notes.txt-1").is_some());
+        let (path, key_a) = f
+            .window
+            .update(&mut vcx, |panel, _, cx| {
+                let file = &panel.review.files()[0];
+                (panel.review.path(file, cx), file.hunks()[0].key.clone())
+            })
+            .unwrap();
+        buffer.update(&mut vcx, |b, cx| b.edit([(0..5, "alpha")], None, cx));
+        vcx.run_until_parked();
+        assert!(
+            vcx.debug_bounds("cedian-reject-ws/notes.txt-1").is_none(),
+            "the view shows what is there: one hunk left"
+        );
+        f.window
+            .update(&mut vcx, |panel, _, cx| {
+                panel.reject_hunk(&path, &key_a, cx)
+            })
+            .unwrap();
+        assert_eq!(
+            buffer.read_with(&vcx, |b, _| b.text()),
+            "alpha\nbeta\nGAMMA\n",
+            "B is untouched"
+        );
+        let hunks = hunks(&f, &mut vcx);
+        assert_eq!(hunks.len(), 1, "{hunks:?}");
+        assert_eq!(hunks[0].1, HunkStatus::Pending);
+        let notice = f
+            .window
+            .update(&mut vcx, |panel, _, _| panel.notice().map(str::to_string))
+            .unwrap();
+        assert!(
+            notice
+                .as_deref()
+                .is_some_and(|n| n.contains("moved; review again")),
+            "{notice:?}"
+        );
     }
 
     #[gpui::test]

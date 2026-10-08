@@ -165,3 +165,52 @@ fn divergence_fails_fast_not_hangs() {
     );
     assert!(started.elapsed() < Duration::from_secs(10), "failed fast");
 }
+
+const CONTROL: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/subagent_control.jsonl"
+);
+
+/// Replay checks a steer's target and text whole, so a wrong subagent id
+/// or message diverges (S9 U8: "a steer reaches the worker" is checked).
+#[test]
+fn replay_checks_subagent_ids_and_messages() {
+    let run = |tag: &str, id: &str, message: &str, cancel: &str, follow: &str| {
+        let root = temp_root(tag);
+        cedian_fake_omp::install_replay(&root.join("sessions"), Path::new(CONTROL)).unwrap();
+        let rt = OmpRuntime::spawn(config(&root)).expect("spawn");
+        let control = rt.control();
+        let steered = control.steer_subagent(id, message).is_ok();
+        let cancelled = steered && control.cancel_subagent(cancel).is_ok_and(|c| c);
+        cancelled && control.follow_up(follow).is_ok()
+    };
+    assert!(run(
+        "ctl-ok",
+        "sa-1",
+        "focus on routing",
+        "sa-1",
+        "after this"
+    ));
+    assert!(
+        !run("ctl-id", "sa-2", "focus on routing", "sa-1", "after this"),
+        "wrong steer id"
+    );
+    assert!(
+        !run("ctl-msg", "sa-1", "focus on tests", "sa-1", "after this"),
+        "wrong steer text"
+    );
+    assert!(
+        !run(
+            "ctl-cancel",
+            "sa-1",
+            "focus on routing",
+            "sa-2",
+            "after this"
+        ),
+        "wrong cancel id"
+    );
+    assert!(
+        !run("ctl-follow", "sa-1", "focus on routing", "sa-1", "other"),
+        "wrong follow-up text"
+    );
+}

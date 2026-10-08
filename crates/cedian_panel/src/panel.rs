@@ -26,7 +26,7 @@ use crate::omp_settings::OmpSettings;
 use crate::review::{ReviewError, TaskReview};
 use cedian_agent::Thread;
 use cedian_agent_ui::{SubagentRow, SubagentTree, ToolCard};
-use cedian_omp::{RouterEvent, UserAnswer};
+use cedian_omp::{RouterEvent, SubagentStatus, UserAnswer};
 use cedian_review::{HunkKey, HunkStatus};
 use cedian_workflow::{CurrentState, Evidence, Gate, GateResult, Outcome};
 use cedian_workspace::{capture_ambient, render_snapshot};
@@ -148,6 +148,10 @@ pub struct CedianPanel {
     thread: Thread,
     /// OMP's subagents, each under the `task` call that started it.
     subagents: SubagentTree,
+    /// Each running subagent's Steer text box, by id.
+    steer_boxes: HashMap<String, Entity<Editor>>,
+    /// What the last Steer or Cancel on a subagent row came to, by id.
+    subagent_notes: HashMap<String, String>,
     link: Option<OmpLink>,
     connection: Connection,
     calls: HashMap<String, CallMarks>,
@@ -218,6 +222,8 @@ impl CedianPanel {
             input,
             thread: Thread::new(),
             subagents: SubagentTree::default(),
+            steer_boxes: HashMap::default(),
+            subagent_notes: HashMap::default(),
             link: None,
             connection: Connection::NotStarted,
             calls: HashMap::default(),
@@ -298,6 +304,49 @@ impl CedianPanel {
 
     pub fn subagents(&self) -> &SubagentTree {
         &self.subagents
+    }
+
+    pub fn subagent_note(&self, id: &str) -> Option<&str> {
+        self.subagent_notes.get(id).map(String::as_str)
+    }
+
+    pub fn subagent_steer_box(&self, id: &str) -> Option<&Entity<Editor>> {
+        self.steer_boxes.get(id)
+    }
+
+    /// The Steer button on subagent `id`'s row.
+    pub fn steer_subagent(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(input) = self.steer_boxes.get(id) else {
+            return;
+        };
+        let text = input.read(cx).text(cx);
+        if text.trim().is_empty() {
+            return;
+        }
+        let Some(link) = &self.link else {
+            self.subagent_notes
+                .insert(id.to_string(), "OMP is not running".to_string());
+            cx.notify();
+            return;
+        };
+        link.steer_subagent(id.to_string(), text);
+        input.update(cx, |editor, cx| editor.clear(window, cx));
+        self.subagent_notes
+            .insert(id.to_string(), "steering…".to_string());
+        cx.notify();
+    }
+
+    /// The Cancel button on subagent `id`'s row.
+    pub fn cancel_subagent(&mut self, id: &str, cx: &mut Context<Self>) {
+        let note = match &self.link {
+            Some(link) => {
+                link.cancel_subagent(id.to_string());
+                "cancelling…"
+            }
+            None => "OMP is not running",
+        };
+        self.subagent_notes.insert(id.to_string(), note.to_string());
+        cx.notify();
     }
 
     /// Cards in order, each followed by its subagents; subagents whose card
@@ -813,6 +862,21 @@ impl CedianPanel {
                 }
             }
             LinkEvent::AuditFailed(e) => self.audit_failed(e, cx),
+            LinkEvent::SubagentSteered { id, result } => {
+                let note = match result {
+                    Ok(()) => "steered".to_string(),
+                    Err(e) => format!("steer refused: {e}"),
+                };
+                self.subagent_notes.insert(id, note);
+            }
+            LinkEvent::SubagentCancelled { id, result } => {
+                let note = match result {
+                    Ok(true) => "cancelled".to_string(),
+                    Ok(false) => "already ended".to_string(),
+                    Err(e) => format!("cancel failed: {e}"),
+                };
+                self.subagent_notes.insert(id, note);
+            }
             LinkEvent::Event(RouterEvent::UiRequest(ExtensionUiRequest::Cancel(cancel))) => {
                 self.dialogs.shift_remove(&cancel.target_id);
             }
@@ -1086,12 +1150,44 @@ impl CedianPanel {
         cx.notify();
     }
 
-    fn render_subagent(&self, row: &SubagentRow, _cx: &mut Context<Self>) -> AnyElement {
-        let selector = format!("cedian-subagent-{}", row.id);
-        div()
+    fn render_subagent(&self, row: &SubagentRow, cx: &mut Context<Self>) -> AnyElement {
+        let id = row.id.clone();
+        let selector = format!("cedian-subagent-{id}");
+        type OnClick = fn(&mut CedianPanel, &str, &mut Window, &mut Context<CedianPanel>);
+        let button = |label: &'static str, suffix: &str, on: OnClick, cx: &mut Context<Self>| {
+            let selector = format!("cedian-subagent-{id}-{suffix}");
+            let element = ElementId::Name(selector.clone().into());
+            let id = id.clone();
+            div().debug_selector(move || selector).child(
+                Button::new(element, label)
+                    .on_click(cx.listener(move |this, _, window, cx| on(this, &id, window, cx))),
+            )
+        };
+        let controls = (row.status == SubagentStatus::Running)
+            .then(|| self.steer_boxes.get(&row.id).cloned())
+            .flatten()
+            .map(|input| {
+                h_flex()
+                    .gap_2()
+                    .child(div().flex_1().child(input))
+                    .child(button("Steer", "steer", Self::steer_subagent, cx))
+                    .child(button(
+                        "Cancel",
+                        "cancel",
+                        |this, id, _, cx| this.cancel_subagent(id, cx),
+                        cx,
+                    ))
+            });
+        v_flex()
             .debug_selector(move || selector)
             .pl_4()
             .child(Label::new(subagent_line(row)).size(LabelSize::Small))
+            .children(controls)
+            .children(self.subagent_notes.get(&row.id).map(|note| {
+                Label::new(note.clone())
+                    .size(LabelSize::Small)
+                    .color(Color::Warning)
+            }))
             .into_any_element()
     }
 
@@ -1573,7 +1669,17 @@ impl Focusable for CedianPanel {
 }
 
 impl Render for CedianPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        for row in self.subagents.rows() {
+            if row.status == SubagentStatus::Running && !self.steer_boxes.contains_key(&row.id) {
+                let input = cx.new(|cx| {
+                    let mut editor = Editor::single_line(window, cx);
+                    editor.set_placeholder_text("Steer this subagent…", window, cx);
+                    editor
+                });
+                self.steer_boxes.insert(row.id.clone(), input);
+            }
+        }
         let (messages, cards) = cedian_agent_ui::render_thread(self.thread.events());
         let mut rows: Vec<AnyElement> = messages
             .into_iter()

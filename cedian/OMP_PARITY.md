@@ -40,7 +40,7 @@ The one home for **per-feature OMP coverage** ([ADR-0034](https://github.com/pon
 | `get_available_commands` | slash commands in palette and composer | planned S9 |
 | `set_subagent_subscription` | the app's link subscribes at level `progress` when OMP starts ([ADR-0050](https://github.com/pongsathonkheereekaew/cedian/blob/main/docs/decisions/0050-workers-are-omp-subagents.md); S9 U8) | native |
 | `get_subagents`, `get_subagent_messages` | subagent snapshot / a subagent's transcript on demand | planned S9 |
-| `steer_subagent`, `cancel_subagent` | subagent steer / cancel | planned S5 |
+| `steer_subagent`, `cancel_subagent` | Steer (text box) and Cancel on each running subagent row, sent off the UI thread; a refused steer shows on the row; `cancelled: false` shows "already ended"; each Cancel is an audit gate row (S9 U8, ADR-0050 decision 4) | native |
 | `bash`, `abort_bash` | user-run shell command in agent context | planned S9 |
 | `btw`, `btw_cancel`, `get_btw_history` | side question without disturbing the turn | planned S9 |
 | `predict_word`, `predict_word_feedback` | composer word prediction (not editor completion, [ADR-0023](https://github.com/pongsathonkheereekaew/cedian/blob/main/docs/decisions/0023-product-scope.md)) | planned S9 |

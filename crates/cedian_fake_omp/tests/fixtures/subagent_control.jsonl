@@ -1,0 +1,11 @@
+{"dir":"out","frame":{"maxFrameBytes":1048576,"maxReassembledFrameBytes":67108864,"protocolVersion":1,"supportedProtocolVersions":[1,2],"type":"ready"}}
+{"dir":"in","frame":{"id":"req_1","protocolVersion":2,"type":"negotiate_protocol"}}
+{"dir":"out","frame":{"command":"negotiate_protocol","data":{"protocolVersion":2},"id":"req_1","success":true,"type":"response"}}
+{"dir":"in","frame":{"enabled":true,"id":"req_2","type":"set_ask_dialog"}}
+{"dir":"out","frame":{"command":"set_ask_dialog","data":{"enabled":true},"id":"req_2","success":true,"type":"response"}}
+{"dir":"in","frame":{"id":"req_3","message":"focus on routing","subagentId":"sa-1","type":"steer_subagent"}}
+{"dir":"out","frame":{"command":"steer_subagent","id":"req_3","success":true,"type":"response"}}
+{"dir":"in","frame":{"id":"req_4","subagentId":"sa-1","type":"cancel_subagent"}}
+{"dir":"out","frame":{"command":"cancel_subagent","data":{"cancelled":true},"id":"req_4","success":true,"type":"response"}}
+{"dir":"in","frame":{"id":"req_5","message":"after this","type":"follow_up"}}
+{"dir":"out","frame":{"command":"follow_up","id":"req_5","success":true,"type":"response"}}

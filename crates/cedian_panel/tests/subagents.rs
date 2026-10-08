@@ -4,7 +4,13 @@
 //! 1. The link subscribes at level `progress` before the session opens
 //!    (the fixture's preamble has the request; without it replay diverges);
 //!    a `task` call's subagents render under its tool card, running;
-//! 2. as OMP ends them their rows show completed and failed.
+//! 2. Steer on a row sends `steer_subagent` with that id and text (replay
+//!    checks both);
+//! 3. a steer OMP refuses ("Subagent not running") shows on the row;
+//! 4. Cancel on a subagent that had already ended: OMP says
+//!    `cancelled: false`, the row says "already ended";
+//! 5. Cancel on a running one: OMP aborts it, the row shows aborted, and
+//!    each Cancel is an audit row.
 //!
 //! Harness off: invoked with `--mode` (or `config`) this binary is fake-omp.
 
@@ -105,17 +111,82 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
         "{transcript:?}"
     );
 
-    // 2. OMP ends them.
-    window.update(cx, |p, _, cx| p.stop_turn(cx)).unwrap();
-    wait(cx, &window, "the subagents to end", |p| {
-        p.turn() == &Turn::Idle
-            && statuses(p)
-                == [
-                    ("sa-1", SubagentStatus::Completed),
-                    ("sa-2", SubagentStatus::Failed),
-                ]
+    // 2. Steer one through its row: replay checks the id and the text.
+    type_steer(cx, &window, "sa-1", "focus on routing");
+    click(&mut vcx, "cedian-subagent-sa-1-steer");
+    wait(cx, &window, "the steer to land", |p| {
+        p.subagents().get("sa-1").unwrap().description == "routing only"
     });
     assert_connected(cx, &window);
+
+    // 3. A steer OMP refuses shows on the row.
+    type_steer(cx, &window, "sa-2", "and the tests");
+    click(&mut vcx, "cedian-subagent-sa-2-steer");
+    wait(cx, &window, "the refusal on the row", |p| {
+        p.subagent_note("sa-2")
+            .is_some_and(|n| n.contains("Subagent not running: sa-2"))
+    });
+
+    // 4. Cancel one that had already ended: "already ended", audited.
+    click(&mut vcx, "cedian-subagent-sa-2-cancel");
+    wait(cx, &window, "already ended", |p| {
+        p.subagent_note("sa-2") == Some("already ended")
+            && p.subagents().get("sa-2").unwrap().status == SubagentStatus::Completed
+    });
+
+    // 5. Cancel a running one: OMP aborts it; the turn ends once.
+    click(&mut vcx, "cedian-subagent-sa-1-cancel");
+    wait(
+        cx,
+        &window,
+        "the cancelled subagent and the turn's end",
+        |p| {
+            p.turn() == &Turn::Idle
+                && statuses(p)
+                    == [
+                        ("sa-1", SubagentStatus::Aborted),
+                        ("sa-2", SubagentStatus::Completed),
+                    ]
+        },
+    );
+    assert!(
+        rendered(&mut vcx, "cedian-subagent-sa-1-cancel").is_none(),
+        "an ended subagent offers no Cancel"
+    );
+    assert_connected(cx, &window);
+    let rows: Vec<(String, bool)> = std::fs::read_to_string(state.join("audit.jsonl"))
+        .unwrap()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .map(|row| row["item"].clone())
+        .filter(|item| item["tool"] == "cancel_subagent")
+        .map(|item| {
+            (
+                item["command"].as_str().unwrap().to_string(),
+                item["cancelled"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [("sa-2".to_string(), false), ("sa-1".to_string(), true)]
+    );
+}
+
+fn type_steer(cx: &mut TestAppContext, window: &WindowHandle<CedianPanel>, id: &str, text: &str) {
+    window
+        .update(cx, |p, window, cx| {
+            let input = p
+                .subagent_steer_box(id)
+                .expect("a running row has a steer box");
+            input.update(cx, |editor, cx| editor.set_text(text, window, cx));
+        })
+        .unwrap();
+}
+
+fn click(vcx: &mut VisualTestContext, selector: &'static str) {
+    let bounds = rendered(vcx, selector).unwrap_or_else(|| panic!("{selector} is not on screen"));
+    vcx.simulate_click(bounds.center(), gpui::Modifiers::none());
 }
 
 fn selector(id: &str) -> &'static str {

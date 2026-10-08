@@ -18,7 +18,10 @@
 use crate::{
     EventRouter, OmpError, SessionBinding, Sessions, SpawnPolicy, SpawnProfile, resolve_on_path,
 };
-use omp_rpc::wire::{SetSubagentSubscriptionCommand, SubagentSubscriptionLevel};
+use omp_rpc::wire::{
+    CancelSubagentCommand, FollowUpCommand, SetSubagentSubscriptionCommand, SteerSubagentCommand,
+    SubagentSubscriptionLevel,
+};
 use omp_rpc::{
     AbortCommand, Client, ClientOptions, Event, ExtensionUiResponse, GetStateCommand, HostTool,
     HostUri, ImageContent, NewSessionCommand, OpenSessionCommand, OpenSessionResult, PromptCommand,
@@ -438,6 +441,35 @@ impl RuntimeControl {
             .call(&SteerCommand {
                 message: message.to_string(),
                 images: None,
+            })
+            .map_err(OmpError::from)
+    }
+
+    /// Queue a message to run after the current turn.
+    pub fn follow_up(&self, message: &str) -> Result<(), OmpError> {
+        self.client
+            .call(&FollowUpCommand {
+                message: message.to_string(),
+                images: None,
+            })
+            .map_err(OmpError::from)
+    }
+
+    /// Steer subagent `id` mid-turn. OMP refuses an id that is not running.
+    pub fn steer_subagent(&self, id: &str, message: &str) -> Result<(), OmpError> {
+        self.client
+            .call(&SteerSubagentCommand {
+                subagent_id: id.to_string(),
+                message: message.to_string(),
+            })
+            .map_err(OmpError::from)
+    }
+
+    /// Cancel subagent `id`; `false` when it had already ended.
+    pub fn cancel_subagent(&self, id: &str) -> Result<bool, OmpError> {
+        self.client
+            .call(&CancelSubagentCommand {
+                subagent_id: id.to_string(),
             })
             .map_err(OmpError::from)
     }

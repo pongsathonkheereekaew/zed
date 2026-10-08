@@ -56,6 +56,16 @@ pub enum LinkEvent {
     PromptFailed(String),
     /// Stop's abort did not reach OMP.
     AbortFailed(String),
+    /// OMP's answer to a Steer on subagent `id`.
+    SubagentSteered {
+        id: String,
+        result: Result<(), String>,
+    },
+    /// OMP's answer to a Cancel on subagent `id`: whether it was running.
+    SubagentCancelled {
+        id: String,
+        result: Result<bool, String>,
+    },
 }
 
 /// What the panel asks of the OMP thread, in order.
@@ -426,6 +436,60 @@ impl OmpLink {
     /// OMP's process id, once it has started.
     pub fn pid(&self) -> Option<u32> {
         Some(self.pid.load(Ordering::Relaxed)).filter(|pid| *pid != 0)
+    }
+
+    /// Steer subagent `id` off the UI thread; the answer comes back as
+    /// [`LinkEvent::SubagentSteered`].
+    pub fn steer_subagent(&self, id: String, message: String) {
+        let not_running = LinkEvent::SubagentSteered {
+            id: id.clone(),
+            result: Err("OMP is not running".to_string()),
+        };
+        self.off_thread(not_running, move |control, _| LinkEvent::SubagentSteered {
+            result: control
+                .steer_subagent(&id, &message)
+                .map_err(|e| e.to_string()),
+            id,
+        });
+    }
+
+    /// Cancel subagent `id` off the UI thread. The person's cancel is an
+    /// audit row once OMP has answered (ADR-0050 decision 4).
+    pub fn cancel_subagent(&self, id: String) {
+        let not_running = LinkEvent::SubagentCancelled {
+            id: id.clone(),
+            result: Err("OMP is not running".to_string()),
+        };
+        self.off_thread(not_running, move |control, gate| {
+            let result = control.cancel_subagent(&id).map_err(|e| e.to_string());
+            if let Ok(cancelled) = result {
+                let recorded = match &mut gate.state.lock().audit {
+                    Some(audit) => audit.subagent_cancel(&id, cancelled),
+                    None => Err("the audit log is not open".to_string()),
+                };
+                if let Err(e) = recorded {
+                    let _ = gate.events.unbounded_send(LinkEvent::AuditFailed(e));
+                }
+            }
+            LinkEvent::SubagentCancelled { id, result }
+        });
+    }
+
+    /// Run a blocking control call on its own thread, as Stop's abort runs.
+    fn off_thread(
+        &self,
+        not_running: LinkEvent,
+        call: impl FnOnce(RuntimeControl, &Gate) -> LinkEvent + Send + 'static,
+    ) {
+        let gate = Arc::clone(&self.gate);
+        let Some(control) = gate.control.lock().clone() else {
+            let _ = gate.events.unbounded_send(not_running);
+            return;
+        };
+        std::thread::spawn(move || {
+            let event = call(control, &gate);
+            let _ = gate.events.unbounded_send(event);
+        });
     }
 
     /// Mid-turn control (abort, steer), once OMP has started. Its calls

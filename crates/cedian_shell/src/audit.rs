@@ -133,6 +133,17 @@ impl AuditLog {
         self.append(item, None)
     }
 
+    /// The person cancelled OMP subagent `id` (ADR-0050 decision 4);
+    /// `cancelled` is OMP's answer, `false` when it had already ended.
+    pub fn subagent_cancel(&mut self, id: &str, cancelled: bool) -> Result<(), String> {
+        let item = json!({
+            "kind": "gate", "tool": "cancel_subagent", "command": id,
+            "decision": "cancel", "scope": "once", "answered_by": "user",
+            "cancelled": cancelled,
+        });
+        self.append(item, None)
+    }
+
     /// A person dismissed a review finding: they let the change through
     /// over it, with a reason (ADR-0011).
     pub fn dismissal(&mut self, finding: &str, reason: &str) -> Result<(), String> {

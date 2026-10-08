@@ -127,7 +127,9 @@ fn discovery(
 }
 
 /// A CDP WebSocket: forwarded both ways; OMP's side is held while the
-/// person has the window.
+/// person has the window. A hold has no timeout of its own: OMP's CDP call
+/// timeout ends a call held too long. Both sockets are polled in 5 ms read
+/// slices because tungstenite's socket cannot be split between threads.
 #[allow(
     clippy::result_large_err,
     reason = "tungstenite's handshake callback returns its own error response"

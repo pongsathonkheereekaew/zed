@@ -784,14 +784,25 @@ impl TaskReview {
         Ok(txn)
     }
 
-    /// Accept every `Pending` hunk. Skips `Stale` (each needs its own
-    /// accept), `Unattributed` and `Interrupted` (§17 R2).
-    pub fn accept_all(&mut self, cx: &App) -> Vec<(PathBuf, usize)> {
+    /// How many hunks are STALE (the user edited them after the agent).
+    pub fn stale_count(&self) -> usize {
+        self.files
+            .iter()
+            .flat_map(|f| &f.hunks)
+            .filter(|h| h.status == HunkStatus::Stale)
+            .count()
+    }
+
+    /// Accept every `Pending` hunk, and every `Stale` one too when
+    /// `include_stale` (the person was asked; owner ruling 2026-10-08).
+    /// Skips `Unattributed` and `Interrupted` (§17 R2).
+    pub fn accept_all(&mut self, include_stale: bool, cx: &App) -> Vec<(PathBuf, usize)> {
         let mut accepted = Vec::new();
         for file in &mut self.files {
             let path = path_of(file.buffer.read(cx), cx);
             for i in 0..file.hunks.len() {
-                if file.hunks[i].status == HunkStatus::Pending {
+                let status = file.hunks[i].status;
+                if status == HunkStatus::Pending || (include_stale && status == HunkStatus::Stale) {
                     let txns = file.txns_of(&file.hunks[i]);
                     file.resolved.insert(file.hunks[i].key.clone(), Some(txns));
                     file.hunks[i].status = HunkStatus::Accepted;
@@ -1391,15 +1402,22 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn accept_all_skips_stale(cx: &mut TestAppContext) {
+    async fn accept_all_takes_stale_only_when_asked(cx: &mut TestAppContext) {
         let mut f = setup(cx).await;
         agent_writes(&mut f, "c1", "ALPHA\nbeta\nGAMMA\n", cx).await;
         user_types(&f, 11..11, "!", cx);
         cx.update(|cx| f.review.rebuild(cx));
         assert_eq!(statuses(&f), vec![HunkStatus::Pending, HunkStatus::Stale]);
-        let accepted = cx.update(|cx| f.review.accept_all(cx));
+        assert_eq!(f.review.stale_count(), 1);
+        let accepted = cx.update(|cx| f.review.accept_all(false, cx));
         assert_eq!(accepted.len(), 1);
         assert_eq!(statuses(&f), vec![HunkStatus::Accepted, HunkStatus::Stale]);
+        let accepted = cx.update(|cx| f.review.accept_all(true, cx));
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(
+            statuses(&f),
+            vec![HunkStatus::Accepted, HunkStatus::Accepted]
+        );
     }
 
     /// S0 check 9: reverting a turn puts back what that turn's calls wrote,

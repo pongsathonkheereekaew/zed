@@ -146,6 +146,8 @@ pub struct CedianPanel {
     watched: HashSet<EntityId>,
     buffer_subscriptions: Vec<Subscription>,
     show_review: bool,
+    /// Accept all is waiting on whether to include the STALE hunks.
+    confirm_accept_all: bool,
     turn: Turn,
     /// The last thing the person should know that is not on a dialog: a
     /// refused prompt, a failed turn, a dialog cedian closed.
@@ -191,6 +193,7 @@ impl CedianPanel {
             watched: HashSet::default(),
             buffer_subscriptions: Vec::new(),
             show_review: false,
+            confirm_accept_all: false,
             turn: Turn::Idle,
             notice: None,
             dialogs: IndexMap::default(),
@@ -337,10 +340,22 @@ impl CedianPanel {
         }
     }
 
-    /// The Accept all button: every pending hunk; STALE ones stay.
+    /// The Accept all button. With STALE hunks in the set it asks first
+    /// whether to include them (owner ruling 2026-10-08); the answer comes
+    /// through [`Self::accept_all_answered`].
     pub fn accept_all(&mut self, cx: &mut Context<Self>) {
-        self.review.rebuild(cx);
-        let accepted = self.review.accept_all(cx);
+        if self.review.stale_count() > 0 {
+            self.confirm_accept_all = true;
+            cx.notify();
+            return;
+        }
+        self.accept_all_answered(false, cx);
+    }
+
+    /// Yes: the STALE hunks too. No: only the others.
+    pub fn accept_all_answered(&mut self, include_stale: bool, cx: &mut Context<Self>) {
+        self.confirm_accept_all = false;
+        let accepted = self.review.accept_all(include_stale, cx);
         self.notice = Some(format!("accepted {} hunk(s)", accepted.len()));
         self.after_review_change(cx);
     }
@@ -992,6 +1007,35 @@ impl CedianPanel {
                         )
                     }),
             );
+        if self.confirm_accept_all {
+            let stale = self.review.stale_count();
+            body = body.child(
+                h_flex()
+                    .gap_2()
+                    .debug_selector(|| "cedian-accept-all-confirm".to_string())
+                    .child(
+                        Label::new(format!(
+                            "{stale} STALE hunk(s) were edited after the agent. Accept them too?"
+                        ))
+                        .size(LabelSize::Small)
+                        .color(Color::Warning),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "cedian-accept-all-yes".to_string())
+                            .child(Button::new("cedian-accept-all-yes", "Yes").on_click(
+                                cx.listener(|this, _, _, cx| this.accept_all_answered(true, cx)),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "cedian-accept-all-no".to_string())
+                            .child(Button::new("cedian-accept-all-no", "No").on_click(
+                                cx.listener(|this, _, _, cx| this.accept_all_answered(false, cx)),
+                            )),
+                    ),
+            );
+        }
         if self.review.is_empty() {
             return body
                 .child(Label::new("No agent edits yet").color(Color::Muted))
@@ -1842,6 +1886,59 @@ mod tests {
                 .is_some_and(|n| n.contains("moved; review again")),
             "{notice:?}"
         );
+    }
+
+    /// Accept all with STALE hunks in the set asks first; Yes takes them
+    /// too, No takes only the others (owner ruling 2026-10-08).
+    async fn accept_all_with_stale(cx: &mut TestAppContext, answer: &str) -> Vec<HunkStatus> {
+        let (f, buffer) = fixture(cx).await;
+        tool_start(&f, cx, "c1", &["notes.txt"]);
+        omp_writes(&f, "/ws/notes.txt", "ALPHA\nbeta\nGAMMA\n").await;
+        tool_end(&f, cx, "c1");
+        buffer.update(cx, |b, cx| b.edit([(11..11, "!")], None, cx));
+        let mut vcx = VisualTestContext::from_window(f.window.into(), cx);
+        click(&mut vcx, "cedian-review-toggle");
+        assert!(vcx.debug_bounds("cedian-accept-all-confirm").is_none());
+        click(&mut vcx, "cedian-accept-all");
+        assert!(
+            vcx.debug_bounds("cedian-accept-all-confirm").is_some(),
+            "asked before anything is accepted"
+        );
+        let before: Vec<HunkStatus> = hunks(&f, &mut vcx).into_iter().map(|h| h.1).collect();
+        assert_eq!(before, vec![HunkStatus::Pending, HunkStatus::Stale]);
+        click(&mut vcx, answer);
+        assert!(vcx.debug_bounds("cedian-accept-all-confirm").is_none());
+        hunks(&f, &mut vcx).into_iter().map(|h| h.1).collect()
+    }
+
+    #[gpui::test]
+    async fn accept_all_yes_takes_the_stale_hunks_too(cx: &mut TestAppContext) {
+        assert_eq!(
+            accept_all_with_stale(cx, "cedian-accept-all-yes").await,
+            vec![HunkStatus::Accepted, HunkStatus::Accepted]
+        );
+    }
+
+    #[gpui::test]
+    async fn accept_all_no_leaves_the_stale_hunks(cx: &mut TestAppContext) {
+        assert_eq!(
+            accept_all_with_stale(cx, "cedian-accept-all-no").await,
+            vec![HunkStatus::Accepted, HunkStatus::Stale]
+        );
+    }
+
+    #[gpui::test]
+    async fn accept_all_without_stale_does_not_ask(cx: &mut TestAppContext) {
+        let (f, _buffer) = fixture(cx).await;
+        tool_start(&f, cx, "c1", &["notes.txt"]);
+        omp_writes(&f, "/ws/notes.txt", "ALPHA\nbeta\nGAMMA\n").await;
+        tool_end(&f, cx, "c1");
+        let mut vcx = VisualTestContext::from_window(f.window.into(), cx);
+        click(&mut vcx, "cedian-review-toggle");
+        click(&mut vcx, "cedian-accept-all");
+        assert!(vcx.debug_bounds("cedian-accept-all-confirm").is_none());
+        let after: Vec<HunkStatus> = hunks(&f, &mut vcx).into_iter().map(|h| h.1).collect();
+        assert_eq!(after, vec![HunkStatus::Accepted, HunkStatus::Accepted]);
     }
 
     #[gpui::test]

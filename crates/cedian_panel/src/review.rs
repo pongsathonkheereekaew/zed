@@ -49,6 +49,11 @@ pub enum ReviewError {
     TurnInFlight {
         turn: u32,
     },
+    /// A tool call is writing the file: edits made now are not classified
+    /// yet, so nothing may act on its hunks until the call ends.
+    Importing {
+        path: PathBuf,
+    },
 }
 
 impl std::fmt::Display for ReviewError {
@@ -76,6 +81,11 @@ impl std::fmt::Display for ReviewError {
             Self::TurnInFlight { turn } => {
                 write!(f, "turn {turn} is still running; revert it once it settles")
             }
+            Self::Importing { path } => write!(
+                f,
+                "OMP is writing {}; try again when the call ends",
+                path.display()
+            ),
         }
     }
 }
@@ -799,6 +809,11 @@ impl TaskReview {
     ) -> Result<TransactionId, ReviewError> {
         let i = self.file_by_path(path, cx)?;
         let file = &mut self.files[i];
+        if file.importing {
+            return Err(ReviewError::Importing {
+                path: path.to_path_buf(),
+            });
+        }
         let hunk = file.hunks[file.hunk_index(key, path)?].clone();
         if matches!(
             hunk.status,
@@ -845,14 +860,22 @@ impl TaskReview {
 
     /// Accept every `Pending` hunk, and every `Stale` one too when
     /// `include_stale` (the person was asked; owner ruling 2026-10-08).
-    /// Skips `Unattributed` and `Interrupted` (§17 R2).
-    pub fn accept_all(&mut self, include_stale: bool, cx: &App) -> Vec<(PathBuf, usize)> {
+    /// Skips `Unattributed` and `Interrupted` (§17 R2). Refused while a
+    /// call is writing a file with a hunk it would take.
+    pub fn accept_all(
+        &mut self,
+        include_stale: bool,
+        cx: &App,
+    ) -> Result<Vec<(PathBuf, usize)>, ReviewError> {
+        let takes = |status: HunkStatus| {
+            status == HunkStatus::Pending || (include_stale && status == HunkStatus::Stale)
+        };
+        self.refuse_importing(cx, |file| file.hunks.iter().any(|h| takes(h.status)))?;
         let mut accepted = Vec::new();
         for file in &mut self.files {
             let path = path_of(file.buffer.read(cx), cx);
             for i in 0..file.hunks.len() {
-                let status = file.hunks[i].status;
-                if status == HunkStatus::Pending || (include_stale && status == HunkStatus::Stale) {
+                if takes(file.hunks[i].status) {
                     let txns = file.txns_of(&file.hunks[i]);
                     file.resolved.insert(file.hunks[i].key.clone(), Some(txns));
                     file.hunks[i].status = HunkStatus::Accepted;
@@ -860,7 +883,22 @@ impl TaskReview {
                 }
             }
         }
-        accepted
+        Ok(accepted)
+    }
+
+    /// `Importing` for the first file a call is writing among those
+    /// `touched` selects.
+    fn refuse_importing(
+        &self,
+        cx: &App,
+        touched: impl Fn(&FileReview) -> bool,
+    ) -> Result<(), ReviewError> {
+        match self.files.iter().find(|f| f.importing && touched(f)) {
+            Some(file) => Err(ReviewError::Importing {
+                path: path_of(file.buffer.read(cx), cx),
+            }),
+            None => Ok(()),
+        }
     }
 
     /// Revert turn `n`: put back, for every change the turn made, the text
@@ -872,6 +910,7 @@ impl TaskReview {
         if self.turn_open && self.current_turn() == n {
             return Err(ReviewError::TurnInFlight { turn: n });
         }
+        self.refuse_importing(cx, |file| file.turn_starts.iter().any(|(t, _)| *t == n))?;
         let kind = self
             .turns
             .iter()
@@ -1563,10 +1602,10 @@ mod tests {
         cx.update(|cx| f.review.rebuild(cx));
         assert_eq!(statuses(&f), vec![HunkStatus::Pending, HunkStatus::Stale]);
         assert_eq!(f.review.stale_count(), 1);
-        let accepted = cx.update(|cx| f.review.accept_all(false, cx));
+        let accepted = cx.update(|cx| f.review.accept_all(false, cx)).unwrap();
         assert_eq!(accepted.len(), 1);
         assert_eq!(statuses(&f), vec![HunkStatus::Accepted, HunkStatus::Stale]);
-        let accepted = cx.update(|cx| f.review.accept_all(true, cx));
+        let accepted = cx.update(|cx| f.review.accept_all(true, cx)).unwrap();
         assert_eq!(accepted.len(), 1);
         assert_eq!(
             statuses(&f),

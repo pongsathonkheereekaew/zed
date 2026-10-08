@@ -355,9 +355,10 @@ impl CedianPanel {
     /// Yes: the STALE hunks too. No: only the others.
     pub fn accept_all_answered(&mut self, include_stale: bool, cx: &mut Context<Self>) {
         self.confirm_accept_all = false;
-        let accepted = self.review.accept_all(include_stale, cx);
-        self.notice = Some(format!("accepted {} hunk(s)", accepted.len()));
-        self.after_review_change(cx);
+        let result = self.review.accept_all(include_stale, cx).map(|accepted| {
+            self.notice = Some(format!("accepted {} hunk(s)", accepted.len()));
+        });
+        self.report_review(result, cx);
     }
 
     /// The Revert turn button: reject every pending hunk the turn made.
@@ -2152,6 +2153,87 @@ mod tests {
                 assert!(!panel.review.turn_open(), "a taken session ends the turn");
             })
             .unwrap();
+    }
+
+    /// `(path, key)` of the first hunk of the first reviewed file.
+    fn first_hunk(f: &Fixture, cx: &mut TestAppContext) -> (PathBuf, HunkKey) {
+        f.window
+            .update(cx, |panel, _, cx| {
+                let file = &panel.review.files()[0];
+                (panel.review.path(file, cx), file.hunks()[0].key.clone())
+            })
+            .unwrap()
+    }
+
+    fn notice(f: &Fixture, cx: &mut TestAppContext) -> Option<String> {
+        f.window
+            .update(cx, |panel, _, _| panel.notice().map(str::to_string))
+            .unwrap()
+    }
+
+    /// While a later call is writing the file, a keystroke inside a Pending
+    /// hunk is not yet classified, so Reject must refuse rather than write
+    /// over it (ADR-0006). Once the call ends the hunk is STALE and Reject
+    /// is refused as such.
+    #[gpui::test]
+    async fn reject_is_refused_while_the_file_is_importing(cx: &mut TestAppContext) {
+        let (f, buffer) = fixture(cx).await;
+        tool_start(&f, cx, "c1", &["notes.txt"]);
+        omp_writes(&f, "/ws/notes.txt", "alpha\nBETA\ngamma\n").await;
+        tool_end(&f, cx, "c1");
+        assert_eq!(hunks(&f, cx)[0].1, HunkStatus::Pending);
+        tool_start(&f, cx, "c2", &["notes.txt"]);
+        buffer.update(cx, |b, cx| b.edit([(7..7, "!")], None, cx));
+        cx.run_until_parked();
+        // The keystroke is not classified yet, so the view still shows the
+        // hunk as Pending with its Reject button: that click is the one
+        // that must be refused.
+        assert_eq!(hunks(&f, cx)[0].1, HunkStatus::Pending);
+        let (path, key) = first_hunk(&f, cx);
+        f.window
+            .update(cx, |panel, _, cx| panel.reject_hunk(&path, &key, cx))
+            .unwrap();
+        assert_eq!(
+            notice(&f, cx).as_deref(),
+            Some("OMP is writing ws/notes.txt; try again when the call ends")
+        );
+        assert_eq!(
+            buffer.read_with(cx, |b, _| b.text()),
+            "alpha\nB!ETA\ngamma\n",
+            "the keystroke is kept"
+        );
+        let refused = Some("OMP is writing ws/notes.txt; try again when the call ends");
+        f.window
+            .update(cx, |panel, _, cx| {
+                panel.notice = None;
+                panel.accept_all(cx);
+                assert_eq!(panel.notice(), refused, "Accept all");
+                panel.notice = None;
+                panel.review.end_turn();
+                panel.revert_turn(1, cx);
+                assert_eq!(panel.notice(), refused, "Revert turn");
+            })
+            .unwrap();
+        assert_eq!(
+            hunks(&f, cx)[0].1,
+            HunkStatus::Pending,
+            "nothing was accepted"
+        );
+        tool_end(&f, cx, "c2");
+        assert_eq!(hunks(&f, cx)[0].1, HunkStatus::Stale);
+        let (path, key) = first_hunk(&f, cx);
+        f.window
+            .update(cx, |panel, _, cx| panel.reject_hunk(&path, &key, cx))
+            .unwrap();
+        assert!(
+            notice(&f, cx).is_some_and(|n| n.contains("hunk is STALE")),
+            "{:?}",
+            notice(&f, cx)
+        );
+        assert_eq!(
+            buffer.read_with(cx, |b, _| b.text()),
+            "alpha\nB!ETA\ngamma\n"
+        );
     }
 
     #[gpui::test]

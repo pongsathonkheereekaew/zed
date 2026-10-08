@@ -1835,10 +1835,16 @@ mod tests {
                 )
             })
             .unwrap();
-        assert!(
-            stale.iter().any(|r| r.contains("c1")) || !unreviewable.is_empty(),
-            "the file shows STALE or unreviewed with a reason: {stale:?} {unreviewable:?}"
+        assert_eq!(
+            stale,
+            vec![
+                "OMP wrote the file on disk (call c1) while the buffer had unsaved edits; \
+                 nothing was imported"
+                    .to_string()
+            ],
+            "the file shows STALE with the reason"
         );
+        assert!(unreviewable.is_empty(), "{unreviewable:?}");
     }
 
     /// A write that creates a file: one all-added hunk; reject empties it.

@@ -438,7 +438,7 @@ impl CedianPanel {
         let previous = self.link.take();
         self.dialogs.clear();
         self.release_in_flight(cx);
-        self.turn = Turn::Idle;
+        self.set_turn(Turn::Idle);
         self.notice = None;
         let Some(root) = self.workspace_root(cx) else {
             self.connection = Connection::Stopped("open a folder first".to_string());
@@ -526,6 +526,24 @@ impl CedianPanel {
         .detach();
     }
 
+    /// The browser holds OMP's traffic on the person's input only while a
+    /// turn runs.
+    fn set_turn(&mut self, turn: Turn) {
+        let running = matches!(turn, Turn::Queued | Turn::Streaming | Turn::Stopping);
+        self.turn = turn;
+        if let Some(host) = &self.browser {
+            host.set_turn(running);
+        }
+    }
+
+    /// The person lets the agent use the browser again.
+    pub fn resume_browser(&mut self, cx: &mut Context<Self>) {
+        if let Some(host) = &self.browser {
+            host.resume();
+        }
+        cx.notify();
+    }
+
     /// Capture the shared page: screenshot, DOM, console and network.
     pub fn capture_browser(&mut self, cx: &mut Context<Self>) {
         let Some(host) = self.browser.clone() else {
@@ -608,6 +626,26 @@ impl CedianPanel {
                             )
                         }),
                 )
+                .when(state.preempted, |col| {
+                    col.child(
+                        h_flex()
+                            .debug_selector(|| "cedian-browser-held".to_string())
+                            .gap_2()
+                            .child(
+                                Label::new(
+                                    "You are using the browser: the agent's next browser call waits for you",
+                                )
+                                .size(LabelSize::Small)
+                                .color(Color::Warning),
+                            )
+                            .child(
+                                Button::new("cedian-browser-resume", "Let the agent continue")
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.resume_browser(cx)),
+                                    ),
+                            ),
+                    )
+                })
                 .when_some(state.error, |col, e| {
                     col.child(Label::new(e).size(LabelSize::Small).color(Color::Error))
                 })
@@ -686,7 +724,7 @@ impl CedianPanel {
             }
             LinkEvent::AbortFailed(e) => {
                 if self.turn != Turn::Idle {
-                    self.turn = Turn::Failed(format!("stop: {e}"));
+                    self.set_turn(Turn::Failed(format!("stop: {e}")));
                 }
             }
             LinkEvent::AuditFailed(e) => self.audit_failed(e, cx),
@@ -757,7 +795,7 @@ impl CedianPanel {
             self.release(&id, call, cx);
         }
         self.review.end_turn();
-        self.turn = Turn::Idle;
+        self.set_turn(Turn::Idle);
         self.connection = Connection::Stopped(reason);
     }
 
@@ -795,7 +833,7 @@ impl CedianPanel {
         self.thread.push_user(&text);
         self.review.begin_turn();
         self.notice = None;
-        self.turn = Turn::Queued;
+        self.set_turn(Turn::Queued);
         cx.notify();
     }
 
@@ -819,7 +857,7 @@ impl CedianPanel {
                     self.import_when_ready(tool_call_id.clone(), cx);
                 }
             }
-            RouterEvent::AgentStart if self.turn == Turn::Queued => self.turn = Turn::Streaming,
+            RouterEvent::AgentStart if self.turn == Turn::Queued => self.set_turn(Turn::Streaming),
             RouterEvent::Settled => {
                 self.review.end_turn();
                 if let Turn::Failed(reason) = std::mem::replace(&mut self.turn, Turn::Idle) {
@@ -838,7 +876,7 @@ impl CedianPanel {
         if !matches!(self.turn, Turn::Queued | Turn::Streaming) {
             return;
         }
-        self.turn = Turn::Stopping;
+        self.set_turn(Turn::Stopping);
         let closed = self.link.as_ref().map(OmpLink::close_dialogs);
         self.dialogs.clear();
         match closed {
@@ -856,7 +894,7 @@ impl CedianPanel {
             Turn::Failed(_) => {}
             Turn::Idle => self.notice = Some(reason),
             Turn::Queued | Turn::Streaming | Turn::Stopping => {
-                self.turn = Turn::Failed(reason);
+                self.set_turn(Turn::Failed(reason));
                 self.cancel();
             }
         }

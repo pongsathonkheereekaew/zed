@@ -8,6 +8,9 @@
 //! 2. Captures carry a frame id and a sequence that run across the
 //!    browser's life: capture A, navigate, capture B; evidence on A reads
 //!    `stale-frame`, B passes a fresh gate.
+//! 3. The person's input wins: input in the window during a turn holds
+//!    OMP's next browser message until the person lets the agent continue
+//!    or the turn ends; OMP's own `Input.*` and input outside a turn do not.
 //!
 //! Harness off: launched with `--user-data-dir` this binary is the browser.
 
@@ -33,6 +36,7 @@ fn main() {
     run("frames_are_bound_to_the_browser", || {
         frames_are_bound_to_the_browser(&root)
     });
+    run("the_persons_input_wins", || the_persons_input_wins(&root));
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -197,4 +201,92 @@ fn frames_are_bound_to_the_browser(root: &std::path::Path) {
     let both = gate.evaluate(&[on_a, on_b], &now);
     assert_eq!(both.status, GateStatus::Passed, "{}", both.reason);
     assert_eq!(both.deciding, ["shot-b"]);
+}
+
+fn send(socket: &mut tungstenite::WebSocket<impl Read + Write>, id: u64, method: &str) {
+    socket
+        .send(tungstenite::Message::Text(
+            json!({"id": id, "method": method, "params": {}})
+                .to_string()
+                .into(),
+        ))
+        .unwrap();
+}
+
+/// The reply to `id` within `limit`, skipping events.
+fn reply(
+    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+    id: u64,
+    limit: Duration,
+) -> Option<Value> {
+    if let tungstenite::stream::MaybeTlsStream::Plain(tcp) = socket.get_ref() {
+        tcp.set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+    }
+    let deadline = Instant::now() + limit;
+    while Instant::now() < deadline {
+        if let Ok(message) = socket.read() {
+            let message: Value = serde_json::from_str(&message.into_text().unwrap()).unwrap();
+            if message["id"] == id {
+                return Some(message);
+            }
+        }
+    }
+    None
+}
+
+fn the_persons_input_wins(root: &std::path::Path) {
+    let profile = root.join("input-profile");
+    let host = BrowserHost::open(profile.clone(), exe(), || {}).unwrap();
+    host.start().unwrap();
+    let list: Value = serde_json::from_str(&get(&host.url(), "/json/list").unwrap()).unwrap();
+    let (mut omp, _) =
+        tungstenite::connect(list[0]["webSocketDebuggerUrl"].as_str().unwrap()).unwrap();
+    let port = std::fs::read_to_string(profile.join("DevToolsActivePort")).unwrap();
+    let port = port.lines().next().unwrap();
+    let (mut person, _) =
+        tungstenite::connect(format!("ws://127.0.0.1:{port}/devtools/page/P1")).unwrap();
+    let pause = Duration::from_millis(300);
+
+    send(&mut person, 1, "Fake.personInput");
+    std::thread::sleep(pause);
+    assert!(
+        !host.state().preempted,
+        "outside a turn the person's input holds nothing"
+    );
+
+    host.set_turn(true);
+    send(&mut omp, 2, "Input.dispatchMouseEvent");
+    assert!(reply(&mut omp, 2, Duration::from_secs(5)).is_some());
+    std::thread::sleep(pause);
+    assert!(
+        !host.state().preempted,
+        "OMP's own input is not the person's"
+    );
+
+    std::thread::sleep(Duration::from_millis(1100));
+    send(&mut person, 3, "Fake.personInput");
+    wait_until("the person's input is seen", || host.state().preempted);
+    send(&mut omp, 4, "Page.navigate");
+    assert!(
+        reply(&mut omp, 4, Duration::from_millis(500)).is_none(),
+        "OMP's next browser call is held"
+    );
+    host.resume();
+    assert!(
+        reply(&mut omp, 4, Duration::from_secs(5)).is_some(),
+        "released when the person lets the agent continue"
+    );
+
+    std::thread::sleep(Duration::from_millis(1100));
+    send(&mut person, 5, "Fake.personInput");
+    wait_until("held again", || host.state().preempted);
+    send(&mut omp, 6, "Page.navigate");
+    assert!(reply(&mut omp, 6, Duration::from_millis(500)).is_none());
+    host.set_turn(false);
+    assert!(
+        reply(&mut omp, 6, Duration::from_secs(5)).is_some(),
+        "released when the turn ends"
+    );
+    assert!(!host.state().preempted);
 }

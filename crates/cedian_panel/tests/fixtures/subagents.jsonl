@@ -43,3 +43,10 @@
 {"dir":"in","frame":{"id":"ht-w1","result":{"content":[{"text":"worktree w1 at ${CEDIAN_CWD}/.worktrees/w1 (branch cedian-worker/w1, base HEAD)","type":"text"}]},"type":"host_tool_result"}}
 {"dir":"out","frame":{"agentInvoked":true,"id":"req_10","sessionSettled":true,"status":"completed","type":"prompt_result"}}
 {"dir":"out","frame":{"type":"session_settled"}}
+{"dir":"in","frame":{"id":"req_11","message":"one more","type":"prompt"}}
+{"dir":"out","frame":{"command":"prompt","id":"req_11","success":true,"type":"response"}}
+{"dir":"out","frame":{"type":"agent_start"}}
+{"dir":"out","frame":{"args":{"description":"map the docs"},"toolCallId":"call-task-2","toolName":"task","type":"tool_execution_start"}}
+{"dir":"out","frame":{"type":"subagent_lifecycle","payload":{"id":"sa-3","agent":"explore","agentSource":"bundled","status":"started","index":0,"parentToolCallId":"call-task-2","description":"map the docs"}}}
+{"dir":"in","frame":{"id":"req_12","type":"abort"}}
+{"dir":"out","frame":{"command":"abort","id":"req_12","success":true,"type":"response"}}

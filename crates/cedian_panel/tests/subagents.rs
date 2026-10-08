@@ -13,7 +13,9 @@
 //!    each Cancel is an audit row;
 //! 6. the link registers `cedian_worktree_request`: a request without the
 //!    ADR-0033 brief is refused naming the missing fields, with no tree;
-//!    one with it gets a tree, a registry row and its stored brief.
+//!    one with it gets a tree, a registry row and its stored brief;
+//! 7. Restart while a subagent runs: the old OMP's rows, steer boxes and
+//!    notes go with it (`subagents_2.jsonl` is the new OMP).
 //!
 //! Harness off: invoked with `--mode` (or `config`) this binary is fake-omp.
 
@@ -33,6 +35,10 @@ use std::time::{Duration, Instant};
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/subagents.jsonl"
+);
+const FIXTURE_2: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/subagents_2.jsonl"
 );
 
 fn main() {
@@ -143,7 +149,7 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
     type_steer(cx, &window, "sa-1", "focus on routing");
     click(&mut vcx, "cedian-subagent-sa-1-steer");
     wait(cx, &window, "the steer to land", |p| {
-        p.subagents().get("sa-1").unwrap().description == "routing only"
+        row(p, "sa-1").description == "routing only"
     });
     assert_connected(cx, &window);
 
@@ -159,7 +165,7 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
     click(&mut vcx, "cedian-subagent-sa-2-cancel");
     wait(cx, &window, "already ended", |p| {
         p.subagent_note("sa-2") == Some("already ended")
-            && p.subagents().get("sa-2").unwrap().status == SubagentStatus::Completed
+            && row(p, "sa-2").status == SubagentStatus::Completed
     });
 
     // 5. Cancel a running one: OMP aborts it; the turn ends once.
@@ -181,6 +187,12 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
         rendered(&mut vcx, "cedian-subagent-sa-1-cancel").is_none(),
         "an ended subagent offers no Cancel"
     );
+    let boxes = window
+        .update(cx, |p, _, _| {
+            ["sa-1", "sa-2"].map(|id| p.subagent_steer_box(id).is_some())
+        })
+        .unwrap();
+    assert_eq!(boxes, [false, false], "an ended row drops its steer box");
     assert_connected(cx, &window);
     let rows: Vec<(String, bool)> = std::fs::read_to_string(state.join("audit.jsonl"))
         .unwrap()
@@ -222,6 +234,43 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
         "{registry}"
     );
     assert!(state.join("briefs/w1.1.json").exists());
+
+    // 7. Restart while a subagent runs: its row and controls go.
+    submit(cx, &window, "one more");
+    wait(cx, &window, "a running subagent", |p| {
+        statuses(p).contains(&("sa-3", SubagentStatus::Running))
+    });
+    assert!(rendered(&mut vcx, "cedian-subagent-sa-3-steer").is_some());
+    cedian_fake_omp::install_replay(&state.join("omp"), Path::new(FIXTURE_2)).unwrap();
+    window
+        .update(cx, |p, window, cx| p.restart(window, cx))
+        .unwrap();
+    wait(cx, &window, "the new OMP", |p| {
+        matches!(p.connection(), Connection::Ready { .. })
+    });
+    let (rows, steer_box, note) = window
+        .update(cx, |p, _, _| {
+            (
+                statuses(p).len(),
+                p.subagent_steer_box("sa-3").is_some(),
+                p.subagent_note("sa-2").is_some(),
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        (rows, steer_box, note),
+        (0, false, false),
+        "the old OMP's subagents went"
+    );
+    assert!(rendered(&mut vcx, "cedian-subagent-sa-3").is_none());
+}
+
+fn row<'a>(p: &'a CedianPanel, id: &str) -> &'a cedian_agent_ui::SubagentRow {
+    p.subagents()
+        .rows()
+        .iter()
+        .find(|row| row.id == id)
+        .unwrap_or_else(|| panic!("no row {id}"))
 }
 
 fn type_steer(cx: &mut TestAppContext, window: &WindowHandle<CedianPanel>, id: &str, text: &str) {

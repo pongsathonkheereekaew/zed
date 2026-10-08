@@ -24,7 +24,7 @@ use crate::import::{self, ImportOutcome, Mark};
 use crate::omp_link::{AnswerError, LaunchSpec, LinkEvent, OmpLink, Prompt};
 use crate::omp_settings::OmpSettings;
 use crate::review::{ReviewError, TaskReview};
-use cedian_agent::Thread;
+use cedian_agent::{Thread, ThreadEvent};
 use cedian_agent_ui::{SubagentRow, SubagentTree, ToolCard};
 use cedian_omp::{RouterEvent, SubagentStatus, UserAnswer};
 use cedian_review::{HunkKey, HunkStatus};
@@ -406,6 +406,12 @@ impl CedianPanel {
         self.link.as_ref().is_some_and(OmpLink::prompt_queued)
     }
 
+    /// Whether OMP runs a run no prompt of the panel's started.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn omp_runs_unprompted(&self) -> bool {
+        self.link.as_ref().is_some_and(OmpLink::runs_unprompted)
+    }
+
     /// Make the link's audit rows fail from now on.
     #[cfg(any(test, feature = "test-support"))]
     pub fn break_audit(&self) {
@@ -531,6 +537,7 @@ impl CedianPanel {
     /// Start (or restart) OMP for the open folder.
     fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let previous = self.link.take();
+        self.forget_old_omp(window, cx);
         self.dialogs.clear();
         self.release_in_flight(cx);
         self.set_turn(Turn::Idle);
@@ -819,6 +826,58 @@ impl CedianPanel {
         cx.notify();
     }
 
+    /// The old OMP's subagents and queue die with it: their rows go, and
+    /// what was queued goes back to the composer.
+    fn forget_old_omp(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.forget_subagents();
+        let queued = self.queued();
+        if !queued.is_empty() {
+            self.thread.apply(&RouterEvent::Queue {
+                steering: Vec::new(),
+                follow_up: Vec::new(),
+            });
+            self.restore_to_composer(queued, window, cx);
+        }
+    }
+
+    fn forget_subagents(&mut self) {
+        self.subagents = SubagentTree::default();
+        self.steer_boxes.clear();
+        self.subagent_notes.clear();
+    }
+
+    /// What OMP last said it has queued, oldest steer first.
+    fn queued(&self) -> Vec<String> {
+        self.thread
+            .events()
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                ThreadEvent::Queue {
+                    steering,
+                    follow_up,
+                } => Some(steering.iter().chain(follow_up).cloned().collect()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// Put `texts` back in the composer, ahead of what is typed there now.
+    fn restore_to_composer(
+        &mut self,
+        mut texts: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let typed = self.input.read(cx).text(cx);
+        if !typed.is_empty() {
+            texts.push(typed);
+        }
+        let text = texts.join("\n");
+        self.input
+            .update(cx, |editor, cx| editor.set_text(text, window, cx));
+    }
+
     /// The Restart button: a fresh OMP on the same session.
     pub fn restart(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.start(window, cx);
@@ -832,6 +891,7 @@ impl CedianPanel {
                 policy_note,
                 ..
             } => {
+                self.forget_subagents();
                 self.connection = Connection::Ready {
                     session_id,
                     resumed,
@@ -862,8 +922,13 @@ impl CedianPanel {
                 }
             }
             LinkEvent::AuditFailed(e) => self.audit_failed(e, cx),
-            LinkEvent::QueueSent => {}
+            LinkEvent::Queued(text) => {
+                if self.input.read(cx).text(cx) == text {
+                    self.input.update(cx, |editor, cx| editor.clear(window, cx));
+                }
+            }
             LinkEvent::QueueRefused(e) => self.notice = Some(format!("OMP did not queue it: {e}")),
+            LinkEvent::Restored(texts) => self.restore_to_composer(texts, window, cx),
             LinkEvent::SubagentSteered { id, result } => {
                 let note = match result {
                     Ok(()) => "steered".to_string(),
@@ -957,7 +1022,7 @@ impl CedianPanel {
         }
         match self.turn {
             Turn::Idle => {}
-            Turn::Streaming => return self.queue(false, window, cx),
+            Turn::Streaming => return self.queue(false, cx),
             _ => {
                 self.notice = Some("the turn is starting or stopping; wait for it".to_string());
                 cx.notify();
@@ -993,15 +1058,15 @@ impl CedianPanel {
     }
 
     /// The Steer button: `text` goes into the running turn.
-    pub fn steer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn steer(&mut self, cx: &mut Context<Self>) {
         if self.turn == Turn::Streaming {
-            self.queue(true, window, cx);
+            self.queue(true, cx);
         }
     }
 
     /// Steer (`steer`) or queue after the turn (`follow_up`, ADR-0050
     /// decision 3). The chip comes from OMP's own `queue_update`.
-    fn queue(&mut self, steer: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn queue(&mut self, steer: bool, cx: &mut Context<Self>) {
         let text = self.input.read(cx).text(cx);
         if text.trim().is_empty() {
             return;
@@ -1012,7 +1077,6 @@ impl CedianPanel {
             return;
         };
         link.queue(text, steer);
-        self.input.update(cx, |editor, cx| editor.clear(window, cx));
         self.notice = None;
         cx.notify();
     }
@@ -1037,7 +1101,11 @@ impl CedianPanel {
                     self.import_when_ready(tool_call_id.clone(), cx);
                 }
             }
-            RouterEvent::AgentStart if self.turn == Turn::Queued => self.set_turn(Turn::Streaming),
+            // Idle: OMP started a run of its own (a queued steer it drains);
+            // it shows as running so Stop can stop it.
+            RouterEvent::AgentStart if matches!(self.turn, Turn::Queued | Turn::Idle) => {
+                self.set_turn(Turn::Streaming)
+            }
             RouterEvent::Settled => {
                 self.review.end_turn();
                 if let Turn::Failed(reason) = std::mem::replace(&mut self.turn, Turn::Idle) {
@@ -1701,6 +1769,13 @@ impl Focusable for CedianPanel {
 
 impl Render for CedianPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let running = |tree: &SubagentTree, id: &str| {
+            tree.rows()
+                .iter()
+                .any(|row| row.id == id && row.status == SubagentStatus::Running)
+        };
+        self.steer_boxes
+            .retain(|id, _| running(&self.subagents, id));
         for row in self.subagents.rows() {
             if row.status == SubagentStatus::Running && !self.steer_boxes.contains_key(&row.id) {
                 let input = cx.new(|cx| {
@@ -1900,11 +1975,12 @@ impl Render for CedianPanel {
                             .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
                     )
                     .when(self.turn == Turn::Streaming, |row| {
-                        row.child(div().debug_selector(|| "cedian-steer".to_string()).child(
-                            Button::new("cedian-steer", "Steer").on_click(
-                                cx.listener(|this, _, window, cx| this.steer(window, cx)),
+                        row.child(
+                            div().debug_selector(|| "cedian-steer".to_string()).child(
+                                Button::new("cedian-steer", "Steer")
+                                    .on_click(cx.listener(|this, _, _, cx| this.steer(cx))),
                             ),
-                        ))
+                        )
                     })
                     .when(stoppable, |row| {
                         row.child(

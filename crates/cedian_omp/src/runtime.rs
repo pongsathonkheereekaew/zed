@@ -19,8 +19,8 @@ use crate::{
     EventRouter, OmpError, SessionBinding, Sessions, SpawnPolicy, SpawnProfile, resolve_on_path,
 };
 use omp_rpc::wire::{
-    CancelSubagentCommand, FollowUpCommand, SetSubagentSubscriptionCommand, SteerSubagentCommand,
-    SubagentSubscriptionLevel,
+    CancelSubagentCommand, FollowUpCommand, QueuedMessageQueue, RemoveQueuedMessageCommand,
+    SetSubagentSubscriptionCommand, SteerSubagentCommand, SubagentSubscriptionLevel,
 };
 use omp_rpc::{
     AbortCommand, Client, ClientOptions, Event, ExtensionUiResponse, GetStateCommand, HostTool,
@@ -452,6 +452,22 @@ impl RuntimeControl {
                 message: message.to_string(),
                 images: None,
             })
+            .map_err(OmpError::from)
+    }
+
+    /// Take one queued message back out of OMP's queue by its chip text;
+    /// `false` when OMP no longer had it queued.
+    pub fn remove_queued(&self, message: &str, steering: bool) -> Result<bool, OmpError> {
+        self.client
+            .call(&RemoveQueuedMessageCommand {
+                message: message.to_string(),
+                queue: if steering {
+                    QueuedMessageQueue::Steering
+                } else {
+                    QueuedMessageQueue::FollowUp
+                },
+            })
+            .map(|result| result.removed)
             .map_err(OmpError::from)
     }
 

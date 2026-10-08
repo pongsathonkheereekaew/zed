@@ -56,10 +56,13 @@ pub enum LinkEvent {
     PromptFailed(String),
     /// Stop's abort did not reach OMP.
     AbortFailed(String),
-    /// OMP took a mid-turn steer or follow-up.
-    QueueSent,
+    /// OMP took a mid-turn steer or follow-up with this text.
+    Queued(String),
     /// A mid-turn steer or follow-up did not reach OMP's queue.
     QueueRefused(String),
+    /// Stop took these queued messages back out of OMP's queue before the
+    /// abort, oldest first, for the composer.
+    Restored(Vec<String>),
     /// OMP's answer to a Steer on subagent `id`.
     SubagentSteered {
         id: String,
@@ -198,7 +201,15 @@ struct Gate {
     control: Mutex<Option<RuntimeControl>>,
     turn: Mutex<TurnState>,
     state: Mutex<GateState>,
+    /// OMP's latest `queue_update`: what Stop takes back before aborting.
+    queue: Mutex<Queue>,
     events: UnboundedSender<LinkEvent>,
+}
+
+#[derive(Default, Clone)]
+struct Queue {
+    steering: Vec<String>,
+    follow_up: Vec<String>,
 }
 
 /// The one prompt in flight, shared by the panel (send, Stop, Drop), the OMP
@@ -212,6 +223,9 @@ struct TurnState {
     cancelled: bool,
     /// The link was dropped: no further command runs.
     closed: bool,
+    /// OMP started a run no prompt of ours asked for (its own drain of a
+    /// queued steer) and has not settled it yet.
+    unprompted: bool,
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
@@ -238,6 +252,31 @@ impl Gate {
         turn.closed |= close;
         if first && turn.phase == Phase::Started {
             self.abort();
+        } else if turn.phase == Phase::Idle && std::mem::take(&mut turn.unprompted) {
+            self.abort();
+        }
+    }
+
+    /// The event thread saw a run start or the session settle.
+    fn observe_run(&self, event: &RouterEvent) {
+        match event {
+            RouterEvent::AgentStart => {
+                let mut turn = self.turn.lock();
+                if turn.phase != Phase::Sent {
+                    turn.unprompted = true;
+                }
+            }
+            RouterEvent::Settled => self.turn.lock().unprompted = false,
+            RouterEvent::Queue {
+                steering,
+                follow_up,
+            } => {
+                *self.queue.lock() = Queue {
+                    steering: steering.clone(),
+                    follow_up: follow_up.clone(),
+                }
+            }
+            _ => {}
         }
     }
 
@@ -252,12 +291,30 @@ impl Gate {
         }
     }
 
+    /// Abort the run. OMP's `abort` keeps queued user messages, and a kept
+    /// steer starts a new run right after it, so each queued message is
+    /// taken back first and handed to the composer.
     fn abort(&self) {
         let Some(control) = self.control.lock().clone() else {
             return;
         };
+        let queue = self.queue.lock().clone();
         let events = self.events.clone();
         std::thread::spawn(move || {
+            let queued = queue.steering.iter().map(|text| (text, true));
+            let queued = queued.chain(queue.follow_up.iter().map(|text| (text, false)));
+            let restored: Vec<String> = queued
+                .filter(|(text, steering)| {
+                    control.remove_queued(text, *steering).unwrap_or_else(|e| {
+                        log::warn!("cedian: OMP kept a queued message on Stop: {e}");
+                        false
+                    })
+                })
+                .map(|(text, _)| text.clone())
+                .collect();
+            if !restored.is_empty() {
+                let _ = events.unbounded_send(LinkEvent::Restored(restored));
+            }
             if let Err(e) = control.abort() {
                 let _ = events.unbounded_send(LinkEvent::AbortFailed(e.to_string()));
             }
@@ -378,6 +435,7 @@ impl OmpLink {
             control: Mutex::default(),
             turn: Mutex::default(),
             state: Mutex::default(),
+            queue: Mutex::default(),
             events: events.clone(),
         });
         let thread_pid = Arc::clone(&pid);
@@ -426,6 +484,13 @@ impl OmpLink {
         self.gate.turn.lock().phase == Phase::Queued
     }
 
+    /// Whether OMP runs a run of its own, no prompt of ours in flight.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn runs_unprompted(&self) -> bool {
+        let turn = self.gate.turn.lock();
+        turn.phase == Phase::Idle && turn.unprompted
+    }
+
     /// Whether OMP still waits on dialog `request_id`.
     pub fn is_open(&self, request_id: &str) -> bool {
         self.gate.state.lock().open.contains_key(request_id)
@@ -469,7 +534,7 @@ impl OmpLink {
                 control.follow_up(&text)
             };
             match sent {
-                Ok(()) => LinkEvent::QueueSent,
+                Ok(()) => LinkEvent::Queued(text),
                 Err(e) => LinkEvent::QueueRefused(e.to_string()),
             }
         });
@@ -642,6 +707,7 @@ fn run(
             if matches!(event, RouterEvent::AgentStart) {
                 forward_gate.started();
             }
+            forward_gate.observe_run(&event);
             if let Err(e) = forward_gate.state.lock().observe(&event) {
                 let _ = forward.unbounded_send(LinkEvent::AuditFailed(e));
             }

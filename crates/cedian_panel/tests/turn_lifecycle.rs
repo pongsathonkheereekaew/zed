@@ -4,13 +4,17 @@
 //!
 //! 1. Stop while the prompt is still queued: it never reaches OMP (the
 //!    fixture's first prompt is "one", and replay checks the text);
-//! 2. while a turn runs, Steer sends `steer` and Send queues `follow_up`
-//!    (ADR-0050 decision 3), both shown as OMP's queue chip; Stop aborts
-//!    the turn once and the chip follows OMP's queue;
+//! 2. while a turn runs, the Steer button sends `steer` and Send queues
+//!    `follow_up` (ADR-0050 decision 3), both shown as OMP's queue chip; a
+//!    steer OMP refuses keeps its text in the composer; Stop takes each
+//!    queued message back out of OMP's queue (`remove_queued_message`,
+//!    since OMP's `abort` keeps them and runs a kept steer), puts them back
+//!    in the composer, and aborts the turn once;
 //! 3. a prompt OMP rejects returns the panel to idle with the reason;
 //! 4. an answer OMP got but the audit lost fails the turn with exactly one
 //!    abort (a second would meet the next recorded prompt and end the
-//!    replay);
+//!    replay); then a run OMP starts on its own while the panel is idle
+//!    shows as running and Stop aborts it;
 //! 5. Restart with a prompt still queued: the old OMP never sends it (the
 //!    fixture would write `old-omp-got-four`), though it was alive and held
 //!    the prompt in its queue at the restart (its thread parked by the
@@ -18,9 +22,10 @@
 //! 6. Stop, then Restart while the old OMP is slow to exit and still holds
 //!    the session file: one abort, and the new OMP waits for the old and
 //!    opens the session, not Taken;
-//! 7. Restart while the old OMP never answers the abort and a process it
-//!    started holds the session file: the old OMP's group is killed and the
-//!    new OMP opens the session, not Taken.
+//! 7. Restart with a follow-up queued, while the old OMP never answers the
+//!    abort and a process it started holds the session file: the follow-up
+//!    goes back to the composer and its chip goes, the old OMP's group is
+//!    killed and the new OMP opens the session, not Taken.
 //!
 //! Harness off: invoked with `--mode` (or `config`) this binary is fake-omp.
 
@@ -31,7 +36,7 @@
 
 use cedian_omp::UserAnswer;
 use cedian_panel::{CedianPanel, Connection, Turn};
-use gpui::{TestAppContext, WindowHandle};
+use gpui::{TestAppContext, VisualTestContext, WindowHandle};
 use project::Project;
 use settings::SettingsStore;
 use std::path::Path;
@@ -96,6 +101,7 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
 
     let project = Project::test(fs::RealFs::new(None, cx.executor()), [ws.as_path()], cx).await;
     let window = cx.add_window(|window, cx| CedianPanel::new(project.clone(), window, cx));
+    let mut vcx = VisualTestContext::from_window(window.into(), cx);
 
     // 1. Stop while queued, before OMP is even ready.
     let turn = window
@@ -117,25 +123,32 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
         "OMP never ran it: {transcript:?}"
     );
 
-    // 2. While a turn runs, Steer sends `steer` and Send queues a
-    // `follow_up` (replay checks both texts); OMP's queue shows as a chip;
-    // Stop aborts the turn, which ends once, and the chip shows what OMP
-    // reports after it.
+    // 2. While a turn runs, the Steer button sends `steer` and Send queues
+    // a `follow_up` (replay checks each text); OMP's queue shows as a chip.
+    // Stop takes both back out of OMP's queue first (replay checks each
+    // text and queue), then aborts once; they go back to the composer.
     assert_eq!(submit(cx, &window, "one").0, Turn::Queued);
     wait(cx, &window, "turn one to stream", |p| {
         p.turn() == &Turn::Streaming
     });
-    window
-        .update(cx, |p, window, cx| {
-            p.set_prompt("faster", window, cx);
-            p.steer(window, cx);
-        })
-        .unwrap();
+    set_prompt(cx, &window, "/plan");
+    click(&mut vcx, "cedian-steer");
+    wait(cx, &window, "the refused steer", |p| {
+        p.notice().is_some_and(|n| n.contains("cannot be queued"))
+    });
+    assert_eq!(
+        prompt(cx, &window),
+        "/plan",
+        "a refused steer keeps its text"
+    );
+    set_prompt(cx, &window, "faster");
+    click(&mut vcx, "cedian-steer");
     wait(cx, &window, "the steer chip", |p| {
         p.transcript()
             .iter()
             .any(|l| l.ends_with("queued: faster / "))
     });
+    assert_eq!(prompt(cx, &window), "", "OMP took the steer");
     let (turn, notice) = submit(cx, &window, "two");
     assert_eq!(
         (turn, notice.as_str()),
@@ -147,13 +160,14 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
             .iter()
             .any(|l| l.ends_with("queued: faster / two"))
     });
-    window.update(cx, |p, _, cx| p.stop_turn(cx)).unwrap();
+    set_prompt(cx, &window, "typed meanwhile");
+    click(&mut vcx, "cedian-stop");
     wait(cx, &window, "turn one to stop", |p| p.turn() == &Turn::Idle);
-    let transcript = window.update(cx, |p, _, _| p.transcript()).unwrap();
-    assert!(
-        !transcript.iter().any(|l| l.contains("queued:")),
-        "OMP emptied its queue on the abort: {transcript:?}"
-    );
+    wait(cx, &window, "the queue back in the composer", |p| {
+        !p.transcript().iter().any(|l| l.contains("queued:"))
+    });
+    assert_eq!(prompt(cx, &window), "faster\ntwo\ntyped meanwhile");
+    set_prompt(cx, &window, "");
     assert_ready(cx, &window);
 
     // 3. OMP rejects the prompt.
@@ -188,7 +202,11 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
         .unwrap();
     assert!(notice.is_some_and(|n| n.starts_with("turn failed: audit")));
     submit(cx, &window, "after the audit");
-    wait(cx, &window, "the turn after the audit", |p| {
+    wait(cx, &window, "OMP's own run after the audit's turn", |p| {
+        p.turn() == &Turn::Streaming && p.omp_runs_unprompted()
+    });
+    click(&mut vcx, "cedian-stop");
+    wait(cx, &window, "OMP's own run to stop", |p| {
         p.turn() == &Turn::Idle && p.notice().is_none()
     });
     assert_ready(cx, &window);
@@ -253,15 +271,46 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
     wait(cx, &window, "the hanging turn", |p| {
         p.turn() == &Turn::Streaming
     });
+    submit(cx, &window, "later");
+    wait(cx, &window, "the follow-up chip", |p| {
+        p.transcript()
+            .iter()
+            .any(|l| l.ends_with("queued:  / later"))
+    });
     install(4);
     cedian_panel::omp_link::set_previous_exit(Duration::from_millis(500));
     window
         .update(cx, |panel, window, cx| panel.restart(window, cx))
         .unwrap();
+    let transcript = window.update(cx, |p, _, _| p.transcript()).unwrap();
+    assert!(
+        !transcript.iter().any(|l| l.contains("queued:")),
+        "the old OMP's queue died with it: {transcript:?}"
+    );
+    assert_eq!(prompt(cx, &window), "later");
     wait(cx, &window, "the session after the hung OMP", |p| {
         !matches!(p.connection(), Connection::Starting)
     });
     assert_ready(cx, &window);
+}
+
+fn set_prompt(cx: &mut TestAppContext, window: &WindowHandle<CedianPanel>, text: &str) {
+    window
+        .update(cx, |p, window, cx| p.set_prompt(text, window, cx))
+        .unwrap();
+}
+
+fn prompt(cx: &mut TestAppContext, window: &WindowHandle<CedianPanel>) -> String {
+    window.update(cx, |p, _, cx| p.prompt_text(cx)).unwrap()
+}
+
+fn click(vcx: &mut VisualTestContext, selector: &'static str) {
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    let bounds = vcx
+        .debug_bounds(selector)
+        .unwrap_or_else(|| panic!("{selector} is not on screen"));
+    vcx.simulate_click(bounds.center(), gpui::Modifiers::none());
 }
 
 /// Whether `pid` runs: a zombie, dead but not yet reaped, does not.

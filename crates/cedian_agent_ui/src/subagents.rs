@@ -75,10 +75,6 @@ impl SubagentTree {
     pub fn rows(&self) -> &[SubagentRow] {
         &self.rows
     }
-
-    pub fn get(&self, id: &str) -> Option<&SubagentRow> {
-        self.rows.iter().find(|row| row.id == id)
-    }
 }
 
 #[cfg(test)]
@@ -124,7 +120,7 @@ mod tests {
                 ("sa-2", SubagentStatus::Running)
             ]
         );
-        assert_eq!(tree.get("sa-1").unwrap().description, "late");
+        assert_eq!(tree.rows()[0].description, "late");
         assert!(tree.under("other").is_empty());
     }
 }

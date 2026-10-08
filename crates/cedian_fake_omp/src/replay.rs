@@ -109,13 +109,19 @@ pub(crate) fn run(fixture: &Path, cwd: &Path, placeholders: &Placeholders) -> i3
                     );
                     return crate::EXIT_DIVERGED;
                 }
-                // A steer, follow-up or subagent command must name the
-                // recorded target and text.
+                // A steer, follow-up, queue removal or subagent command must
+                // name the recorded target and text.
                 if matches!(
                     got_type,
-                    Some("steer" | "follow_up" | "steer_subagent" | "cancel_subagent")
+                    Some(
+                        "steer"
+                            | "follow_up"
+                            | "remove_queued_message"
+                            | "steer_subagent"
+                            | "cancel_subagent"
+                    )
                 ) {
-                    for field in ["subagentId", "message"] {
+                    for field in ["subagentId", "message", "queue"] {
                         if got.get(field) != expected.get(field) {
                             eprintln!(
                                 "fake-omp replay: divergence at record {n}: expected {field} {:?}, host sent {:?}",

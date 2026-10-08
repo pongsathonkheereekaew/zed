@@ -245,14 +245,15 @@ impl Gate {
         control.respond(reply).map_err(|e| e.to_string())
     }
 
-    /// Cancel the current prompt; with `close`, every later one too.
+    /// Cancel the current prompt; with `close`, every later one too. One
+    /// abort stops what runs: our started prompt, or a run of OMP's own,
+    /// even while a prompt of ours still waits.
     fn cancel(&self, close: bool) {
         let mut turn = self.turn.lock();
         let first = !std::mem::replace(&mut turn.cancelled, true);
         turn.closed |= close;
-        if first && turn.phase == Phase::Started {
-            self.abort();
-        } else if turn.phase == Phase::Idle && std::mem::take(&mut turn.unprompted) {
+        let ours = first && turn.phase == Phase::Started;
+        if std::mem::take(&mut turn.unprompted) || ours {
             self.abort();
         }
     }

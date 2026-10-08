@@ -19,3 +19,10 @@
 {"dir":"out","frame":{"agentInvoked":true,"id":"req_5","sessionSettled":false,"status":"completed","type":"prompt_result"}}
 {"dir":"fs","frame":{"type":"fs_sleep","ms":1000}}
 {"dir":"out","frame":{"type":"session_settled"}}
+{"dir":"in","frame":{"id":"req_6","subagentId":"none","type":"cancel_subagent"}}
+{"dir":"out","frame":{"command":"cancel_subagent","data":{"cancelled":false},"id":"req_6","success":true,"type":"response"}}
+{"dir":"out","frame":{"type":"agent_start"}}
+{"dir":"in","frame":{"id":"req_7","type":"abort"}}
+{"dir":"fs","frame":{"type":"fs_write","path":"own-run-aborted","content":""}}
+{"dir":"out","frame":{"command":"abort","id":"req_7","success":true,"type":"response"}}
+{"dir":"out","frame":{"type":"session_settled"}}

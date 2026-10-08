@@ -27,7 +27,9 @@
 //!    goes back to the composer and its chip goes, the old OMP's group is
 //!    killed and the new OMP opens the session, not Taken;
 //! 8. a turn of ours never shows as a run OMP started on its own, not even
-//!    between its `prompt_result` and `session_settled`.
+//!    between its `prompt_result` and `session_settled`;
+//! 9. Stop while our prompt still waits and OMP runs a run of its own
+//!    aborts OMP's run, and our prompt never reaches OMP.
 //!
 //! Harness off: invoked with `--mode` (or `config`) this binary is fake-omp.
 
@@ -302,6 +304,32 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
     wait(cx, &window, "the own turn to end", |p| {
         assert!(!p.omp_runs_unprompted(), "our own turn shows as OMP's");
         p.turn() == &Turn::Idle && p.transcript().iter().any(|l| l == "User: own")
+    });
+    assert_ready(cx, &window);
+
+    // 9. Stop while our prompt waits behind the parked OMP thread and OMP
+    // runs a run of its own (started after the subagent cancel): that run
+    // is aborted, and our prompt never goes out.
+    let hold = window
+        .update(cx, |panel, window, cx| {
+            let hold = panel.hold_omp();
+            panel.set_prompt("held", window, cx);
+            panel.submit(window, cx);
+            assert!(panel.prompt_queued(), "our prompt waits");
+            panel.cancel_subagent("none", cx);
+            hold
+        })
+        .unwrap();
+    wait(cx, &window, "OMP's own run while ours waits", |p| {
+        p.turn() == &Turn::Streaming
+    });
+    click(&mut vcx, "cedian-stop");
+    wait(cx, &window, "OMP's own run to be aborted", |_| {
+        ws.join("own-run-aborted").exists()
+    });
+    drop(hold);
+    wait(cx, &window, "our prompt dropped", |p| {
+        p.turn() == &Turn::Idle && !p.transcript().iter().any(|l| l == "User: held")
     });
     assert_ready(cx, &window);
 }

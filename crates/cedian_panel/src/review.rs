@@ -726,12 +726,21 @@ impl TaskReview {
         file.fold_user_edits_except(buffer, &agent);
         // A fold made after the call's mark that lies wholly inside the
         // transaction is this import landing early (the file's window was
-        // closed by another outcome), not the user's.
+        // closed by another outcome), not the user's. Unless the fold saw
+        // the import land after it: then it is a keystroke the write kept
+        // (OMP read the autosaved file), the user's. A deletion (an empty
+        // range) is kept too: unsure means STALE (ADR-0006).
         let snapshot = buffer.text_snapshot();
         file.user_edits.retain(|e| {
             let r = e.range.start.to_offset(&snapshot)..e.range.end.to_offset(&snapshot);
-            !(e.folded_at.changed_since(baseline.version())
-                && agent.iter().any(|a| a.start <= r.start && r.end <= a.end))
+            if r.is_empty() || !e.folded_at.changed_since(baseline.version()) {
+                return true;
+            }
+            let inside = agent.iter().any(|a| a.start <= r.start && r.end <= a.end);
+            let edited_after = snapshot
+                .edits_since::<usize>(&e.folded_at)
+                .any(|edit| touches(&edit.new, &r));
+            !inside || edited_after
         });
         file.importing.remove(tool_call_id);
         if !file.turn_starts.iter().any(|(t, _)| *t == turn) {
@@ -1726,6 +1735,58 @@ mod tests {
             f.review.agent_edited(&f.buffer, "c1", txn, baseline, cx);
         });
         assert_eq!(statuses(&f), vec![HunkStatus::Pending, HunkStatus::Pending]);
+    }
+
+    /// A keystroke inside the word OMP rewrote, folded by a second call's
+    /// observe and kept by OMP's write (it read the autosaved file): the
+    /// fold saw the import land after it, so it is the user's and the hunk
+    /// is STALE, never rejected.
+    #[gpui::test]
+    async fn a_user_edit_the_write_kept_is_not_the_imports_own(cx: &mut TestAppContext) {
+        let mut f = setup(cx).await;
+        agent_writes(&mut f, "c0", "alpha\nbeta\nGAMMA\n", cx).await;
+        cx.update(|cx| f.review.observe(&f.buffer, "c1", cx));
+        let mark = f.buffer.update(cx, |b, _| import::begin(b));
+        let baseline = mark.start().clone();
+        user_types(&f, 5..5, "foo", cx);
+        cx.update(|cx| f.review.observe(&f.buffer, "c2", cx));
+        f.project
+            .update(cx, |p, cx| p.save_buffer(f.buffer.clone(), cx))
+            .await
+            .unwrap();
+        f.fs.save(
+            Path::new(NOTES),
+            &"ALPHAfoo\nbeta\nGAMMA\n".into(),
+            LineEnding::Unix,
+        )
+        .await
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            text(&f, cx),
+            "ALPHAfoo\nbeta\nGAMMA\n",
+            "the watcher reloaded"
+        );
+        let outcome = import::finish(f.buffer.clone(), mark, &mut cx.to_async())
+            .await
+            .unwrap();
+        let ImportOutcome::Imported(txn) = outcome else {
+            panic!("{outcome:?}");
+        };
+        cx.update(|cx| {
+            f.review.agent_edited(&f.buffer, "c1", txn, baseline, cx);
+            f.review.import_done(&f.buffer, "c2", cx);
+        });
+        assert_eq!(statuses(&f), vec![HunkStatus::Stale, HunkStatus::Pending]);
+        let key = key(&f, 0);
+        let path = cx.update(|cx| f.review.path(&f.review.files()[0], cx));
+        assert_eq!(
+            cx.update(|cx| f.review.reject(&path, &key, cx)),
+            Err(ReviewError::BadTransition {
+                status: HunkStatus::Stale
+            })
+        );
+        assert_eq!(text(&f, cx), "ALPHAfoo\nbeta\nGAMMA\n");
     }
 
     /// Autosave plus the watcher racing ahead: the user's saved transaction

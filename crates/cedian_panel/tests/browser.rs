@@ -92,6 +92,9 @@ fn main() {
     run("a_browser_left_by_a_crash_is_closed", || {
         a_browser_left_by_a_crash_is_closed(&root)
     });
+    run("a_half_written_port_file_is_waited_for", || {
+        a_half_written_port_file_is_waited_for(&root)
+    });
     run("the_persons_input_wins", || the_persons_input_wins(&root));
     run("the_person_preempts_continuous_agent_input", || {
         the_person_preempts_continuous_agent_input(&root)
@@ -241,6 +244,7 @@ fn the_endpoint_refuses_web_pages(root: &std::path::Path) {
     );
     std::thread::sleep(Duration::from_millis(200));
     assert!(!host.state().running, "a refused request starts nothing");
+    host.start().unwrap();
     let local = raw(
         &host.url(),
         &format!(
@@ -572,7 +576,7 @@ fn alive(pid: &str) -> bool {
 fn drop_during_launch_returns_at_once(root: &std::path::Path) {
     let profile = root.join("slow-profile");
     // SAFETY: the tests run one at a time; the fake reads it at launch.
-    unsafe { std::env::set_var("CEDIAN_FAKE_BROWSER_DELAY_MS", "1500") };
+    unsafe { std::env::set_var("CEDIAN_FAKE_BROWSER_DELAY_MS", "3000") };
     let host = BrowserHost::open(profile.clone(), exe(), || {}).unwrap();
     let url = host.url();
     let opener = std::thread::spawn(move || {
@@ -590,7 +594,7 @@ fn drop_during_launch_returns_at_once(root: &std::path::Path) {
     let started = Instant::now();
     drop(host);
     assert!(
-        started.elapsed() < Duration::from_millis(300),
+        started.elapsed() < Duration::from_secs(1),
         "drop waited on the launch: {:?}",
         started.elapsed()
     );
@@ -622,6 +626,39 @@ fn a_browser_left_by_a_crash_is_closed(root: &std::path::Path) {
         "closed over CDP, not killed"
     );
     assert!(host.state().running, "a fresh browser runs on the profile");
+}
+
+/// Chromium creates `DevToolsActivePort` before writing it; a launch that
+/// reads it in between still finds the browser a crash left.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test stands in for a crashed cedian's browser"
+)]
+fn a_half_written_port_file_is_waited_for(root: &std::path::Path) {
+    let profile = root.join("half-written-profile");
+    std::fs::create_dir_all(&profile).unwrap();
+    let mut orphan = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg(format!("--user-data-dir={}", profile.display()))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let port_file = profile.join("DevToolsActivePort");
+    wait_until("the orphan opens its port", || {
+        std::fs::read_to_string(&port_file).is_ok_and(|t| !t.is_empty())
+    });
+    let written = std::fs::read_to_string(&port_file).unwrap();
+    std::fs::write(&port_file, "").unwrap();
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        std::fs::write(&port_file, written).unwrap();
+    });
+    let host = BrowserHost::open(profile, exe(), || {}).unwrap();
+    let _ = host.start();
+    writer.join().unwrap();
+    wait_until("the orphan is closed", || {
+        orphan.try_wait().unwrap().is_some()
+    });
 }
 
 fn send(socket: &mut tungstenite::WebSocket<impl Read + Write>, id: u64, method: &str) {

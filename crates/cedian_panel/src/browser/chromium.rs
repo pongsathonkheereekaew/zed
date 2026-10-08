@@ -129,10 +129,23 @@ fn browser_close(port: u16, limit: Duration) {
 /// adopted: the app could not see it exit or kill it), so the new one can
 /// take the profile.
 fn close_leftover(port_file: &Path) {
-    let Some(port) = std::fs::read_to_string(port_file)
-        .ok()
-        .and_then(|text| text.lines().next()?.trim().parse::<u16>().ok())
-    else {
+    // Chromium creates the file before writing it.
+    let deadline = Instant::now() + Duration::from_millis(200);
+    let port = loop {
+        match std::fs::read_to_string(port_file) {
+            Ok(text) if text.is_empty() && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(text) => {
+                break text
+                    .lines()
+                    .next()
+                    .and_then(|l| l.trim().parse::<u16>().ok());
+            }
+            Err(_) => break None,
+        }
+    };
+    let Some(port) = port else {
         return;
     };
     if http_get(port, "/json/version").is_err() {

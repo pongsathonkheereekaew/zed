@@ -171,11 +171,11 @@ pub fn run(args: &[String]) -> i32 {
     }
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
     let port = listener.local_addr().expect("addr").port();
-    std::fs::write(
-        std::path::Path::new(profile).join("DevToolsActivePort"),
-        format!("{port}\n/devtools/browser/fake\n"),
-    )
-    .expect("DevToolsActivePort");
+    let port_file = std::path::Path::new(profile).join("DevToolsActivePort");
+    let partial = port_file.with_extension("partial");
+    std::fs::write(&partial, format!("{port}\n/devtools/browser/fake\n"))
+        .expect("DevToolsActivePort");
+    std::fs::rename(&partial, &port_file).expect("DevToolsActivePort");
     let browser = Arc::new(Mutex::new(Browser {
         profile: profile_dir.to_path_buf(),
         ..Browser::default()

@@ -287,9 +287,10 @@ fn touches(a: &Range<usize>, b: &Range<usize>) -> bool {
 
 /// Widen edits to whole lines and merge the ones that then overlap; edits on
 /// adjacent lines stay separate hunks, so two calls' lines are never one
-/// hunk. The text
-/// outside every edit is the same in both snapshots, so widening by the same
-/// distance on each side keeps `old` and `new` aligned.
+/// hunk. Each range is widened to its own snapshot's line boundaries: the
+/// text outside every edit is the same in both snapshots, so the same
+/// line-boundary lies on both sides unless another edit sits in between, and
+/// then the two widened edits overlap and merge.
 fn line_hunks(
     old: &text::BufferSnapshot,
     new: &text::BufferSnapshot,
@@ -297,29 +298,38 @@ fn line_hunks(
 ) -> Vec<(Range<usize>, Range<usize>)> {
     let at_line_start =
         |s: &text::BufferSnapshot, o: usize| o == 0 || s.chars_at(o - 1).next() == Some('\n');
+    let line_start = |s: &text::BufferSnapshot, o: usize| {
+        s.point_to_offset(text::Point::new(s.offset_to_point(o).row, 0))
+    };
+    let line_end = |s: &text::BufferSnapshot, o: usize| {
+        let row = s.offset_to_point(o).row;
+        if row < s.max_point().row {
+            s.point_to_offset(text::Point::new(row + 1, 0))
+        } else {
+            s.len()
+        }
+    };
     let mut out: Vec<(Range<usize>, Range<usize>)> = Vec::new();
     for edit in edits {
-        let back = if at_line_start(new, edit.new.start) {
-            0
-        } else {
-            edit.new.start
-                - new.point_to_offset(text::Point::new(new.offset_to_point(edit.new.start).row, 0))
-        };
-        let forward = if at_line_start(new, edit.new.end) && at_line_start(old, edit.old.end) {
-            0
-        } else {
-            let row = new.offset_to_point(edit.new.end).row;
-            let line_end = if row < new.max_point().row {
-                new.point_to_offset(text::Point::new(row + 1, 0))
+        let (old_start, new_start) =
+            if at_line_start(old, edit.old.start) && at_line_start(new, edit.new.start) {
+                (edit.old.start, edit.new.start)
             } else {
-                new.len()
+                (
+                    line_start(old, edit.old.start),
+                    line_start(new, edit.new.start),
+                )
             };
-            line_end - edit.new.end
-        };
-        let new_range = edit.new.start - back..edit.new.end + forward;
-        let old_range = edit.old.start - back..(edit.old.end + forward).min(old.len());
+        let (old_end, new_end) =
+            if at_line_start(old, edit.old.end) && at_line_start(new, edit.new.end) {
+                (edit.old.end, edit.new.end)
+            } else {
+                (line_end(old, edit.old.end), line_end(new, edit.new.end))
+            };
+        let old_range = old_start..old_end;
+        let new_range = new_start..new_end;
         match out.last_mut() {
-            Some((o, n)) if new_range.start < n.end => {
+            Some((o, n)) if new_range.start < n.end || old_range.start < o.end => {
                 n.end = n.end.max(new_range.end);
                 o.end = o.end.max(old_range.end);
             }
@@ -754,13 +764,17 @@ mod tests {
     }
 
     async fn setup(cx: &mut TestAppContext) -> Fixture {
+        setup_with(ORIGINAL, cx).await
+    }
+
+    async fn setup_with(original: &str, cx: &mut TestAppContext) -> Fixture {
         cx.update(|cx| {
             let store = SettingsStore::test(cx);
             cx.set_global(store);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
         });
         let fs = FakeFs::new(cx.executor());
-        fs.insert_tree("/ws", json!({"notes.txt": ORIGINAL})).await;
+        fs.insert_tree("/ws", json!({"notes.txt": original})).await;
         let project = Project::test(fs.clone(), [Path::new("/ws")], cx).await;
         let buffer = project
             .update(cx, |p, cx| p.open_local_buffer(NOTES, cx))
@@ -830,6 +844,30 @@ mod tests {
             ("beta\n", "BETA\n")
         );
         assert_eq!(hunks[0].tool_call_ids, vec!["c1".to_string()]);
+    }
+
+    /// `Buffer::diff` is word-level: one write can be two edits on one line.
+    /// They are one hunk, and reject restores the whole line.
+    #[gpui::test]
+    async fn two_edits_on_one_line_are_one_hunk(cx: &mut TestAppContext) {
+        for (original, written) in [
+            ("alpha beta\n", "ALPHA BETAA\n"),
+            // A net deletion first, then a second edit on the same line.
+            ("alpha beta\n", "A BETAA\n"),
+            ("a beta\n", "ALPHA betaY\n"),
+        ] {
+            let mut f = setup_with(original, cx).await;
+            agent_writes(&mut f, "c1", written, cx).await;
+            let hunks = f.review.files()[0].hunks().to_vec();
+            assert_eq!(hunks.len(), 1, "{original:?} -> {written:?}: {hunks:?}");
+            assert_eq!(
+                (hunks[0].old_text.as_str(), hunks[0].new_text.as_str()),
+                (original, written)
+            );
+            let path = cx.update(|cx| f.review.path(&f.review.files()[0], cx));
+            cx.update(|cx| f.review.reject(&path, 0, cx)).unwrap();
+            assert_eq!(text(&f, cx), original, "reject restored {written:?}");
+        }
     }
 
     #[gpui::test]

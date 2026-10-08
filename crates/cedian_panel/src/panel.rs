@@ -856,36 +856,18 @@ impl CedianPanel {
             .into_any_element()
     }
 
-    /// An edit-class tool starts: mark every open local buffer, and open the
-    /// files it names that are not open yet so their write is imported too.
+    /// An edit-class tool starts: mark the open buffers of the files it
+    /// names, and open the named files that are not open yet so their write
+    /// is imported too. A file the call does not name is never an outcome:
+    /// the person's own save of it during the call is not the agent's.
     fn mark_before_write(
         &mut self,
         tool_call_id: String,
         paths: &[String],
         cx: &mut Context<Self>,
     ) {
-        let buffers: Vec<_> = self
-            .project
-            .read(cx)
-            .opened_buffers(cx)
-            .into_iter()
-            .filter(|b| b.read(cx).file().is_some_and(|f| f.is_local()))
-            .collect();
-        let open: Vec<PathBuf> = buffers
-            .iter()
-            .filter_map(|b| b.read(cx).file().and_then(|f| f.as_local()))
-            .map(|f| f.abs_path(cx))
-            .collect();
-        let marks = buffers
-            .into_iter()
-            .map(|b| {
-                self.review.observe(&b, &tool_call_id, cx);
-                let mark = b.update(cx, |b, _| import::begin(b));
-                (b, mark)
-            })
-            .collect();
         let root = self.workspace_root(cx);
-        let to_open: Vec<PathBuf> = paths
+        let named: Vec<PathBuf> = paths
             .iter()
             .filter_map(|p| {
                 let path = std::path::Path::new(p);
@@ -895,7 +877,29 @@ impl CedianPanel {
                     root.as_ref().map(|r| r.join(path))
                 }
             })
-            .filter(|p| !open.iter().any(|o| o == p))
+            .collect();
+        let buffers: Vec<(Entity<Buffer>, PathBuf)> = self
+            .project
+            .read(cx)
+            .opened_buffers(cx)
+            .into_iter()
+            .filter_map(|b| {
+                let path = b.read(cx).file().and_then(|f| f.as_local())?.abs_path(cx);
+                named.contains(&path).then_some((b, path))
+            })
+            .collect();
+        let to_open: Vec<PathBuf> = named
+            .iter()
+            .filter(|p| !buffers.iter().any(|(_, o)| o == *p))
+            .cloned()
+            .collect();
+        let marks = buffers
+            .into_iter()
+            .map(|(b, _)| {
+                self.review.observe(&b, &tool_call_id, cx);
+                let mark = b.update(cx, |b, _| import::begin(b));
+                (b, mark)
+            })
             .collect();
         self.calls.insert(
             tool_call_id.clone(),
@@ -2378,6 +2382,36 @@ mod tests {
             .unwrap();
         assert_eq!(files, vec![("ws/notes.txt".to_string(), None)]);
         assert_eq!(hunks(&f, cx)[0].1, HunkStatus::Pending);
+    }
+
+    /// The person saves their own edit to an open file while a call writes
+    /// another: a file the call does not name is never an outcome, so their
+    /// save is not credited to the agent and the other file's hunk stands.
+    #[gpui::test]
+    async fn a_users_save_of_an_unnamed_file_is_not_imported(cx: &mut TestAppContext) {
+        let (f, _notes) = fixture(cx).await;
+        let other = f
+            .project
+            .update(cx, |p, cx| p.open_local_buffer("/ws/other.txt", cx))
+            .await
+            .unwrap();
+        tool_start(&f, cx, "c1", &["notes.txt"]);
+        other.update(cx, |b, cx| b.edit([(0..0, "USER ")], None, cx));
+        f.project
+            .update(cx, |p, cx| p.save_buffer(other.clone(), cx))
+            .await
+            .unwrap();
+        omp_writes(&f, "/ws/notes.txt", "alpha\nBETA\ngamma\n").await;
+        tool_end(&f, cx, "c1");
+        assert_eq!(
+            hunks(&f, cx),
+            vec![(
+                "ws/notes.txt".to_string(),
+                HunkStatus::Pending,
+                vec!["c1".to_string()]
+            )]
+        );
+        assert_eq!(other.read_with(cx, |b, _| b.text()), "USER one\ntwo\n");
     }
 
     #[gpui::test]

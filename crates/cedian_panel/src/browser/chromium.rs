@@ -14,18 +14,27 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const START_LIMIT: Duration = Duration::from_secs(60);
+/// How long Chromium gets to close itself (and flush cookies) before it is
+/// killed.
+const CLOSE_LIMIT: Duration = Duration::from_secs(3);
 
 pub struct Chromium {
-    child: Child,
+    child: Option<Child>,
     pub port: u16,
 }
 
 impl Chromium {
     pub fn launch(exe: &Path, profile: &Path) -> Result<Self, String> {
-        std::fs::create_dir_all(profile).map_err(|e| format!("browser profile: {e}"))?;
+        create_profile(profile)?;
         let port_file = profile.join("DevToolsActivePort");
+        close_leftover(&port_file);
         let _ = std::fs::remove_file(&port_file);
-        let mut child = Command::new(exe)
+        let mut command = Command::new(exe);
+        // Its own process group: the app reaps Chromium and its helpers
+        // together, and a terminal's signals to cedian do not reach it.
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let mut child = command
             .arg("--remote-debugging-port=0")
             .arg(format!("--user-data-dir={}", profile.display()))
             .arg("--no-first-run")
@@ -37,10 +46,12 @@ impl Chromium {
             .spawn()
             .map_err(|e| format!("start {}: {e}", exe.display()))?;
         match wait_for_port(&port_file, &mut child) {
-            Ok(port) => Ok(Self { child, port }),
+            Ok(port) => Ok(Self {
+                child: Some(child),
+                port,
+            }),
             Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill(&mut child);
                 Err(e)
             }
         }
@@ -49,15 +60,96 @@ impl Chromium {
 
 impl Chromium {
     pub fn exited(&mut self) -> bool {
-        !matches!(self.child.try_wait(), Ok(None))
+        self.child
+            .as_mut()
+            .is_none_or(|c| !matches!(c.try_wait(), Ok(None)))
     }
 }
 
 impl Drop for Chromium {
+    /// `Browser.close` over CDP, so the profile's cookies flush; the group
+    /// is killed after [`CLOSE_LIMIT`]. Runs off the dropping thread.
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let port = self.port;
+        std::thread::spawn(move || {
+            browser_close(port);
+            let deadline = Instant::now() + CLOSE_LIMIT;
+            while Instant::now() < deadline {
+                if !matches!(child.try_wait(), Ok(None)) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            kill(&mut child);
+        });
     }
+}
+
+fn kill(child: &mut Child) {
+    #[cfg(unix)]
+    if let Ok(pid) = i32::try_from(child.id()) {
+        // SAFETY: signals the process group the child leads (process_group(0)).
+        unsafe { libc::killpg(pid, libc::SIGKILL) };
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Ask the Chromium on `port` to close itself.
+fn browser_close(port: u16) {
+    let Some(url) = http_get(port, "/json/version").ok().and_then(|body| {
+        let version: serde_json::Value = serde_json::from_str(&body).ok()?;
+        Some(version.get("webSocketDebuggerUrl")?.as_str()?.to_string())
+    }) else {
+        return;
+    };
+    if let Ok(mut client) = super::cdp::CdpClient::connect(&url) {
+        let _ = client.call(
+            "Browser.close",
+            serde_json::json!({}),
+            Duration::from_secs(2),
+        );
+    }
+}
+
+/// A Chromium a crashed cedian left running on this profile is closed (not
+/// adopted: the app could not see it exit or kill it), so the new one can
+/// take the profile.
+fn close_leftover(port_file: &Path) {
+    let Some(port) = std::fs::read_to_string(port_file)
+        .ok()
+        .and_then(|text| text.lines().next()?.trim().parse::<u16>().ok())
+    else {
+        return;
+    };
+    if http_get(port, "/json/version").is_err() {
+        return;
+    }
+    browser_close(port);
+    let deadline = Instant::now() + CLOSE_LIMIT;
+    while Instant::now() < deadline && TcpStream::connect(("127.0.0.1", port)).is_ok() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn create_profile(profile: &Path) -> Result<(), String> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder
+        .create(profile)
+        .map_err(|e| format!("browser profile: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(profile, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("browser profile: {e}"))?;
+    }
+    Ok(())
 }
 
 /// `CEDIAN_CHROMIUM`, else the first installed Chrome or Chromium.

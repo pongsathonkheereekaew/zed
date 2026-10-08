@@ -2874,6 +2874,7 @@ dependencies = [
  "futures 0.3.34",
  "gpui",
  "language",
+ "libc",
  "log",
  "lsp",
  "omp-rpc",

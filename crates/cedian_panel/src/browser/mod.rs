@@ -18,7 +18,7 @@ mod monitor;
 
 use cedian_workflow::{Evidence, EvidenceKind, Outcome};
 use chromium::Chromium;
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -109,6 +109,9 @@ struct Shared {
     exe: Option<PathBuf>,
     profile: PathBuf,
     running: Mutex<Option<Running>>,
+    /// A launch is under way; [`Self::launched`] wakes those waiting on it.
+    starting: Mutex<bool>,
+    launched: Condvar,
     state: Mutex<BrowserState>,
     closed: AtomicBool,
     changed: Box<dyn Fn() + Send + Sync>,
@@ -135,6 +138,8 @@ impl BrowserHost {
             exe,
             profile,
             running: Mutex::new(None),
+            starting: Mutex::new(false),
+            launched: Condvar::new(),
             state: Mutex::new(BrowserState::default()),
             closed: AtomicBool::new(false),
             changed: Box::new(changed),
@@ -206,15 +211,25 @@ impl Drop for BrowserHost {
 }
 
 impl Shared {
-    /// The running Chromium's debugging port, starting it if needed.
+    /// The running Chromium's debugging port, starting it if needed. The
+    /// launch runs outside every lock, so dropping the host never waits on
+    /// it; a launch that finishes after the host closed closes its Chromium.
     fn start(self: &Arc<Self>) -> Result<u16, String> {
-        let mut running = self.running.lock();
-        if self.closed.load(Ordering::SeqCst) {
-            return Err("the browser is closed".to_string());
+        let mut starting = self.starting.lock();
+        loop {
+            if self.closed() {
+                return Err("the browser is closed".to_string());
+            }
+            if let Some(r) = self.running.lock().as_ref() {
+                return Ok(r.chromium.port);
+            }
+            if !*starting {
+                break;
+            }
+            self.launched.wait(&mut starting);
         }
-        if let Some(r) = running.as_ref() {
-            return Ok(r.chromium.port);
-        }
+        *starting = true;
+        drop(starting);
         let result = self
             .exe
             .clone()
@@ -222,15 +237,15 @@ impl Shared {
             .and_then(|exe| Chromium::launch(&exe, &self.profile))
             .and_then(|chromium| {
                 let captures = monitor::watch(chromium.port, self.clone())?;
-                Ok(Running {
-                    chromium: chromium,
-                    captures,
-                })
+                Ok(Running { chromium, captures })
             });
+        let mut starting = self.starting.lock();
+        *starting = false;
         let outcome = match result {
+            Ok(_) if self.closed() => Err("the browser is closed".to_string()),
             Ok(r) => {
                 let port = r.chromium.port;
-                *running = Some(r);
+                *self.running.lock() = Some(r);
                 let mut state = self.state.lock();
                 state.running = true;
                 state.error = None;
@@ -241,7 +256,8 @@ impl Shared {
                 Err(e)
             }
         };
-        drop(running);
+        self.launched.notify_all();
+        drop(starting);
         (self.changed)();
         outcome
     }

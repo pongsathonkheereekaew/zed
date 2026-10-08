@@ -8,6 +8,8 @@
 //! `Fake.personInput` stands in for the person clicking in the window, and
 //! `Fake.childNavigate` for a child frame navigating; any `Input.*` command
 //! fires the page's input listener too, as real CDP input does.
+//! `Browser.close` exits, leaving `closed-by-cdp` in the profile;
+//! `CEDIAN_FAKE_BROWSER_DELAY_MS` delays opening the debugging port.
 
 use base64::Engine as _;
 use parking_lot::Mutex;
@@ -50,6 +52,7 @@ struct Browser {
     /// Browser sockets that asked for auto-attach or target discovery.
     auto_attach: Vec<mpsc::Sender<String>>,
     discover: Vec<mpsc::Sender<String>>,
+    profile: std::path::PathBuf,
 }
 
 impl Browser {
@@ -145,6 +148,14 @@ pub fn run(args: &[String]) -> i32 {
         .iter()
         .find_map(|a| a.strip_prefix("--user-data-dir="))
         .expect("--user-data-dir");
+    let profile_dir = std::path::Path::new(profile);
+    std::fs::write(profile_dir.join("fake.pid"), std::process::id().to_string()).expect("pid");
+    if let Some(ms) = std::env::var("CEDIAN_FAKE_BROWSER_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
     let port = listener.local_addr().expect("addr").port();
     std::fs::write(
@@ -152,7 +163,10 @@ pub fn run(args: &[String]) -> i32 {
         format!("{port}\n/devtools/browser/fake\n"),
     )
     .expect("DevToolsActivePort");
-    let browser = Arc::new(Mutex::new(Browser::default()));
+    let browser = Arc::new(Mutex::new(Browser {
+        profile: profile_dir.to_path_buf(),
+        ..Browser::default()
+    }));
     browser.lock().open_page("about:blank");
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
@@ -252,6 +266,10 @@ fn websocket(
                 socket
                     .send(Message::Text(reply.to_string().into()))
                     .map_err(|e| e.to_string())?;
+                if request["method"] == "Browser.close" {
+                    let _ = socket.flush();
+                    std::process::exit(0);
+                }
             }
             Ok(Message::Close(_)) => return Ok(()),
             Ok(_) => {}
@@ -290,6 +308,10 @@ fn answer_browser(
         "Target.createTarget" => {
             let id = browser.open_page(params["url"].as_str().unwrap_or("about:blank"));
             json!({"targetId": id})
+        }
+        "Browser.close" => {
+            let _ = std::fs::write(browser.profile.join("closed-by-cdp"), "");
+            json!({})
         }
         "Target.closeTarget" => {
             browser.close_page(params["targetId"].as_str().unwrap_or_default());

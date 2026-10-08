@@ -74,6 +74,12 @@ fn main() {
         frames_are_bound_to_the_browser(&root)
     });
     run("every_tab_is_followed", || every_tab_is_followed(&root));
+    run("drop_during_launch_returns_at_once", || {
+        drop_during_launch_returns_at_once(&root)
+    });
+    run("a_browser_left_by_a_crash_is_closed", || {
+        a_browser_left_by_a_crash_is_closed(&root)
+    });
     run("the_persons_input_wins", || the_persons_input_wins(&root));
     run("the_person_preempts_continuous_agent_input", || {
         the_person_preempts_continuous_agent_input(&root)
@@ -271,6 +277,16 @@ fn first_connection_starts_the_browser(root: &std::path::Path) {
         "the endpoint is closed"
     );
     assert!(profile.exists(), "the profile outlives the browser");
+    assert!(
+        profile.join("closed-by-cdp").exists(),
+        "closed with Browser.close, so cookies flush"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&profile).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "the profile is the person's alone");
+    }
 }
 
 fn frames_are_bound_to_the_browser(root: &std::path::Path) {
@@ -391,6 +407,70 @@ fn every_tab_is_followed(root: &std::path::Path) {
         capture.url, "https://two.test/",
         "captures re-point to the open tab"
     );
+}
+
+#[allow(clippy::disallowed_methods, reason = "a test probe")]
+fn alive(pid: &str) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", pid])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+fn drop_during_launch_returns_at_once(root: &std::path::Path) {
+    let profile = root.join("slow-profile");
+    // SAFETY: the tests run one at a time; the fake reads it at launch.
+    unsafe { std::env::set_var("CEDIAN_FAKE_BROWSER_DELAY_MS", "1500") };
+    let host = BrowserHost::open(profile.clone(), exe(), || {}).unwrap();
+    let url = host.url();
+    let opener = std::thread::spawn(move || {
+        let _ = raw(
+            &url,
+            &format!(
+                "GET /json/version HTTP/1.1\r\nHost: {}\r\n\r\n",
+                url.trim_start_matches("http://")
+            ),
+        );
+    });
+    wait_until("the launch begins", || profile.join("fake.pid").exists());
+    unsafe { std::env::remove_var("CEDIAN_FAKE_BROWSER_DELAY_MS") };
+    let pid = std::fs::read_to_string(profile.join("fake.pid")).unwrap();
+    let started = Instant::now();
+    drop(host);
+    assert!(
+        started.elapsed() < Duration::from_millis(300),
+        "drop waited on the launch: {:?}",
+        started.elapsed()
+    );
+    let _ = opener.join();
+    wait_until("the late Chromium is killed", || !alive(&pid));
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test stands in for a crashed cedian's browser"
+)]
+fn a_browser_left_by_a_crash_is_closed(root: &std::path::Path) {
+    let profile = root.join("crash-profile");
+    std::fs::create_dir_all(&profile).unwrap();
+    let mut orphan = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg(format!("--user-data-dir={}", profile.display()))
+        .spawn()
+        .unwrap();
+    wait_until("the orphan opens its port", || {
+        profile.join("DevToolsActivePort").exists()
+    });
+    let host = BrowserHost::open(profile.clone(), exe(), || {}).unwrap();
+    host.start().unwrap();
+    wait_until("the orphan is closed", || {
+        orphan.try_wait().unwrap().is_some()
+    });
+    assert!(
+        profile.join("closed-by-cdp").exists(),
+        "closed over CDP, not killed"
+    );
+    assert!(host.state().running, "a fresh browser runs on the profile");
 }
 
 fn send(socket: &mut tungstenite::WebSocket<impl Read + Write>, id: u64, method: &str) {

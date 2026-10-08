@@ -10,9 +10,17 @@
 //! 4. Cancel on a subagent that had already ended: OMP says
 //!    `cancelled: false`, the row says "already ended";
 //! 5. Cancel on a running one: OMP aborts it, the row shows aborted, and
-//!    each Cancel is an audit row.
+//!    each Cancel is an audit row;
+//! 6. the link registers `cedian_worktree_request`: a request without the
+//!    ADR-0033 brief is refused naming the missing fields, with no tree;
+//!    one with it gets a tree, a registry row and its stored brief.
 //!
 //! Harness off: invoked with `--mode` (or `config`) this binary is fake-omp.
+
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test setup runs git to make the workspace a repository"
+)]
 
 use cedian_omp::SubagentStatus;
 use cedian_panel::{CedianPanel, Connection, Turn};
@@ -73,6 +81,26 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
     });
     let ws = root.join("ws");
     std::fs::write(ws.join("session.jsonl"), "").unwrap();
+    std::fs::write(ws.join("notes.txt"), "base\n").unwrap();
+    for args in [
+        &["init", "-q", "-b", "main"][..],
+        &["config", "user.email", "t@t"],
+        &["config", "user.name", "t"],
+        &["add", "notes.txt"],
+        &["commit", "-q", "-m", "base"],
+    ] {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&ws)
+            .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_WORK_TREE")
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    }
     let state = cedian_shell::state::dir(&ws).unwrap();
     cedian_fake_omp::install_replay(&state.join("omp"), Path::new(FIXTURE)).unwrap();
 
@@ -171,6 +199,29 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
         rows,
         [("sa-2".to_string(), false), ("sa-1".to_string(), true)]
     );
+
+    // 6. OMP asks the app for worktrees: one without the ADR-0033 brief is
+    // refused naming the missing fields (replay checks the reason) and no
+    // tree appears; one with the brief gets its tree, row and brief.
+    submit(cx, &window, "make trees");
+    wait(cx, &window, "the worktree turn", |p| {
+        p.turn() == &Turn::Idle && p.transcript().iter().any(|l| l == "User: make trees")
+    });
+    assert_connected(cx, &window);
+    assert!(
+        !ws.join(".worktrees/bare").exists(),
+        "a brief-less request makes no tree"
+    );
+    assert!(
+        ws.join(".worktrees/w1/notes.txt").exists(),
+        "the briefed tree"
+    );
+    let registry = std::fs::read_to_string(state.join("workers.json")).unwrap();
+    assert!(
+        registry.contains("fix the casing") && !registry.contains("bare"),
+        "{registry}"
+    );
+    assert!(state.join("briefs/w1.1.json").exists());
 }
 
 fn type_steer(cx: &mut TestAppContext, window: &WindowHandle<CedianPanel>, id: &str, text: &str) {

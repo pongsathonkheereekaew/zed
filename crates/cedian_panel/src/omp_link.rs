@@ -19,7 +19,7 @@ use cedian_shell::audit::AuditLog;
 use cedian_shell::{Policy, RunKind};
 use collections::HashMap;
 use futures::channel::mpsc::UnboundedSender;
-use omp_rpc::{ExtensionUiRequest, ExtensionUiResponse, HostUri, ImageContent};
+use omp_rpc::{ExtensionUiRequest, ExtensionUiResponse, HostTool, HostUri, ImageContent};
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -105,32 +105,48 @@ pub struct LaunchSpec {
     pub omp_state: Option<PathBuf>,
     /// The host URI schemes registered before the session opens.
     pub uris: Vec<HostUri>,
+    /// The host tools registered before the session opens (one
+    /// `set_host_tools` replaces OMP's whole set, ADR-0004).
+    pub tools: Vec<HostTool>,
 }
 
 impl LaunchSpec {
-    /// Resolve settings, policy and paths for `workdir`. The app registers no
-    /// host tools yet; the panel adds its `cedian://` scheme to `uris`.
+    /// Resolve settings, policy and paths for `workdir`. The app registers
+    /// `cedian_worktree_request` unless project writes are denied (it writes
+    /// `.worktrees/` and a branch); the panel adds its `cedian://` scheme.
     pub fn resolve(workdir: &Path) -> Result<Self, String> {
         let settings = cedian_shell::resolve_settings(workdir).map_err(|e| e.to_string())?;
         let binary = cedian_shell::launch::omp_binary()?;
         let choice = settings.policy_for(workdir, RunKind::Interactive);
-        let mut policy = cedian_shell::launch::spawn_policy(&settings, choice.policy, &[]);
+        let state_dir = cedian_shell::state::dir(workdir)?;
+        let (tools, names) = if settings.permissions.project_write == cedian_shell::Verdict::Deny {
+            (Vec::new(), Vec::new())
+        } else {
+            let tool =
+                cedian_worker::worktree_request_tool(workdir.to_path_buf(), state_dir.clone());
+            (vec![tool], vec![cedian_worker::WORKTREE_REQUEST_TOOL])
+        };
+        let mut policy = cedian_shell::launch::spawn_policy(&settings, choice.policy, &names);
         let policy_note = match choice.policy {
             Policy::Cedian => {
                 policy.config_allows = cedian_shell::launch::config_allows(&binary, workdir)?;
                 None
             }
-            Policy::Omp => Some("policy = \"omp\": OMP's own config decides approvals".to_string()),
+            Policy::Omp => Some(
+                "policy = \"omp\": OMP's own config decides approvals, computer and task isolation"
+                    .to_string(),
+            ),
         };
         Ok(Self {
             binary,
             workdir: workdir.to_path_buf(),
-            state_dir: cedian_shell::state::dir(workdir)?,
+            state_dir,
             sessions: Sessions::OmpDefault,
             policy,
             policy_note,
             omp_state: cedian_omp::driver::state_root(),
             uris: Vec::new(),
+            tools,
         })
     }
 }
@@ -587,6 +603,16 @@ fn run(
             return;
         }
     };
+    if !spec.tools.is_empty()
+        && let Err(e) = runtime.set_host_tools(spec.tools)
+    {
+        let _ = events.unbounded_send(LinkEvent::Failed(format!(
+            "OMP refused cedian's host tools: {e}"
+        )));
+        let own = runtime.pid();
+        shutdown(runtime, &gate, own);
+        return;
+    }
     if !spec.uris.is_empty()
         && let Err(e) = runtime.set_host_uris(spec.uris)
     {
@@ -992,6 +1018,7 @@ mod tests {
             policy_note: None,
             omp_state: cedian_omp::driver::state_root(),
             uris: Vec::new(),
+            tools: Vec::new(),
         };
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         let link = OmpLink::start(spec(), tx, None);

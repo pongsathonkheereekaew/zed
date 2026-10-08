@@ -3,8 +3,8 @@
 //! Plan refs: §43 R1 (cedian owns worktrees, OMP requests; conflict → STALE,
 //! never auto-merge; merge-back needs explicit accept).
 //!
-//! Phase 16 (mechanism + visualization land together — CLI `list` is the
-//! headless visualization). §18 R3 (hunk precedence surfaces STALE through
+//! Phase 16 (mechanism; the app registers `cedian_worktree_request` since
+//! S9 U8, ADR-0050). §18 R3 (hunk precedence surfaces STALE through
 //! the existing tracker; the registry adds no new hunk states).
 //!
 //! S9 handoff: this crate is the headless mechanism (registry record +

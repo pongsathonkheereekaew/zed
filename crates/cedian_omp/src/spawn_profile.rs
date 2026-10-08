@@ -263,6 +263,9 @@ impl SpawnPolicy {
                 let mut overlay = json!({
                     // Until ADR-0008's atomic landing (driver + Seatbelt + bypass test).
                     "computer": {"enabled": false},
+                    // Worktrees are cedian's (ADR-0009, ADR-0050): OMP's
+                    // `task` never makes its own isolated copy.
+                    "task": {"isolation": {"enabled": false}},
                     "tools": {
                         "approvalMode": self.approvals.mode().map(ApprovalMode::as_str),
                         "approval": approval,
@@ -660,6 +663,7 @@ mod tests {
             policy.overlay().unwrap(),
             json!({
                 "computer": {"enabled": false},
+                "task": {"isolation": {"enabled": false}},
                 "tools": {
                     "approvalMode": "write",
                     "approval": {
@@ -808,6 +812,32 @@ mod tests {
             };
             assert!(policy.overlay().is_err(), "{bad} refused");
         }
+    }
+
+    #[test]
+    fn overlay_keeps_omp_from_making_worktrees_except_under_policy_omp() {
+        for approvals in [Approvals::Cedian(ApprovalMode::Write), Approvals::Reviewer] {
+            let overlay = SpawnPolicy {
+                approvals,
+                ..SpawnPolicy::default()
+            }
+            .overlay()
+            .unwrap();
+            assert_eq!(
+                overlay["task"]["isolation"]["enabled"], false,
+                "{approvals:?}: worktrees are cedian's (ADR-0009, ADR-0050)"
+            );
+        }
+        let omp = SpawnPolicy {
+            approvals: Approvals::Omp,
+            ..SpawnPolicy::default()
+        }
+        .overlay()
+        .unwrap();
+        assert!(
+            omp.get("task").is_none(),
+            "policy = \"omp\": the user's OMP config decides"
+        );
     }
 
     fn reviewer() -> SpawnPolicy {

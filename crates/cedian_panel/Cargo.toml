@@ -27,6 +27,7 @@ cedian_agent_ui = { path = "../cedian_agent_ui" }
 cedian_omp = { path = "../cedian_omp" }
 cedian_review = { path = "../cedian_review" }
 cedian_shell = { path = "../cedian_shell" }
+cedian_worker = { path = "../cedian_worker" }
 cedian_workflow = { path = "../cedian_workflow" }
 cedian_workspace = { path = "../cedian_workspace" }
 clock.workspace = true

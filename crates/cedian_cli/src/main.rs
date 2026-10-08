@@ -66,7 +66,7 @@ fn is_read_only(args: &[String]) -> bool {
         "review" => sub.is_none(),
         "state" | "palette" | "help" | "shell" => true,
         "workflow" => sub == Some("status"),
-        "worker" => matches!(sub, Some("list" | "preview")),
+        "worker" => sub == Some("preview"),
         _ => false,
     }
 }
@@ -1000,11 +1000,11 @@ fn worker_base(args: &[String], from: usize) -> Result<String, String> {
     Ok(base)
 }
 
-/// Worker commands (S5 headless surface — one-shot per invocation):
+/// Worker commands (S5 headless surface — one-shot per invocation; `list`
+/// and `steer` were deleted at S9 U8, ADR-0050: the app's subagent rows
+/// and `steer_subagent` replace them):
 /// ```text
 /// cedian worker spawn <id> <kind> <title> [--base <branch>]
-/// cedian worker list
-/// cedian worker steer <id> <note...>
 /// cedian worker preview <id> [--base <branch>]
 /// cedian worker merge-back <id> [--base <branch>]
 /// cedian worker remove <id>
@@ -1033,48 +1033,6 @@ fn cmd_worker(workdir: &Path, args: &[String]) -> Result<(), String> {
             reg.insert(head).map_err(|e| e.to_string())?;
             reg.save(&state).map_err(|e| e.to_string())?;
             println!("worker {id} → {worktree} (branch {branch})");
-            Ok(())
-        }
-        Some("list") => {
-            if args.len() > 1 {
-                return Err("usage: cedian worker list".to_string());
-            }
-            let (reg, _) = cedian_worker::Registry::open(&state).map_err(|e| e.to_string())?;
-            let mut any = false;
-            for head in reg.all() {
-                any = true;
-                let status = format!("{:?}", head.status).to_lowercase();
-                println!(
-                    "{} {} {} {}",
-                    head.id, status, head.worktree, head.task_title
-                );
-            }
-            if !any {
-                println!("no workers");
-            }
-            Ok(())
-        }
-        Some("steer") => {
-            let usage = "usage: cedian worker steer <id> <note...>";
-            let id = args.get(1).ok_or(usage)?;
-            if args.len() < 3 {
-                return Err(usage.to_string());
-            }
-            let note = args[2..].join(" ");
-            let (mut reg, _) = cedian_worker::Registry::open(&state).map_err(|e| e.to_string())?;
-            let head = reg
-                .get(id)
-                .cloned()
-                .ok_or_else(|| cedian_worker::WorkerError::NoSuch(id.clone()).to_string())?;
-            reg.set_status(id, cedian_worker::WorkerStatus::Running, note.clone())
-                .map_err(|e| e.to_string())?;
-            reg.save(&state).map_err(|e| e.to_string())?;
-            let wt = workdir.join(&head.worktree);
-            println!("steer {id}: {note}");
-            println!(
-                "hint: run the turn with CEDIAN_WORKDIR={} cedian prompt ...",
-                wt.display()
-            );
             Ok(())
         }
         Some("preview") => {
@@ -1143,7 +1101,7 @@ fn cmd_worker(workdir: &Path, args: &[String]) -> Result<(), String> {
             println!("removed {id}");
             Ok(())
         }
-        _ => Err("usage: cedian worker <spawn|list|steer|preview|merge-back|remove> …".into()),
+        _ => Err("usage: cedian worker <spawn|preview|merge-back|remove> …".into()),
     }
 }
 

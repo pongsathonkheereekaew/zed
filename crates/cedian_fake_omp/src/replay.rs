@@ -3,8 +3,8 @@
 //! Server (`out`) frames are emitted in recorded order. At each recorded host
 //! (`in`) frame, replay blocks for the host's next line and checks its `type`
 //! matches, and a dialog answer (and a prompt's text and recorded images,
-//! a steer's, follow-up's or subagent command's id and text, and a host URI
-//! read's content) matches whole; the host's fresh request id
+//! a steer's, follow-up's or subagent command's id and text, a host URI
+//! read's content, and a host tool refusal's reason) matches; the host's fresh request id
 //! is mapped onto the recorded one so the recorded `response` frames
 //! correlate.
 //! Any divergence exits with [`crate::EXIT_DIVERGED`] — the host sees a
@@ -127,17 +127,35 @@ pub(crate) fn run(fixture: &Path, cwd: &Path, placeholders: &Placeholders) -> i3
                     }
                 }
                 // A host URI read must answer what the recording answered.
-                if got_type == Some("host_uri_result") {
-                    for field in ["content", "isError", "error"] {
-                        if got.get(field) != expected.get(field) {
-                            eprintln!(
-                                "fake-omp replay: divergence at record {n}: expected {field} {:?}, host sent {:?}",
-                                expected.get(field),
-                                got.get(field)
-                            );
-                            return crate::EXIT_DIVERGED;
-                        }
+                let fields: &[&str] = match got_type {
+                    Some("host_uri_result") => &["content", "isError", "error"],
+                    Some("host_tool_result") => &["isError"],
+                    _ => &[],
+                };
+                for field in fields {
+                    if got.get(field) != expected.get(field) {
+                        let json = |v: Option<&Value>| v.cloned().unwrap_or(Value::Null);
+                        eprintln!(
+                            "fake-omp replay: divergence at record {n}: expected {field} {}, host sent {}",
+                            json(expected.get(field)),
+                            json(got.get(field))
+                        );
+                        return crate::EXIT_DIVERGED;
                     }
+                }
+                // A host tool call succeeds or fails as recorded, and a
+                // refusal is refused for the same reason: its first line. The
+                // rest can vary with the run's settings and version tokens.
+                if got_type == Some("host_tool_result")
+                    && expected.get("isError") == Some(&json!(true))
+                    && first_lines(&got) != first_lines(&expected)
+                {
+                    eprintln!(
+                        "fake-omp replay: divergence at record {n}: expected refusal {:?}, host sent {:?}",
+                        first_lines(&expected),
+                        first_lines(&got)
+                    );
+                    return crate::EXIT_DIVERGED;
                 }
                 // Images the recording prompted with must reach OMP too.
                 let expected = record.frame.get("images");
@@ -202,6 +220,18 @@ fn hold(cwd: &Path, frame: &Value) {
     if let Err(e) = spawned {
         eprintln!("fake-omp replay: fs_hold: {e}");
     }
+}
+
+/// The first line of each text item of a host tool result.
+fn first_lines(frame: &Value) -> Vec<&str> {
+    frame
+        .pointer("/result/content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .map(|text| text.lines().next().unwrap_or(""))
+        .collect()
 }
 
 fn remap_id(frame: &mut Value, ids: &HashMap<String, String>) {

@@ -88,6 +88,10 @@ pub fn begin_from(
 /// the first, so the import would see nothing while the watcher's reload
 /// landed after it.
 ///
+/// A file the tool did not write (the disk still holds the text the call
+/// started from) is `Unchanged` whatever the buffer holds: the person's
+/// typing in an open file the call never touched is no outcome.
+///
 /// Whether the watcher raced ahead is decided by content, not by the undo
 /// stack: edits since [`begin`] that leave the buffer equal to the disk text
 /// are the watcher landing this same write, and that transaction is the
@@ -99,18 +103,20 @@ pub async fn finish(
     mark: Mark,
     cx: &mut AsyncApp,
 ) -> Result<ImportOutcome> {
-    let (dirty, load) = buffer.read_with(cx, |b, cx| {
-        let load = b.file().and_then(|f| f.as_local()).map(|f| f.load(cx));
-        (b.is_dirty(), load)
+    let load = buffer.read_with(cx, |b, cx| {
+        b.file().and_then(|f| f.as_local()).map(|f| f.load(cx))
     });
-    if dirty {
-        return Ok(ImportOutcome::Stale);
-    }
     let Some(load) = load else {
         return Ok(ImportOutcome::Unchanged);
     };
     let mut disk_text = load.await?;
     text::LineEnding::normalize(&mut disk_text);
+    if disk_text == mark.start.text() {
+        return Ok(ImportOutcome::Unchanged);
+    }
+    if buffer.read_with(cx, |b, _| b.is_dirty()) {
+        return Ok(ImportOutcome::Stale);
+    }
     let diff = buffer
         .read_with(cx, |b, cx| b.diff(disk_text.clone(), cx))
         .await;

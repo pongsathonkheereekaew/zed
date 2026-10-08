@@ -2340,6 +2340,40 @@ mod tests {
         assert_eq!(buffer.read_with(cx, |b, _| b.text()), ORIGINAL);
     }
 
+    /// Typing in an open file OMP did not write is no outcome: the file is
+    /// not in review at all, STALE or otherwise.
+    #[gpui::test]
+    async fn an_unrelated_dirty_file_is_not_in_review(cx: &mut TestAppContext) {
+        let (f, _notes) = fixture(cx).await;
+        let other = f
+            .project
+            .update(cx, |p, cx| p.open_local_buffer("/ws/other.txt", cx))
+            .await
+            .unwrap();
+        tool_start(&f, cx, "c1", &["notes.txt"]);
+        other.update(cx, |b, cx| b.edit([(0..0, "USER ")], None, cx));
+        omp_writes(&f, "/ws/notes.txt", "alpha\nBETA\ngamma\n").await;
+        tool_end(&f, cx, "c1");
+        let files: Vec<(String, Option<String>)> = f
+            .window
+            .update(cx, |panel, _, cx| {
+                panel
+                    .review
+                    .files()
+                    .iter()
+                    .map(|file| {
+                        (
+                            panel.review.path(file, cx).display().to_string(),
+                            file.stale_import().map(str::to_string),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap();
+        assert_eq!(files, vec![("ws/notes.txt".to_string(), None)]);
+        assert_eq!(hunks(&f, cx)[0].1, HunkStatus::Pending);
+    }
+
     #[gpui::test]
     #[ignore]
     async fn live_panel_streams_and_imports_one_undoable_omp_edit(cx: &mut TestAppContext) {

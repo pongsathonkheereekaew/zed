@@ -202,6 +202,15 @@ struct TurnRevert {
     accepted: usize,
 }
 
+/// A range the user edited, kept as anchors so a later agent or cedian edit
+/// never demotes a stale hunk back to pending.
+struct UserEdit {
+    range: Range<Anchor>,
+    /// The buffer version the fold saw, so an import can tell a fold made
+    /// after its call's mark from an older one.
+    folded_at: clock::Global,
+}
+
 /// Per-buffer review state.
 pub struct FileReview {
     buffer: Entity<Buffer>,
@@ -210,11 +219,12 @@ pub struct FileReview {
     /// Every edit up to here is accounted for: the agent's, cedian's, or
     /// folded into `user_edits`.
     last_seen: clock::Global,
-    user_edits: Vec<Range<Anchor>>,
-    /// A tool call is writing this file (between [`TaskReview::observe`]
-    /// and its outcome): edits landing now are the import, or are judged
-    /// by it, so a display rebuild classifies none of them.
-    importing: bool,
+    user_edits: Vec<UserEdit>,
+    /// The tool calls writing this file (each between
+    /// [`TaskReview::observe`] and its outcome): edits landing now are an
+    /// import, or are judged by one, so a display rebuild classifies none
+    /// of them.
+    importing: collections::HashSet<String>,
     /// Set when OMP wrote the disk while the buffer had unsaved edits, so
     /// nothing was imported (decision 5).
     stale_import: Option<String>,
@@ -244,7 +254,7 @@ impl FileReview {
             baseline,
             agent_txns: Vec::new(),
             user_edits: Vec::new(),
-            importing: false,
+            importing: collections::HashSet::default(),
             stale_import: None,
             resolved: HashMap::default(),
             rejected: collections::HashSet::default(),
@@ -272,6 +282,11 @@ impl FileReview {
         &self.agent_txns
     }
 
+    /// A tool call is writing this file.
+    pub fn importing(&self) -> bool {
+        !self.importing.is_empty()
+    }
+
     fn fold_user_edits(&mut self, buffer: &Buffer) {
         self.fold_user_edits_except(buffer, &[]);
     }
@@ -286,7 +301,10 @@ impl FileReview {
                 .iter()
                 .any(|a| a.start <= edit.new.start && edit.new.end <= a.end);
             if !inside {
-                self.user_edits.push(range);
+                self.user_edits.push(UserEdit {
+                    range,
+                    folded_at: snapshot.version().clone(),
+                });
             }
         }
         self.last_seen = snapshot.version().clone();
@@ -300,7 +318,7 @@ impl FileReview {
         let user: Vec<Range<usize>> = self
             .user_edits
             .iter()
-            .map(|r| r.start.to_offset(&snapshot)..r.end.to_offset(&snapshot))
+            .map(|e| e.range.start.to_offset(&snapshot)..e.range.end.to_offset(&snapshot))
             .collect();
         // A call's edits are attributed by row: a pure deletion is an empty
         // range that sits at a line start, which must not credit the call
@@ -390,8 +408,8 @@ impl FileReview {
                 revived.push(hunk.new.clone());
             }
         }
-        self.user_edits.retain(|r| {
-            let r = r.start.to_offset(&snapshot)..r.end.to_offset(&snapshot);
+        self.user_edits.retain(|e| {
+            let r = e.range.start.to_offset(&snapshot)..e.range.end.to_offset(&snapshot);
             !revived.iter().any(|h| touches(h, &r))
         });
         self.built_at = snapshot.version().clone();
@@ -429,7 +447,7 @@ impl FileReview {
         let user: Vec<Range<usize>> = self
             .user_edits
             .iter()
-            .map(|r| r.start.to_offset(&snapshot)..r.end.to_offset(&snapshot))
+            .map(|e| e.range.start.to_offset(&snapshot)..e.range.end.to_offset(&snapshot))
             .collect();
         let accepted: Vec<Range<usize>> = self
             .hunks
@@ -651,19 +669,22 @@ impl TaskReview {
     /// before any agent write can land (the tool's start); until the call's
     /// outcome ([`Self::agent_edited`], [`Self::import_refused`] or
     /// [`Self::import_done`]) a rebuild classifies no edit to the buffer.
-    pub fn observe(&mut self, buffer: &Entity<Buffer>, cx: &App) {
+    pub fn observe(&mut self, buffer: &Entity<Buffer>, tool_call_id: &str, cx: &App) {
         if let Some(i) = self.file_index(buffer) {
             self.files[i].fold_user_edits(buffer.read(cx));
-            self.files[i].importing = true;
+            self.files[i].importing.insert(tool_call_id.to_string());
         }
     }
 
     /// The tool call that [`Self::observe`]d this buffer imported nothing
-    /// (or failed): whatever changed since is the user's.
-    pub fn import_done(&mut self, buffer: &Entity<Buffer>, cx: &App) {
+    /// (or failed, or never ended): once no call is writing the file,
+    /// whatever changed since is the user's.
+    pub fn import_done(&mut self, buffer: &Entity<Buffer>, tool_call_id: &str, cx: &App) {
         if let Some(i) = self.file_index(buffer) {
-            self.files[i].importing = false;
-            self.files[i].fold_user_edits(buffer.read(cx));
+            self.files[i].importing.remove(tool_call_id);
+            if !self.files[i].importing() {
+                self.files[i].fold_user_edits(buffer.read(cx));
+            }
             self.rebuild(cx);
         }
     }
@@ -703,7 +724,16 @@ impl TaskReview {
             .edited_ranges_for_transaction_id::<usize>(transaction)
             .collect();
         file.fold_user_edits_except(buffer, &agent);
-        file.importing = false;
+        // A fold made after the call's mark that lies wholly inside the
+        // transaction is this import landing early (the file's window was
+        // closed by another outcome), not the user's.
+        let snapshot = buffer.text_snapshot();
+        file.user_edits.retain(|e| {
+            let r = e.range.start.to_offset(&snapshot)..e.range.end.to_offset(&snapshot);
+            !(e.folded_at.changed_since(baseline.version())
+                && agent.iter().any(|a| a.start <= r.start && r.end <= a.end))
+        });
+        file.importing.remove(tool_call_id);
         if !file.turn_starts.iter().any(|(t, _)| *t == turn) {
             file.turn_starts.push((turn, baseline));
         }
@@ -736,7 +766,7 @@ impl TaskReview {
             }
         };
         let file = &mut self.files[i];
-        file.importing = false;
+        file.importing.remove(tool_call_id);
         file.fold_user_edits(buffer.read(cx));
         file.stale_import = Some(reason);
     }
@@ -745,7 +775,7 @@ impl TaskReview {
     pub fn rebuild(&mut self, cx: &App) {
         for file in &mut self.files {
             let buffer = file.buffer.read(cx);
-            if !file.importing {
+            if !file.importing() {
                 file.fold_user_edits(buffer);
             }
             let path = path_of(buffer, cx);
@@ -809,7 +839,7 @@ impl TaskReview {
     ) -> Result<TransactionId, ReviewError> {
         let i = self.file_by_path(path, cx)?;
         let file = &mut self.files[i];
-        if file.importing {
+        if file.importing() {
             return Err(ReviewError::Importing {
                 path: path.to_path_buf(),
             });
@@ -893,7 +923,7 @@ impl TaskReview {
         cx: &App,
         touched: impl Fn(&FileReview) -> bool,
     ) -> Result<(), ReviewError> {
-        match self.files.iter().find(|f| f.importing && touched(f)) {
+        match self.files.iter().find(|f| f.importing() && touched(f)) {
             Some(file) => Err(ReviewError::Importing {
                 path: path_of(file.buffer.read(cx), cx),
             }),
@@ -1130,7 +1160,7 @@ mod tests {
     /// OMP's edit tool writes the disk; the panel's ToolStart/ToolEnd path
     /// imports it as one transaction attributed to `call`.
     async fn agent_writes(f: &mut Fixture, call: &str, text: &str, cx: &mut TestAppContext) {
-        cx.update(|cx| f.review.observe(&f.buffer, cx));
+        cx.update(|cx| f.review.observe(&f.buffer, call, cx));
         let mark = f.buffer.update(cx, |b, _| import::begin(b));
         let baseline = mark.start().clone();
         f.fs.save(Path::new(NOTES), &text.into(), LineEnding::Unix)
@@ -1667,6 +1697,37 @@ mod tests {
         assert_eq!(text(&f, cx), ORIGINAL);
     }
 
+    /// The file's window closed early (a release) and a display rebuild
+    /// folded the import's own edit as the user's before the import was
+    /// attributed: the attribution drops that fold, so the hunk is Pending.
+    #[gpui::test]
+    async fn an_import_landing_after_an_early_close_is_still_the_agents(cx: &mut TestAppContext) {
+        let mut f = setup(cx).await;
+        agent_writes(&mut f, "c0", "ALPHA\nbeta\ngamma\n", cx).await;
+        cx.update(|cx| f.review.observe(&f.buffer, "c1", cx));
+        let mark = f.buffer.update(cx, |b, _| import::begin(b));
+        let baseline = mark.start().clone();
+        cx.update(|cx| f.review.import_done(&f.buffer, "c1", cx));
+        f.fs.save(
+            Path::new(NOTES),
+            &"ALPHA\nbeta\nGAMMA\n".into(),
+            LineEnding::Unix,
+        )
+        .await
+        .unwrap();
+        let outcome = import::finish(f.buffer.clone(), mark, &mut cx.to_async())
+            .await
+            .unwrap();
+        let ImportOutcome::Imported(txn) = outcome else {
+            panic!("{outcome:?}");
+        };
+        cx.update(|cx| {
+            f.review.rebuild(cx);
+            f.review.agent_edited(&f.buffer, "c1", txn, baseline, cx);
+        });
+        assert_eq!(statuses(&f), vec![HunkStatus::Pending, HunkStatus::Pending]);
+    }
+
     /// Autosave plus the watcher racing ahead: the user's saved transaction
     /// during the call sits under the watcher's reload of OMP's write. The
     /// import is the watcher's transaction; the user's line is STALE, and
@@ -1674,7 +1735,7 @@ mod tests {
     #[gpui::test]
     async fn a_user_transaction_under_the_watchers_reload_is_stale(cx: &mut TestAppContext) {
         let mut f = setup(cx).await;
-        cx.update(|cx| f.review.observe(&f.buffer, cx));
+        cx.update(|cx| f.review.observe(&f.buffer, "c1", cx));
         let mark = f.buffer.update(cx, |b, _| import::begin(b));
         let baseline = mark.start().clone();
         user_types(&f, 0..5, "by user", cx);

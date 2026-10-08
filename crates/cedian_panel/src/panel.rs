@@ -411,6 +411,7 @@ impl CedianPanel {
     fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let previous = self.link.take();
         self.dialogs.clear();
+        self.release_in_flight(cx);
         self.turn = Turn::Idle;
         self.notice = None;
         let Some(root) = self.workspace_root(cx) else {
@@ -482,20 +483,19 @@ impl CedianPanel {
             LinkEvent::Taken { session_id, reason } => {
                 if self.turn != Turn::Idle {
                     self.thread.withdraw_user();
-                    self.turn = Turn::Idle;
-                    self.review.end_turn();
+                    self.end_turn(None, cx);
                 }
                 self.connection = Connection::Taken { session_id, reason };
             }
             LinkEvent::PromptCancelled => {
                 self.thread.withdraw_user();
-                self.end_turn(None);
+                self.end_turn(None, cx);
             }
             LinkEvent::PromptStopped(e) => {
-                self.end_turn(Some(format!("turn stopped: {e}")));
+                self.end_turn(Some(format!("turn stopped: {e}")), cx);
             }
             LinkEvent::PromptFailed(e) => {
-                self.end_turn(Some(format!("OMP did not run the prompt: {e}")));
+                self.end_turn(Some(format!("OMP did not run the prompt: {e}")), cx);
             }
             LinkEvent::AbortFailed(e) => {
                 if self.turn != Turn::Idle {
@@ -536,10 +536,12 @@ impl CedianPanel {
         cx.notify();
     }
 
-    /// The prompt call ended without OMP settling: idle again, and a failed
-    /// turn keeps its reason over `notice`.
-    fn end_turn(&mut self, notice: Option<String>) {
+    /// The prompt call ended without OMP settling: idle again, a call whose
+    /// ToolEnd never came is released, and a failed turn keeps its reason
+    /// over `notice`.
+    fn end_turn(&mut self, notice: Option<String>, cx: &mut Context<Self>) {
         self.review.end_turn();
+        self.release_in_flight(cx);
         if let Turn::Failed(reason) = std::mem::replace(&mut self.turn, Turn::Idle) {
             self.notice = Some(format!("turn failed: {reason}"));
         } else if notice.is_some() {
@@ -547,12 +549,27 @@ impl CedianPanel {
         }
     }
 
+    /// Release every call still waiting for its ToolEnd: it is not coming.
+    fn release_in_flight(&mut self, cx: &mut Context<Self>) {
+        let ids: Vec<String> = self
+            .calls
+            .iter()
+            .filter(|(_, c)| c.ended.is_none())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            let call = self.calls.remove(&id).expect("listed above");
+            self.release(&id, call, cx);
+        }
+    }
+
     fn stop(&mut self, reason: String, cx: &mut Context<Self>) {
         self.link = None;
         self.dialogs.clear();
-        for call in std::mem::take(&mut self.calls).into_values() {
-            self.release(call, cx);
+        for (id, call) in std::mem::take(&mut self.calls) {
+            self.release(&id, call, cx);
         }
+        self.review.end_turn();
         self.turn = Turn::Idle;
         self.connection = Connection::Stopped(reason);
     }
@@ -862,7 +879,7 @@ impl CedianPanel {
         let marks = buffers
             .into_iter()
             .map(|b| {
-                self.review.observe(&b, cx);
+                self.review.observe(&b, &tool_call_id, cx);
                 let mark = b.update(cx, |b, _| import::begin(b));
                 (b, mark)
             })
@@ -922,7 +939,7 @@ impl CedianPanel {
         }
         let call = self.calls.remove(&tool_call_id).expect("checked above");
         if call.ended == Some(true) {
-            return self.release(call, cx);
+            return self.release(&tool_call_id, call, cx);
         }
         let project = self.project.clone();
         cx.spawn(async move |this, cx| {
@@ -982,13 +999,13 @@ impl CedianPanel {
                                     ),
                                 );
                             }
-                            this.review.import_done(&buffer, cx);
+                            this.review.import_done(&buffer, &tool_call_id, cx);
                         }
                         Err(e) => {
                             let path = buffer.read(cx).file().map(|f| f.full_path(cx));
                             this.review
                                 .could_not_review(path.unwrap_or_default(), e.to_string());
-                            this.review.import_done(&buffer, cx);
+                            this.review.import_done(&buffer, &tool_call_id, cx);
                         }
                     }
                     this.watch_reviewed_buffers(cx);
@@ -1003,9 +1020,9 @@ impl CedianPanel {
     }
 
     /// A call that imports nothing: its marked buffers are the user's again.
-    fn release(&mut self, call: CallMarks, cx: &mut Context<Self>) {
+    fn release(&mut self, tool_call_id: &str, call: CallMarks, cx: &mut Context<Self>) {
         for (buffer, _) in call.marks {
-            self.review.import_done(&buffer, cx);
+            self.review.import_done(&buffer, tool_call_id, cx);
         }
         self.after_review_change(cx);
     }
@@ -2234,6 +2251,93 @@ mod tests {
             buffer.read_with(cx, |b, _| b.text()),
             "alpha\nB!ETA\ngamma\n"
         );
+    }
+
+    /// The session is taken while a call is in flight: its ToolEnd never
+    /// comes, so the call is released and the file is the person's again.
+    #[gpui::test]
+    async fn a_taken_session_releases_the_calls_in_flight(cx: &mut TestAppContext) {
+        let (f, buffer) = fixture(cx).await;
+        tool_start(&f, cx, "c1", &["notes.txt"]);
+        omp_writes(&f, "/ws/notes.txt", "alpha\nBETA\ngamma\n").await;
+        tool_end(&f, cx, "c1");
+        tool_start(&f, cx, "c2", &["notes.txt"]);
+        f.window
+            .update(cx, |panel, window, cx| {
+                panel.turn = Turn::Streaming;
+                let taken = LinkEvent::Taken {
+                    session_id: "s".into(),
+                    reason: "another driver".into(),
+                };
+                panel.on_link_event(taken, window, cx);
+                assert!(
+                    panel.review.files().iter().all(|f| !f.importing()),
+                    "no file is importing"
+                );
+            })
+            .unwrap();
+        buffer.update(cx, |b, cx| b.edit([(7..7, "!")], None, cx));
+        cx.run_until_parked();
+        assert_eq!(hunks(&f, cx)[0].1, HunkStatus::Stale);
+    }
+
+    /// Two calls write the same file at once and the short one ends first:
+    /// the file is still importing for the long one, so its write is not
+    /// a user edit when it lands.
+    #[gpui::test]
+    async fn overlapping_calls_keep_the_file_importing_until_the_last_ends(
+        cx: &mut TestAppContext,
+    ) {
+        let (f, _buffer) = fixture(cx).await;
+        tool_start(&f, cx, "c1", &["notes.txt"]);
+        omp_writes(&f, "/ws/notes.txt", "alpha\nBETA\ngamma\n").await;
+        tool_end(&f, cx, "c1");
+        tool_start(&f, cx, "c2", &["notes.txt"]);
+        tool_start(&f, cx, "c3", &["notes.txt"]);
+        tool_end(&f, cx, "c3");
+        omp_writes(&f, "/ws/notes.txt", "alpha\nBETA\nGAMMA\n").await;
+        tool_end(&f, cx, "c2");
+        assert_eq!(
+            hunks(&f, cx),
+            vec![
+                (
+                    "ws/notes.txt".to_string(),
+                    HunkStatus::Pending,
+                    vec!["c1".to_string()]
+                ),
+                (
+                    "ws/notes.txt".to_string(),
+                    HunkStatus::Pending,
+                    vec!["c2".to_string()]
+                ),
+            ]
+        );
+    }
+
+    /// OMP's process exits mid-turn: the turn is over, so its revert is not
+    /// refused as still running.
+    #[gpui::test]
+    async fn a_disconnect_mid_turn_ends_the_reviews_turn(cx: &mut TestAppContext) {
+        let (f, buffer) = fixture(cx).await;
+        tool_start(&f, cx, "c1", &["notes.txt"]);
+        omp_writes(&f, "/ws/notes.txt", "alpha\nBETA\ngamma\n").await;
+        tool_end(&f, cx, "c1");
+        f.window
+            .update(cx, |panel, window, cx| {
+                panel.turn = Turn::Streaming;
+                panel.on_link_event(LinkEvent::Event(RouterEvent::Disconnected), window, cx);
+                assert!(!panel.review.turn_open(), "the turn ended with the process");
+                panel.revert_turn(1, cx);
+                assert_eq!(
+                    panel.notice().map(str::to_string).as_deref(),
+                    Some(
+                        "turn 1 reverted: 1 hunk(s) put back, 0 STALE kept, \
+                         0 changed again by a later turn, kept, 0 accepted, kept"
+                    )
+                );
+            })
+            .unwrap();
+        assert_eq!(buffer.read_with(cx, |b, _| b.text()), ORIGINAL);
     }
 
     #[gpui::test]

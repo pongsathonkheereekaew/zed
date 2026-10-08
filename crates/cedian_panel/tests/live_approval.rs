@@ -9,6 +9,11 @@
 //! dir, so the session stays out of the person's OMP store, and writes the
 //! redacted fixture.
 //!
+//! Two request/response pairs are synthetic, added after the recording
+//! when the link began sending them: `set_host_tools` (`req_tools_1`) and
+//! `set_subagent_subscription` (`req_sub_1`). Their responses follow OMP's
+//! documented shapes; a re-record replaces them.
+//!
 //! Harness off: invoked with `--mode` (or `config`) this binary is fake-omp.
 
 #![allow(

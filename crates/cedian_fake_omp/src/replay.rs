@@ -4,7 +4,7 @@
 //! (`in`) frame, replay blocks for the host's next line and checks its `type`
 //! matches, and a dialog answer (and a prompt's text and recorded images,
 //! a steer's, follow-up's or subagent command's id and text, a host URI
-//! read's content, and a host tool refusal's reason) matches; the host's fresh request id
+//! read's content, and an opted-in host tool refusal's reason) matches; the host's fresh request id
 //! is mapped onto the recorded one so the recorded `response` frames
 //! correlate.
 //! Any divergence exits with [`crate::EXIT_DIVERGED`] — the host sees a
@@ -149,10 +149,11 @@ pub(crate) fn run(fixture: &Path, cwd: &Path, placeholders: &Placeholders) -> i3
                         return crate::EXIT_DIVERGED;
                     }
                 }
-                // A host tool call succeeds or fails as recorded, and a
-                // refusal is refused for the same reason: its first line. The
-                // rest can vary with the run's settings and version tokens.
-                if got_type == Some("host_tool_result")
+                // A host tool call succeeds or fails as recorded. A record
+                // that opts in is refused for the same reason (its first
+                // line); others keep what OMP echoed when it was recorded.
+                if record.check_reason
+                    && got_type == Some("host_tool_result")
                     && expected.get("isError") == Some(&json!(true))
                     && first_lines(&got) != first_lines(&expected)
                 {

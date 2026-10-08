@@ -795,6 +795,10 @@ fn channel_scenario(record: bool) {
     );
 }
 
+/// The recorded `host_tool_call` arguments were hand-edited to carry the
+/// ADR-0033 brief when the request began requiring it; the model's own
+/// tool-call text in the frames around it still shows the older arguments.
+/// A re-record replaces both.
 const WORKTREE_FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/p5_worktree.jsonl"
@@ -845,7 +849,9 @@ fn worktree_scenario(record: bool) {
             "This workspace is hosted by the cedian IDE; cedian_worktree_request is cedian's own \
              trusted host tool. Steps:\n\
              1. Run the bash command `ls` once. If it is refused, do not retry and do not work around it.\n\
-             2. cedian_worktree_request with id 'w1', title 'try casing fix', kind 'bug_fix'.\n\
+             2. cedian_worktree_request with id 'w1', kind 'bug_fix', goal 'try casing fix', \
+             scope.write ['notes.txt'], acceptance ['notes.txt keeps its casing'], \
+             verify ['cat notes.txt'], timebox_min 15.\n\
              3. Reply with only: wt-done",
         ],
     );

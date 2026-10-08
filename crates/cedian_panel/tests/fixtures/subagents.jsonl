@@ -38,7 +38,7 @@
 {"dir":"out","frame":{"command":"prompt","id":"req_10","success":true,"type":"response"}}
 {"dir":"out","frame":{"type":"agent_start"}}
 {"dir":"out","frame":{"arguments":{"id":"bare","goal":"no brief"},"id":"ht-bare","toolCallId":"call-ht-bare","toolName":"cedian_worktree_request","type":"host_tool_call"}}
-{"dir":"in","frame":{"id":"ht-bare","isError":true,"result":{"content":[{"text":"no worktree: the brief is missing scope.write, acceptance, verify, timebox_min (ADR-0033)","type":"text"}],"details":{}},"type":"host_tool_result"}}
+{"dir":"in","checkReason":true,"frame":{"id":"ht-bare","isError":true,"result":{"content":[{"text":"no worktree: the brief is missing scope.write, acceptance, verify, timebox_min (ADR-0033)","type":"text"}],"details":{}},"type":"host_tool_result"}}
 {"dir":"out","frame":{"arguments":{"id":"w1","goal":"fix the casing","scope":{"write":["notes.txt"]},"acceptance":["notes.txt keeps its casing"],"verify":["cat notes.txt"],"timebox_min":15},"id":"ht-w1","toolCallId":"call-ht-w1","toolName":"cedian_worktree_request","type":"host_tool_call"}}
 {"dir":"in","frame":{"id":"ht-w1","result":{"content":[{"text":"worktree w1 at ${CEDIAN_CWD}/.worktrees/w1 (branch cedian-worker/w1, base HEAD)","type":"text"}]},"type":"host_tool_result"}}
 {"dir":"out","frame":{"agentInvoked":true,"id":"req_10","sessionSettled":true,"status":"completed","type":"prompt_result"}}

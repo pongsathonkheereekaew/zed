@@ -3,6 +3,8 @@
 //! `fs` = a workspace file OMP's own tool wrote (`{"type":"fs_write"|"fs_delete",
 //! "path": <cwd-relative>, "content"?}`), replayed onto disk at the same point
 //! so OMP-native edits replay too (row G).
+//! An `in` record may carry `"checkReason": true`: replay then also checks a
+//! host tool refusal's reason, not only that it was refused.
 //! Machine-specific paths are stored as placeholders so a fixture recorded in
 //! one temp dir replays in another, and no home path is committed.
 
@@ -25,6 +27,8 @@ pub enum Dir {
 pub struct Record {
     pub dir: Dir,
     pub frame: Value,
+    /// The host must refuse this host tool call for the recorded reason.
+    pub check_reason: bool,
 }
 
 impl Record {
@@ -38,7 +42,12 @@ impl Record {
             other => return Err(format!("bad fixture dir: {other:?}")),
         };
         let frame = v.get("frame").cloned().ok_or("fixture line has no frame")?;
-        Ok(Self { dir, frame })
+        let check_reason = v.get("checkReason") == Some(&Value::Bool(true));
+        Ok(Self {
+            dir,
+            frame,
+            check_reason,
+        })
     }
 
     /// Serialize as one fixture line (no trailing newline).
@@ -48,7 +57,11 @@ impl Record {
             Dir::Out => "out",
             Dir::Fs => "fs",
         };
-        json!({"dir": dir, "frame": self.frame}).to_string()
+        let mut line = json!({"dir": dir, "frame": self.frame});
+        if self.check_reason {
+            line["checkReason"] = json!(true);
+        }
+        line.to_string()
     }
 
     /// The frame's `type`, if any.
@@ -179,8 +192,15 @@ mod tests {
         let r = Record {
             dir: Dir::Out,
             frame: json!({"type": "ready"}),
+            check_reason: false,
         };
         assert_eq!(Record::parse(&r.to_line()).unwrap(), r);
+        let checked = Record {
+            dir: Dir::In,
+            frame: json!({"type": "host_tool_result"}),
+            check_reason: true,
+        };
+        assert_eq!(Record::parse(&checked.to_line()).unwrap(), checked);
         assert!(Record::parse(r#"{"dir":"sideways","frame":{}}"#).is_err());
     }
 

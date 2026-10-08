@@ -5,9 +5,15 @@
 //! and close more, and a browser connection that asked for
 //! `Target.setAutoAttach` gets a flat session on each. A page's navigations
 //! emit `Page.frameNavigated`, a console line and a network exchange.
-//! `Fake.personInput` stands in for the person clicking in the window, and
-//! `Fake.childNavigate` for a child frame navigating; any `Input.*` command
-//! fires the page's input listener too, as real CDP input does.
+//! `Fake.personInput {type?}` stands in for the person using the window
+//! (a `pointerdown` unless `type` says otherwise), `Fake.childNavigate` for
+//! a child frame navigating, and `Fake.pageScriptCalls {name, payload}` for
+//! a page's own script calling a binding by name, which reaches only a
+//! binding added without an `executionContextName`. An `Input.*` command
+//! fires the page's input listener with the events real CDP input makes
+//! (`keyDown` a keydown, `mousePressed` a pointerdown, `mouseWheel` a
+//! wheel, `touchStart` a pointerdown per touch point); one with
+//! `fakeNoReply` is never answered, as when Chromium hangs.
 //! `Fake.navigateMidCapture {times}` navigates the page during each of the
 //! next `times` screenshots. `Browser.close` exits, leaving `closed-by-cdp` in the profile;
 //! `CEDIAN_FAKE_BROWSER_DELAY_MS` delays opening the debugging port.
@@ -55,6 +61,8 @@ struct Browser {
     /// Browser sockets that asked for auto-attach or target discovery.
     auto_attach: Vec<mpsc::Sender<String>>,
     discover: Vec<mpsc::Sender<String>>,
+    /// `Runtime.addBinding` names and the world each is visible in.
+    bindings: Vec<(String, Option<String>)>,
     profile: std::path::PathBuf,
 }
 
@@ -261,8 +269,9 @@ fn websocket(
                 };
                 let result = match page {
                     Some(page) => answer_page(&request, &page, browser),
-                    None => answer_browser(&request, browser, &tx),
+                    None => Some(answer_browser(&request, browser, &tx)),
                 };
+                let Some(result) = result else { continue };
                 let mut reply = json!({"id": request["id"], "result": result});
                 if let Some(session) = session {
                     reply["sessionId"] = json!(session);
@@ -325,23 +334,48 @@ fn answer_browser(
     }
 }
 
-fn input_payload() -> String {
-    let now = std::time::SystemTime::now()
+fn now_ms() -> f64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs_f64()
-        * 1000.0;
-    json!({"type": "pointerdown", "time": now}).to_string()
+        * 1000.0
 }
 
-fn answer_page(request: &Value, target: &str, browser: &Arc<Mutex<Browser>>) -> Value {
+/// The listener's report of trusted `kind` input, to cedian's binding.
+fn report_input(browser: &mut Browser, target: &str, kind: &str) {
+    let Some((name, _)) = browser.bindings.last().cloned() else {
+        return;
+    };
+    browser.broadcast(
+        target,
+        "Runtime.bindingCalled",
+        json!({"name": name, "payload": json!({"type": kind, "time": now_ms()}).to_string()}),
+    );
+}
+
+/// The trusted input events a CDP `Input.*` command makes in the page.
+fn input_events(method: &str, params: &Value) -> Vec<&'static str> {
+    match (method, params["type"].as_str().unwrap_or_default()) {
+        ("Input.dispatchKeyEvent", "keyDown" | "rawKeyDown") => vec!["keydown"],
+        ("Input.dispatchMouseEvent", "mousePressed") => vec!["pointerdown"],
+        ("Input.dispatchMouseEvent", "mouseWheel") => vec!["wheel"],
+        ("Input.dispatchTouchEvent", "touchStart") => {
+            let points = params["touchPoints"].as_array().map_or(1, Vec::len);
+            vec!["pointerdown"; points]
+        }
+        _ => vec![],
+    }
+}
+
+fn answer_page(request: &Value, target: &str, browser: &Arc<Mutex<Browser>>) -> Option<Value> {
     let params = &request["params"];
     let mut browser = browser.lock();
     let Some(page) = browser.pages.get(target) else {
-        return json!({});
+        return Some(json!({}));
     };
     let (url_now, frame) = (page.url.clone(), page.frame.clone());
-    match request["method"].as_str().unwrap_or_default() {
+    Some(match request["method"].as_str().unwrap_or_default() {
         "Page.navigate" => {
             let url = params["url"].as_str().unwrap_or_default().to_string();
             if let Some(page) = browser.pages.get_mut(target) {
@@ -405,14 +439,44 @@ fn answer_page(request: &Value, target: &str, browser: &Arc<Mutex<Browser>>) -> 
             let html = format!("<html><body>{url_now}</body></html>");
             json!({"result": {"type": "object", "value": {"url": url_now, "title": "fake", "html": html}}})
         }
-        method if method == "Fake.personInput" || method.starts_with("Input.") => {
-            browser.broadcast(
-                target,
-                "Runtime.bindingCalled",
-                json!({"name": "cedianInput", "payload": input_payload()}),
-            );
+        "Runtime.addBinding" => {
+            let name = params["name"].as_str().unwrap_or_default().to_string();
+            let world = params["executionContextName"].as_str().map(str::to_string);
+            browser.bindings.push((name, world));
+            json!({})
+        }
+        "Page.createIsolatedWorld" => json!({"executionContextId": 7}),
+        "Fake.personInput" => {
+            let kind = params["type"].as_str().unwrap_or("pointerdown");
+            report_input(&mut browser, target, kind);
+            json!({})
+        }
+        "Fake.pageScriptCalls" => {
+            let name = params["name"].as_str().unwrap_or_default();
+            if browser
+                .bindings
+                .iter()
+                .any(|(n, world)| n == name && world.is_none())
+            {
+                let mut payload = params["payload"].clone();
+                payload["time"] = json!(now_ms());
+                browser.broadcast(
+                    target,
+                    "Runtime.bindingCalled",
+                    json!({"name": name, "payload": payload.to_string()}),
+                );
+            }
+            json!({})
+        }
+        method if method.starts_with("Input.") => {
+            if params["fakeNoReply"] == true {
+                return None;
+            }
+            for kind in input_events(method, params) {
+                report_input(&mut browser, target, kind);
+            }
             json!({})
         }
         _ => json!({}),
-    }
+    })
 }

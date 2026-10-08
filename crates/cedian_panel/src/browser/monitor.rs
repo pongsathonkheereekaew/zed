@@ -14,12 +14,31 @@ use std::time::Duration;
 const CALL: Duration = Duration::from_secs(10);
 const KEEP_LINES: usize = 200;
 const DOM_BYTES: usize = 64 * 1024;
-const INPUT_BINDING: &str = "cedianInput";
-/// Reports trusted (person- or CDP-made) input to cedian's binding.
-const INPUT_LISTENER: &str = "(() => { if (window.__cedianInput) return; window.__cedianInput = 1; \
-for (const t of ['pointerdown', 'keydown', 'wheel']) addEventListener(t, e => { \
-if (e.isTrusted && window.cedianInput) window.cedianInput(JSON.stringify({type: t, \
-time: performance.timeOrigin + e.timeStamp})); }, true); })()";
+/// The isolated world cedian's input listener and binding live in: the
+/// page's own scripts cannot see or call the binding.
+const INPUT_WORLD: &str = "cedian";
+
+/// A binding name for this launch, so not even a guess reaches it from
+/// another world.
+fn binding_name() -> String {
+    use rand::{Rng as _, SeedableRng as _};
+    format!(
+        "cedian{:016x}",
+        rand::rngs::StdRng::from_os_rng().random::<u64>()
+    )
+}
+
+/// Reports trusted (person- or CDP-made) input to `binding`, at the wall
+/// clock the endpoint also stamps OMP's input with: `e.timeStamp` is
+/// monotonic and drifts from it after a sleep or a clock step.
+fn input_listener(binding: &str) -> String {
+    format!(
+        "(() => {{ if (window.__cedianInput) return; window.__cedianInput = 1; \
+for (const t of ['pointerdown', 'keydown', 'wheel']) addEventListener(t, e => {{ \
+if (e.isTrusted && window['{binding}']) window['{binding}'](JSON.stringify({{type: t, \
+time: Date.now()}})); }}, true); }})()"
+    )
+}
 
 const KEEP_REQUESTS: usize = 500;
 /// How long to wait for the first page after the debugging port opens.
@@ -47,6 +66,7 @@ struct Tab {
 struct Tabs {
     by_session: Vec<(String, Tab)>,
     active: Option<String>,
+    binding: String,
 }
 
 impl Tabs {
@@ -67,7 +87,10 @@ pub(super) fn watch(port: u16, shared: Arc<Shared>) -> Result<CaptureRequests, S
         json!({"autoAttach": true, "flatten": true, "waitForDebuggerOnStart": false}),
         CALL,
     )?;
-    let mut tabs = Tabs::default();
+    let mut tabs = Tabs {
+        binding: binding_name(),
+        ..Tabs::default()
+    };
     let deadline = std::time::Instant::now() + FIRST_PAGE;
     while tabs.active.is_none() && std::time::Instant::now() < deadline {
         client.poll()?;
@@ -133,29 +156,45 @@ fn run(
     }
 }
 
-/// Start following the page on `session`. `None` when it went away first.
-fn follow(client: &mut CdpClient, session: &str) -> Option<Tab> {
-    for (method, params) in [
-        ("Page.enable", json!({})),
-        ("Runtime.enable", json!({})),
-        ("Network.enable", json!({})),
-        ("Runtime.addBinding", json!({"name": INPUT_BINDING})),
-        (
-            "Page.addScriptToEvaluateOnNewDocument",
-            json!({"source": INPUT_LISTENER}),
-        ),
-        ("Runtime.evaluate", json!({"expression": INPUT_LISTENER})),
-    ] {
-        client.call_in(Some(session), method, params, CALL).ok()?;
+/// Start following the page on `session`. A setup call that fails is
+/// logged, not fatal: the page is still followed, so its navigations count.
+fn follow(client: &mut CdpClient, session: &str, binding: &str) -> Tab {
+    let listener = input_listener(binding);
+    let mut call = |method: &str, params: Value| {
+        client
+            .call_in(Some(session), method, params, CALL)
+            .inspect_err(|e| log::debug!("browser: {method} on {session}: {e}"))
+            .ok()
+    };
+    call("Page.enable", json!({}));
+    call("Runtime.enable", json!({}));
+    call("Network.enable", json!({}));
+    call(
+        "Runtime.addBinding",
+        json!({"name": binding, "executionContextName": INPUT_WORLD}),
+    );
+    call(
+        "Page.addScriptToEvaluateOnNewDocument",
+        json!({"source": listener, "worldName": INPUT_WORLD}),
+    );
+    let tree = call("Page.getFrameTree", json!({})).unwrap_or_default();
+    let frame_id = text(&tree, "/frameTree/frame/id");
+    if !frame_id.is_empty()
+        && let Some(world) = call(
+            "Page.createIsolatedWorld",
+            json!({"frameId": frame_id, "worldName": INPUT_WORLD}),
+        )
+    {
+        call(
+            "Runtime.evaluate",
+            json!({"expression": listener, "contextId": world["executionContextId"]}),
+        );
     }
-    let tree = client
-        .call_in(Some(session), "Page.getFrameTree", json!({}), CALL)
-        .ok()?;
-    Some(Tab {
-        frame_id: text(&tree, "/frameTree/frame/id"),
+    Tab {
+        frame_id,
         url: text(&tree, "/frameTree/frame/url"),
         ..Tab::default()
-    })
+    }
 }
 
 /// Apply notifications, following pages as they attach; attaching may
@@ -173,10 +212,9 @@ fn handle(
                     if text(&notification.params, "/targetInfo/type") == "page" =>
                 {
                     let session = text(&notification.params, "/sessionId");
-                    if let Some(tab) = follow(client, &session) {
-                        tabs.by_session.push((session.clone(), tab));
-                        tabs.active.get_or_insert(session);
-                    }
+                    let tab = follow(client, &session, &tabs.binding);
+                    tabs.by_session.push((session.clone(), tab));
+                    tabs.active.get_or_insert(session);
                 }
                 "Target.detachedFromTarget" => {
                     let session = text(&notification.params, "/sessionId");
@@ -301,6 +339,7 @@ fn apply(shared: &Shared, tabs: &mut Tabs, notification: Notification) {
         session,
     } = notification;
     let Some(session) = session else { return };
+    let binding = tabs.binding.clone();
     let Some(tab) = tabs.get(&session) else {
         return;
     };
@@ -373,12 +412,14 @@ fn apply(shared: &Shared, tabs: &mut Tabs, notification: Notification) {
                 format!("failed ({}) {request}", text(&params, "/errorText")),
             );
         }
-        "Runtime.bindingCalled" if text(&params, "/name") == INPUT_BINDING => {
-            let at = serde_json::from_str::<Value>(&text(&params, "/payload"))
-                .ok()
-                .and_then(|p| p.get("time")?.as_f64());
+        "Runtime.bindingCalled" if text(&params, "/name") == binding => {
+            let payload =
+                serde_json::from_str::<Value>(&text(&params, "/payload")).unwrap_or_default();
             tabs.active = Some(session);
-            shared.person_input(at);
+            shared.person_input(
+                &text(&payload, "/type"),
+                payload.get("time").and_then(Value::as_f64),
+            );
         }
         _ => {}
     }

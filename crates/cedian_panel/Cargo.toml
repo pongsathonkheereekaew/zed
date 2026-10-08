@@ -40,6 +40,7 @@ log.workspace = true
 omp-rpc = { path = "../../vendor/omp-rpc" }
 parking_lot.workspace = true
 project.workspace = true
+rand.workspace = true
 serde_json.workspace = true
 text.workspace = true
 tungstenite = "0.26"

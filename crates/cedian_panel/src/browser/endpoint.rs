@@ -156,23 +156,34 @@ fn websocket(stream: TcpStream, shared: &Arc<Shared>) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
     let connection = NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed);
+    let result = forward(&mut client, &mut upstream, connection, shared);
+    shared.connection_ended(connection);
+    result
+}
+
+fn forward(
+    client: &mut WebSocket<TcpStream>,
+    upstream: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    connection: u64,
+    shared: &Shared,
+) -> Result<(), String> {
     while !shared.closed() {
         if !shared.held() {
-            if let Some(message) = read(&mut client)? {
+            if let Some(message) = read(client)? {
                 if let Message::Text(text) = &message
                     && let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
                     && let Some(method) = value.get("method").and_then(|m| m.as_str())
                     && method.starts_with("Input.")
                     && let Some(id) = value.get("id").and_then(|id| id.as_u64())
                 {
-                    shared.agent_input_sent(connection, id);
+                    shared.agent_input_sent(connection, id, method, &value["params"]);
                 }
                 upstream.send(message).map_err(|e| e.to_string())?;
             }
         } else {
             std::thread::sleep(SLICE);
         }
-        if let Some(message) = read(&mut upstream)? {
+        if let Some(message) = read(upstream)? {
             if let Message::Text(text) = &message
                 && shared.has_agent_input_in_flight(connection)
                 && let Ok(value) = serde_json::from_str::<serde_json::Value>(text)

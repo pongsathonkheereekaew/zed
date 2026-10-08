@@ -31,17 +31,45 @@ pub use chromium::executable;
 /// Slack around an agent `Input.*` command's send and reply when matching a
 /// trusted input event's time to it.
 const INPUT_SLACK_MS: f64 = 10.0;
-/// How long an answered agent input is kept for matching late reports.
-const INPUT_KEEP_MS: f64 = 5000.0;
+/// An agent input Chromium has not answered by now never will be: OMP's
+/// socket or Chromium hung, and it must not cover the person's input.
+const INPUT_UNANSWERED_MS: f64 = 30_000.0;
+/// How long after it was sent an agent input is kept, so a late report of
+/// the events it made still matches it.
+const INPUT_KEEP_MS: f64 = 60_000.0;
 
 /// One `Input.*` command OMP sent through the endpoint: its connection and
-/// id, sent and answered in wall-clock milliseconds.
+/// id, sent and answered in wall-clock milliseconds, and the trusted events
+/// it makes in the page that no report has claimed yet.
 #[derive(Debug, Clone)]
 struct AgentInput {
     connection: u64,
     id: u64,
     sent: f64,
     answered: Option<f64>,
+    events: Vec<&'static str>,
+}
+
+/// The trusted events (as the page listener names them) that a CDP
+/// `Input.*` command makes in the page.
+fn input_events(method: &str, params: &serde_json::Value) -> Vec<&'static str> {
+    let kind = params
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    match (method, kind) {
+        ("Input.dispatchKeyEvent", "keyDown" | "rawKeyDown") => vec!["keydown"],
+        ("Input.dispatchMouseEvent", "mousePressed") => vec!["pointerdown"],
+        ("Input.dispatchMouseEvent", "mouseWheel") => vec!["wheel"],
+        ("Input.dispatchTouchEvent", "touchStart") => {
+            let points = params
+                .get("touchPoints")
+                .and_then(serde_json::Value::as_array)
+                .map_or(1, Vec::len);
+            vec!["pointerdown"; points]
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn now_ms() -> f64 {
@@ -272,17 +300,20 @@ impl Shared {
     }
 
     /// OMP sent `Input.*` command `id` on `connection`.
-    fn agent_input_sent(&self, connection: u64, id: u64) {
+    fn agent_input_sent(&self, connection: u64, id: u64, method: &str, params: &serde_json::Value) {
+        let events = input_events(method, params);
+        if events.is_empty() {
+            return;
+        }
         let now = now_ms();
         let mut state = self.state.lock();
-        state
-            .agent_inputs
-            .retain(|i| i.answered.is_none_or(|at| now - at < INPUT_KEEP_MS));
+        state.agent_inputs.retain(|i| now - i.sent < INPUT_KEEP_MS);
         state.agent_inputs.push(AgentInput {
             connection,
             id,
             sent: now,
             answered: None,
+            events,
         });
     }
 
@@ -306,16 +337,28 @@ impl Shared {
             .any(|i| i.connection == connection && i.answered.is_none())
     }
 
-    /// A trusted input event in the page, made at wall-clock `at` ms. It is
-    /// the agent's when an agent `Input.*` command was in flight then;
-    /// otherwise it is the person's.
-    fn person_input(&self, at: Option<f64>) {
+    /// OMP's socket `connection` ended: its unanswered inputs never will be.
+    fn connection_ended(&self, connection: u64) {
+        self.state
+            .lock()
+            .agent_inputs
+            .retain(|i| i.connection != connection || i.answered.is_some());
+    }
+
+    /// A trusted `kind` event in the page, made at wall-clock `at` ms. It is
+    /// the agent's when an agent `Input.*` command that makes `kind` was in
+    /// flight then and has not had that event claimed; otherwise it is the
+    /// person's.
+    fn person_input(&self, kind: &str, at: Option<f64>) {
         let at = at.unwrap_or_else(now_ms);
         let mut state = self.state.lock();
-        let agents = state.agent_inputs.iter().any(|i| {
-            i.sent - INPUT_SLACK_MS <= at && at <= i.answered.unwrap_or(f64::MAX) + INPUT_SLACK_MS
+        let claimed = state.agent_inputs.iter_mut().find_map(|i| {
+            let until = i.answered.unwrap_or(i.sent + INPUT_UNANSWERED_MS);
+            let in_flight = i.sent - INPUT_SLACK_MS <= at && at <= until + INPUT_SLACK_MS;
+            let event = i.events.iter().position(|e| *e == kind)?;
+            in_flight.then(|| i.events.remove(event))
         });
-        if agents || !state.turn_active || state.preempted {
+        if claimed.is_some() || !state.turn_active || state.preempted {
             return;
         }
         state.preempted = true;

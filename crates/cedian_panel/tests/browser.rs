@@ -87,6 +87,15 @@ fn main() {
     run("the_person_preempts_continuous_agent_input", || {
         the_person_preempts_continuous_agent_input(&root)
     });
+    run("the_person_preempts_dense_agent_typing", || {
+        the_person_preempts_dense_agent_typing(&root)
+    });
+    run("a_page_cannot_forge_the_persons_input", || {
+        a_page_cannot_forge_the_persons_input(&root)
+    });
+    run("an_unanswered_agent_input_ends_with_its_socket", || {
+        an_unanswered_agent_input_ends_with_its_socket(&root)
+    });
     let exit_root = root.clone();
     run("u7_exit_through_the_panel", move || {
         gpui::run_test_once(
@@ -105,7 +114,16 @@ fn main() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Runs `test` unless a name filter (`cargo test --test browser -- NAME`)
+/// leaves it out.
 fn run(name: &str, test: impl FnOnce()) {
+    let filters: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|a| !a.starts_with('-'))
+        .collect();
+    if !filters.is_empty() && !filters.iter().any(|f| name.contains(f.as_str())) {
+        return;
+    }
     print!("test {name} ... ");
     test();
     println!("ok");
@@ -509,9 +527,18 @@ fn a_browser_left_by_a_crash_is_closed(root: &std::path::Path) {
 }
 
 fn send(socket: &mut tungstenite::WebSocket<impl Read + Write>, id: u64, method: &str) {
+    send_params(socket, id, method, json!({}));
+}
+
+fn send_params(
+    socket: &mut tungstenite::WebSocket<impl Read + Write>,
+    id: u64,
+    method: &str,
+    params: Value,
+) {
     socket
         .send(tungstenite::Message::Text(
-            json!({"id": id, "method": method, "params": {}})
+            json!({"id": id, "method": method, "params": params})
                 .to_string()
                 .into(),
         ))
@@ -561,7 +588,12 @@ fn the_persons_input_wins(root: &std::path::Path) {
     );
 
     host.set_turn(true);
-    send(&mut omp, 2, "Input.dispatchMouseEvent");
+    send_params(
+        &mut omp,
+        2,
+        "Input.dispatchMouseEvent",
+        json!({"type": "mousePressed"}),
+    );
     assert!(reply(&mut omp, 2, Duration::from_secs(5)).is_some());
     std::thread::sleep(pause);
     assert!(
@@ -617,7 +649,12 @@ fn the_person_preempts_continuous_agent_input(root: &std::path::Path) {
             let (mut omp, _) = tungstenite::connect(&page_ws).unwrap();
             let mut id = 100;
             while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-                send(&mut omp, id, "Input.dispatchKeyEvent");
+                send_params(
+                    &mut omp,
+                    id,
+                    "Input.dispatchKeyEvent",
+                    json!({"type": "keyDown"}),
+                );
                 reply(&mut omp, id, Duration::from_millis(200));
                 id += 1;
                 std::thread::sleep(Duration::from_millis(200));
@@ -639,6 +676,135 @@ fn the_person_preempts_continuous_agent_input(root: &std::path::Path) {
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
     host.set_turn(false);
     agent.join().unwrap();
+}
+
+/// The page socket OMP would use and a direct line standing in for the
+/// person's hand on the window, on a running browser in a turn.
+fn turn_with_person(
+    host: &BrowserHost,
+    profile: &Path,
+) -> (
+    String,
+    tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+) {
+    host.start().unwrap();
+    let list: Value = serde_json::from_str(&get(&host.url(), "/json/list").unwrap()).unwrap();
+    let page_ws = list[0]["webSocketDebuggerUrl"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let port = std::fs::read_to_string(profile.join("DevToolsActivePort")).unwrap();
+    let port = port.lines().next().unwrap().to_string();
+    let (person, _) =
+        tungstenite::connect(format!("ws://127.0.0.1:{port}/devtools/page/P1")).unwrap();
+    host.set_turn(true);
+    (page_ws, person)
+}
+
+fn the_person_preempts_dense_agent_typing(root: &std::path::Path) {
+    let profile = root.join("dense-profile");
+    let host = BrowserHost::open(profile.clone(), exe(), || {}).unwrap();
+    let (page_ws, mut person) = turn_with_person(&host, &profile);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let agent = std::thread::spawn({
+        let stop = stop.clone();
+        move || {
+            let (mut omp, _) = tungstenite::connect(&page_ws).unwrap();
+            let mut id = 100;
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                for kind in ["keyDown", "keyUp"] {
+                    send_params(
+                        &mut omp,
+                        id,
+                        "Input.dispatchKeyEvent",
+                        json!({"type": kind}),
+                    );
+                    if reply(&mut omp, id, Duration::from_millis(200)).is_none() {
+                        return;
+                    }
+                    id += 1;
+                }
+            }
+        }
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !host.state().preempted,
+        "the agent's own back-to-back keys are not the person's"
+    );
+    send(&mut person, 1, "Fake.personInput");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !host.state().preempted {
+        assert!(
+            Instant::now() < deadline,
+            "the person's click during dense typing was taken as the agent's"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    host.resume();
+    send_params(
+        &mut person,
+        2,
+        "Fake.personInput",
+        json!({"type": "keydown"}),
+    );
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !host.state().preempted {
+        assert!(
+            Instant::now() < deadline,
+            "the person's key during dense typing was taken as the agent's: one \
+             dispatchKeyEvent claims one keydown"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    host.set_turn(false);
+    agent.join().unwrap();
+}
+
+fn a_page_cannot_forge_the_persons_input(root: &std::path::Path) {
+    let profile = root.join("forge-profile");
+    let host = BrowserHost::open(profile.clone(), exe(), || {}).unwrap();
+    let (_, mut page) = turn_with_person(&host, &profile);
+    for name in ["cedianInput", "__cedianInput"] {
+        send_params(
+            &mut page,
+            1,
+            "Fake.pageScriptCalls",
+            json!({"name": name, "payload": {"type": "pointerdown"}}),
+        );
+        assert!(reply(&mut page, 1, Duration::from_secs(5)).is_some());
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !host.state().preempted,
+        "a page script calling a guessable binding preempted the agent"
+    );
+    send(&mut page, 2, "Fake.personInput");
+    wait_until("the person's real input still preempts", || {
+        host.state().preempted
+    });
+}
+
+fn an_unanswered_agent_input_ends_with_its_socket(root: &std::path::Path) {
+    let profile = root.join("unanswered-profile");
+    let host = BrowserHost::open(profile.clone(), exe(), || {}).unwrap();
+    let (page_ws, mut person) = turn_with_person(&host, &profile);
+    let (mut omp, _) = tungstenite::connect(&page_ws).unwrap();
+    send_params(
+        &mut omp,
+        7,
+        "Input.dispatchMouseEvent",
+        json!({"type": "mousePressed", "fakeNoReply": true}),
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    drop(omp);
+    std::thread::sleep(Duration::from_millis(300));
+    send(&mut person, 1, "Fake.personInput");
+    wait_until(
+        "the person preempts once the dead socket's input is gone",
+        || host.state().preempted,
+    );
 }
 
 const LAUNCH: &str = concat!(

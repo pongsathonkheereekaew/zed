@@ -2880,6 +2880,7 @@ dependencies = [
  "omp-rpc",
  "parking_lot",
  "project",
+ "rand 0.9.4",
  "serde_json",
  "settings",
  "text",

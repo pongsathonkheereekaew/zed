@@ -158,6 +158,10 @@ pub struct SpawnPolicy {
     /// Run under `sandbox-exec -f` the layout's profile, with the overlay
     /// beside it and the child's temp and state roots inside its run dir.
     pub sandbox: Option<crate::sandbox::ReviewerLayout>,
+    /// The app's browser endpoint (ADR-0049): OMP attaches there instead of
+    /// launching its own browser or relaying the person's Chrome, under every
+    /// approvals source. Must be `http://127.0.0.1:<port>`.
+    pub browser_cdp_url: Option<String>,
 }
 
 impl Default for SpawnPolicy {
@@ -170,6 +174,7 @@ impl Default for SpawnPolicy {
             config_allows: BTreeSet::new(),
             model: None,
             sandbox: None,
+            browser_cdp_url: None,
         }
     }
 }
@@ -252,7 +257,7 @@ impl SpawnPolicy {
             .collect::<Result<_, _>>()?;
         let approval = Value::Object(self.approval_record()?);
         let bash = json!({"patterns": patterns, "allowCompoundCommands": false});
-        Ok(match self.approvals {
+        let mut overlay = match self.approvals {
             Approvals::Cedian(_) | Approvals::Reviewer => {
                 let mut overlay = json!({
                     // Until ADR-0008's atomic landing (driver + Seatbelt + bypass test).
@@ -271,8 +276,25 @@ impl SpawnPolicy {
             }
             Approvals::Omp if patterns.is_empty() => json!({"tools": {"approval": approval}}),
             Approvals::Omp => json!({"tools": {"approval": approval}, "bash": bash}),
-        })
+        };
+        if let Some(url) = &self.browser_cdp_url {
+            check_browser_url(url)?;
+            overlay["browser"] = json!({"cdpUrl": url, "relay": false});
+        }
+        Ok(overlay)
     }
+}
+
+fn check_browser_url(url: &str) -> Result<(), OmpError> {
+    let loopback = url
+        .strip_prefix("http://127.0.0.1:")
+        .is_some_and(|port| port.parse::<u16>().is_ok_and(|p| p != 0));
+    if !loopback {
+        return Err(OmpError::InvalidSpawnProfile(format!(
+            "browser endpoint {url:?} is not http://127.0.0.1:<port>"
+        )));
+    }
+    Ok(())
 }
 
 fn check_tool_name(tool: &str) -> Result<(), OmpError> {
@@ -742,6 +764,41 @@ mod tests {
         policy.config_allows.insert("some_mcp_tool".to_string());
         let overlay = policy.overlay().unwrap();
         assert!(overlay["tools"]["approval"].get("some_mcp_tool").is_none());
+    }
+
+    #[test]
+    fn overlay_points_omp_at_the_apps_browser_under_every_policy() {
+        let url = "http://127.0.0.1:43123";
+        for approvals in [
+            Approvals::Cedian(ApprovalMode::Write),
+            Approvals::Omp,
+            Approvals::Reviewer,
+        ] {
+            let policy = SpawnPolicy {
+                approvals,
+                browser_cdp_url: Some(url.to_string()),
+                ..SpawnPolicy::default()
+            };
+            let overlay = policy.overlay().unwrap();
+            assert_eq!(
+                overlay["browser"],
+                json!({"cdpUrl": url, "relay": false}),
+                "{approvals:?}"
+            );
+        }
+        let none = SpawnPolicy::default().overlay().unwrap();
+        assert!(none.get("browser").is_none(), "no browser, no key");
+        for bad in [
+            "http://example.com:9222",
+            "ws://127.0.0.1:1",
+            "http://127.0.0.1:1/x y",
+        ] {
+            let policy = SpawnPolicy {
+                browser_cdp_url: Some(bad.to_string()),
+                ..SpawnPolicy::default()
+            };
+            assert!(policy.overlay().is_err(), "{bad} refused");
+        }
     }
 
     fn reviewer() -> SpawnPolicy {

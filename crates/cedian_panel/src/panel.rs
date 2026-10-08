@@ -455,6 +455,7 @@ impl CedianPanel {
         if self.browser.is_none() {
             self.open_browser_host(&spec.state_dir, cx);
         }
+        spec.policy.browser_cdp_url = self.browser.as_ref().map(|b| b.url());
         let (read_tx, read_rx) = mpsc::unbounded::<context::Read>();
         spec.uris.push(context::scheme(read_tx));
         let this = cx.entity().downgrade();

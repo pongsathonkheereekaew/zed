@@ -474,7 +474,7 @@ impl CedianPanel {
                     policy_note,
                 };
             }
-            LinkEvent::Failed(reason) => self.stop(reason),
+            LinkEvent::Failed(reason) => self.stop(reason, cx),
             LinkEvent::Taken { session_id, reason } => {
                 if self.turn != Turn::Idle {
                     self.thread.withdraw_user();
@@ -517,7 +517,7 @@ impl CedianPanel {
             }
             LinkEvent::Event(RouterEvent::Disconnected) => {
                 self.thread.apply(&RouterEvent::Disconnected);
-                self.stop("OMP stopped: its process exited".to_string());
+                self.stop("OMP stopped: its process exited".to_string(), cx);
             }
             LinkEvent::Event(RouterEvent::Unknown { frame_type })
                 if frame_type == "config_update" =>
@@ -541,10 +541,12 @@ impl CedianPanel {
         }
     }
 
-    fn stop(&mut self, reason: String) {
+    fn stop(&mut self, reason: String, cx: &mut Context<Self>) {
         self.link = None;
         self.dialogs.clear();
-        self.calls.clear();
+        for call in std::mem::take(&mut self.calls).into_values() {
+            self.release(call, cx);
+        }
         self.turn = Turn::Idle;
         self.connection = Connection::Stopped(reason);
     }
@@ -914,7 +916,7 @@ impl CedianPanel {
         }
         let call = self.calls.remove(&tool_call_id).expect("checked above");
         if call.ended == Some(true) {
-            return;
+            return self.release(call, cx);
         }
         let project = self.project.clone();
         cx.spawn(async move |this, cx| {
@@ -951,11 +953,12 @@ impl CedianPanel {
                         Ok(ImportOutcome::Stale) => {
                             this.review.import_refused(&buffer, &tool_call_id, cx)
                         }
-                        Ok(ImportOutcome::Unchanged) => {}
+                        Ok(ImportOutcome::Unchanged) => this.review.import_done(&buffer, cx),
                         Err(e) => {
                             let path = buffer.read(cx).file().map(|f| f.full_path(cx));
                             this.review
                                 .could_not_review(path.unwrap_or_default(), e.to_string());
+                            this.review.import_done(&buffer, cx);
                         }
                     }
                     this.watch_reviewed_buffers(cx);
@@ -967,6 +970,14 @@ impl CedianPanel {
                 .ok();
         })
         .detach();
+    }
+
+    /// A call that imports nothing: its marked buffers are the user's again.
+    fn release(&mut self, call: CallMarks, cx: &mut Context<Self>) {
+        for (buffer, _) in call.marks {
+            self.review.import_done(&buffer, cx);
+        }
+        self.after_review_change(cx);
     }
 
     fn render_review(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -1636,6 +1647,52 @@ mod tests {
             buffer.read_with(cx, |b, _| b.text()),
             "alpha\nBETA\ngamma\n"
         );
+    }
+
+    /// Two calls write the same open file in sequence. The panel rebuilds
+    /// the review on every buffer edit, so the second import lands in the
+    /// review before it is attributed; it is still the agent's, not a user
+    /// edit over the first hunk.
+    #[gpui::test]
+    async fn two_calls_to_one_file_are_both_pending(cx: &mut TestAppContext) {
+        for watcher_first in [false, true] {
+            let (f, buffer) = fixture(cx).await;
+            tool_start(&f, cx, "c1", &["notes.txt"]);
+            omp_writes(&f, "/ws/notes.txt", "alpha\nBETA\ngamma\n").await;
+            tool_end(&f, cx, "c1");
+            tool_start(&f, cx, "c2", &["notes.txt"]);
+            omp_writes(&f, "/ws/notes.txt", "alpha\nBETA\nGAMMA\n").await;
+            if watcher_first {
+                cx.run_until_parked();
+                assert_eq!(
+                    buffer.read_with(cx, |b, _| b.text()),
+                    "alpha\nBETA\nGAMMA\n",
+                    "the watcher reloaded before the tool ended"
+                );
+            }
+            tool_end(&f, cx, "c2");
+            assert_eq!(
+                hunks(&f, cx),
+                vec![
+                    (
+                        "ws/notes.txt".to_string(),
+                        HunkStatus::Pending,
+                        vec!["c1".to_string()]
+                    ),
+                    (
+                        "ws/notes.txt".to_string(),
+                        HunkStatus::Pending,
+                        vec!["c2".to_string()]
+                    ),
+                ],
+                "watcher first: {watcher_first}"
+            );
+            let events = f
+                .window
+                .update(cx, |panel, _, _| panel.review.drain_events())
+                .unwrap();
+            assert!(events.is_empty(), "no user edit was reported: {events:?}");
+        }
     }
 
     #[gpui::test]

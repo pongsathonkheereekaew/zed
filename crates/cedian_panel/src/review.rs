@@ -190,6 +190,10 @@ pub struct FileReview {
     /// folded into `user_edits`.
     last_seen: clock::Global,
     user_edits: Vec<Range<Anchor>>,
+    /// A tool call is writing this file (between [`TaskReview::observe`]
+    /// and its outcome): edits landing now are the import, or are judged
+    /// by it, so a display rebuild classifies none of them.
+    importing: bool,
     /// Set when OMP wrote the disk while the buffer had unsaved edits, so
     /// nothing was imported (decision 5).
     stale_import: Option<String>,
@@ -219,6 +223,7 @@ impl FileReview {
             baseline,
             agent_txns: Vec::new(),
             user_edits: Vec::new(),
+            importing: false,
             stale_import: None,
             resolved: HashMap::default(),
             rejected: collections::HashSet::default(),
@@ -605,10 +610,23 @@ impl TaskReview {
     }
 
     /// Account for the user's edits to a tracked buffer up to now. Called
-    /// before any agent write can land (the tool's start).
+    /// before any agent write can land (the tool's start); until the call's
+    /// outcome ([`Self::agent_edited`], [`Self::import_refused`] or
+    /// [`Self::import_done`]) a rebuild classifies no edit to the buffer.
     pub fn observe(&mut self, buffer: &Entity<Buffer>, cx: &App) {
         if let Some(i) = self.file_index(buffer) {
             self.files[i].fold_user_edits(buffer.read(cx));
+            self.files[i].importing = true;
+        }
+    }
+
+    /// The tool call that [`Self::observe`]d this buffer imported nothing
+    /// (or failed): whatever changed since is the user's.
+    pub fn import_done(&mut self, buffer: &Entity<Buffer>, cx: &App) {
+        if let Some(i) = self.file_index(buffer) {
+            self.files[i].importing = false;
+            self.files[i].fold_user_edits(buffer.read(cx));
+            self.rebuild(cx);
         }
     }
 
@@ -651,6 +669,7 @@ impl TaskReview {
         if started_later {
             file.fold_user_edits(buffer);
         }
+        file.importing = false;
         if !file.turn_starts.iter().any(|(t, _)| *t == turn) {
             file.turn_starts.push((turn, baseline));
         }
@@ -680,14 +699,19 @@ impl TaskReview {
                 self.files.len() - 1
             }
         };
-        self.files[i].stale_import = Some(reason);
+        let file = &mut self.files[i];
+        file.importing = false;
+        file.fold_user_edits(buffer.read(cx));
+        file.stale_import = Some(reason);
     }
 
     /// Recompute every file's hunks from its buffer.
     pub fn rebuild(&mut self, cx: &App) {
         for file in &mut self.files {
             let buffer = file.buffer.read(cx);
-            file.fold_user_edits(buffer);
+            if !file.importing {
+                file.fold_user_edits(buffer);
+            }
             let path = path_of(buffer, cx);
             let turn = file.agent_txns.last().map_or(0, |t| t.turn);
             for key in file.rebuild(buffer) {

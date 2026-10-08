@@ -174,11 +174,16 @@ pub struct CedianPanel {
     /// the panel.
     browser: Option<Arc<BrowserHost>>,
     _browser_events: Option<Task<()>>,
+    _browser_quit: Option<Subscription>,
     /// Evidence from the panel's browser captures, each bound to its frame.
     browser_evidence: Vec<Evidence>,
     /// Answers OMP's `cedian://` reads.
     _context: Option<Task<()>>,
 }
+
+/// How long a quitting app waits for Chromium to close itself (flushing its
+/// cookies) before killing it. The quit hook blocks the main thread.
+const BROWSER_QUIT_LIMIT: Duration = Duration::from_secs(2);
 
 impl CedianPanel {
     pub fn load(
@@ -227,6 +232,7 @@ impl CedianPanel {
             _events: None,
             browser: None,
             _browser_events: None,
+            _browser_quit: None,
             browser_evidence: Vec::new(),
             _context: None,
         };
@@ -503,7 +509,15 @@ impl CedianPanel {
                 let _ = tx.unbounded_send(());
             },
         ) {
-            Ok(host) => self.browser = Some(Arc::new(host)),
+            Ok(host) => {
+                self.browser = Some(Arc::new(host));
+                self._browser_quit = Some(cx.on_app_quit(|this: &mut Self, _| {
+                    if let Some(host) = &this.browser {
+                        host.close_now(BROWSER_QUIT_LIMIT);
+                    }
+                    async {}
+                }));
+            }
             Err(e) => {
                 self.notice = Some(e);
                 return;

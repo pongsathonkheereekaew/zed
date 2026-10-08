@@ -239,6 +239,21 @@ impl BrowserHost {
     }
 }
 
+impl BrowserHost {
+    /// Close Chromium before returning, waiting at most `limit` for it to
+    /// close itself before its group is killed: the app is quitting, and
+    /// nothing runs after the quit hook to finish an async close.
+    pub fn close_now(&self, limit: Duration) {
+        self.shared.closed.store(true, Ordering::SeqCst);
+        let running = self.shared.running.lock().take();
+        if let Some(mut running) = running {
+            running.chromium.close_now(limit);
+        }
+        self.shared.state.lock().running = false;
+        (self.shared.changed)();
+    }
+}
+
 impl Drop for BrowserHost {
     fn drop(&mut self) {
         self.shared.closed.store(true, Ordering::SeqCst);

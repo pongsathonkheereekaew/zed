@@ -83,6 +83,9 @@ fn main() {
     run("closing_the_captured_tab_stales_a_capture", || {
         closing_the_captured_tab_stales_a_capture(&root)
     });
+    run("closing_now_closes_the_browser_before_returning", || {
+        closing_now_closes_the_browser_before_returning(&root)
+    });
     run("drop_during_launch_returns_at_once", || {
         drop_during_launch_returns_at_once(&root)
     });
@@ -529,6 +532,21 @@ fn closing_the_captured_tab_stales_a_capture(root: &std::path::Path) {
     });
     let reason = stale_reason(&a, host.state().seq).expect("stale after the tab closed");
     assert!(reason.starts_with("stale-frame"), "{reason}");
+}
+
+fn closing_now_closes_the_browser_before_returning(root: &std::path::Path) {
+    let profile = root.join("quit-profile");
+    let host = BrowserHost::open(profile.clone(), exe(), || {}).unwrap();
+    host.start().unwrap();
+    let pid = std::fs::read_to_string(profile.join("fake.pid")).unwrap();
+    host.close_now(Duration::from_secs(2));
+    assert!(
+        profile.join("closed-by-cdp").exists(),
+        "closed over CDP, so cookies flush"
+    );
+    assert!(!alive(&pid), "the browser is gone when close_now returns");
+    assert!(!host.state().running);
+    assert!(host.start().is_err(), "a closed host does not relaunch");
 }
 
 fn list_ws(host: &BrowserHost, id: &str) -> String {
@@ -1020,6 +1038,21 @@ async fn exit(cx: &mut TestAppContext, root: &Path) {
         assert!(Instant::now() < deadline, "Open browser started nothing");
         cx.run_until_parked();
         std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let profile_of = |ws: &Path| {
+        cedian_shell::state::dir(ws)
+            .unwrap()
+            .join("browser-profile")
+    };
+    cx.quit();
+    for (ws, host) in [(&ws, &host), (&ws2, &host2)] {
+        assert!(
+            profile_of(ws).join("closed-by-cdp").exists(),
+            "quitting the app closes {} over CDP",
+            ws.display()
+        );
+        assert!(!host.state().running, "before the app exits");
     }
 }
 

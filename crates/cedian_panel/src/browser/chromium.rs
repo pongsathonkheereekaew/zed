@@ -64,6 +64,13 @@ impl Chromium {
             .as_mut()
             .is_none_or(|c| !matches!(c.try_wait(), Ok(None)))
     }
+
+    /// [`Drop`]'s close on this thread, bounded by `limit`.
+    pub fn close_now(&mut self, limit: Duration) {
+        if let Some(mut child) = self.child.take() {
+            close(self.port, &mut child, limit);
+        }
+    }
 }
 
 impl Drop for Chromium {
@@ -74,21 +81,28 @@ impl Drop for Chromium {
             return;
         };
         let port = self.port;
-        std::thread::spawn(move || {
-            browser_close(port);
-            let deadline = Instant::now() + CLOSE_LIMIT;
-            while Instant::now() < deadline {
-                if !matches!(child.try_wait(), Ok(None)) {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            kill(&mut child);
-        });
+        std::thread::spawn(move || close(port, &mut child, CLOSE_LIMIT));
     }
 }
 
+fn close(port: u16, child: &mut Child, limit: Duration) {
+    browser_close(port, limit.min(Duration::from_secs(2)));
+    let deadline = Instant::now() + limit;
+    while Instant::now() < deadline {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    kill(child);
+}
+
+/// Kills the child's process group, but only while the child is unreaped:
+/// once reaped, its pid (and so the group id) may belong to someone else.
 fn kill(child: &mut Child) {
+    if !matches!(child.try_wait(), Ok(None)) {
+        return;
+    }
     #[cfg(unix)]
     if let Ok(pid) = i32::try_from(child.id()) {
         // SAFETY: signals the process group the child leads (process_group(0)).
@@ -99,7 +113,7 @@ fn kill(child: &mut Child) {
 }
 
 /// Ask the Chromium on `port` to close itself.
-fn browser_close(port: u16) {
+fn browser_close(port: u16, limit: Duration) {
     let Some(url) = http_get(port, "/json/version").ok().and_then(|body| {
         let version: serde_json::Value = serde_json::from_str(&body).ok()?;
         Some(version.get("webSocketDebuggerUrl")?.as_str()?.to_string())
@@ -107,11 +121,7 @@ fn browser_close(port: u16) {
         return;
     };
     if let Ok(mut client) = super::cdp::CdpClient::connect(&url) {
-        let _ = client.call(
-            "Browser.close",
-            serde_json::json!({}),
-            Duration::from_secs(2),
-        );
+        let _ = client.call("Browser.close", serde_json::json!({}), limit);
     }
 }
 
@@ -128,7 +138,7 @@ fn close_leftover(port_file: &Path) {
     if http_get(port, "/json/version").is_err() {
         return;
     }
-    browser_close(port);
+    browser_close(port, Duration::from_secs(2));
     let deadline = Instant::now() + CLOSE_LIMIT;
     while Instant::now() < deadline && TcpStream::connect(("127.0.0.1", port)).is_ok() {
         std::thread::sleep(Duration::from_millis(50));

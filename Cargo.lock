@@ -2812,22 +2812,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "cedian_browser"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "serde",
- "serde_json",
- "tungstenite 0.26.2",
-]
-
-[[package]]
 name = "cedian_cli"
 version = "0.1.0"
 dependencies = [
  "cedian_agent",
  "cedian_agent_ui",
- "cedian_browser",
  "cedian_fake_omp",
  "cedian_omp",
  "cedian_review",

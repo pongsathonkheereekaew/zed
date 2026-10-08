@@ -91,7 +91,7 @@ Frames OMP sends besides the agent events above.
 | `notify` | toast | planned S9 |
 | `setStatus`, `setWidget`, `setTitle` | status line, panel widget, window title | planned S9 |
 | `set_editor_text` | composer text | planned S9 |
-| `open_url` | open in cedian browser or system browser | planned S9 |
+| `open_url` | open in the app's owned Chromium (ADR-0049); headless browser use is OMP's own | planned S9 |
 
 ## Tools (hand-reviewed on pin bump)
 

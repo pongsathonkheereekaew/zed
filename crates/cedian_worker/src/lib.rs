@@ -11,7 +11,7 @@
 //! blocking `git` subprocess calls); the GUI binding visualizes `Registry`
 //! and stays out of orchestration (§88: OMP is the only orchestrator).
 //!
-//! One-shot-per-invocation like `browser`: each CLI command shells out to
+//! One-shot per invocation: each CLI command shells out to
 //! `git worktree`, persists the updated [`Registry`], and exits — no daemon
 //! is ever held.
 #![allow(

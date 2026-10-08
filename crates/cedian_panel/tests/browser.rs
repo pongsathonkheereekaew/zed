@@ -74,6 +74,9 @@ fn main() {
         frames_are_bound_to_the_browser(&root)
     });
     run("every_tab_is_followed", || every_tab_is_followed(&root));
+    run("a_capture_binds_the_frame_it_shows", || {
+        a_capture_binds_the_frame_it_shows(&root)
+    });
     run("drop_during_launch_returns_at_once", || {
         drop_during_launch_returns_at_once(&root)
     });
@@ -407,6 +410,38 @@ fn every_tab_is_followed(root: &std::path::Path) {
         capture.url, "https://two.test/",
         "captures re-point to the open tab"
     );
+}
+
+fn a_capture_binds_the_frame_it_shows(root: &std::path::Path) {
+    let host = BrowserHost::open(root.join("moving-profile"), exe(), || {}).unwrap();
+    host.start().unwrap();
+    let list: Value = serde_json::from_str(&get(&host.url(), "/json/list").unwrap()).unwrap();
+    let (mut omp, _) =
+        tungstenite::connect(list[0]["webSocketDebuggerUrl"].as_str().unwrap()).unwrap();
+    call(&mut omp, "Fake.navigateMidCapture", json!({"times": 1}));
+    let retried = host.capture().unwrap();
+    assert_eq!(retried.url, "https://moved.test/0");
+    assert_eq!(
+        retried.seq,
+        host.state().seq,
+        "retried at the frame it shows"
+    );
+    let mut now = CurrentState::default();
+    now.frame_seq = Some(host.state().seq);
+    let fresh = retried
+        .evidence("retried", &[], Outcome::Pass)
+        .with_code_state(now.bind(&[]));
+    assert_eq!(fresh.stale_reason(&now), None);
+
+    call(&mut omp, "Fake.navigateMidCapture", json!({"times": 100}));
+    let moving = host.capture().unwrap();
+    now.frame_seq = Some(moving.seq);
+    let reason = moving
+        .evidence("moving", &[], Outcome::Pass)
+        .with_code_state(now.bind(&[]))
+        .stale_reason(&now)
+        .expect("a page that never holds still gives a capture born stale");
+    assert!(reason.starts_with("stale-frame"), "{reason}");
 }
 
 #[allow(clippy::disallowed_methods, reason = "a test probe")]

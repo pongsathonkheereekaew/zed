@@ -64,6 +64,9 @@ pub struct Capture {
     pub dom: String,
     pub console: Vec<String>,
     pub network: Vec<String>,
+    /// The page navigated while it was captured, on every try: the
+    /// screenshot may show an earlier frame than `seq`.
+    pub moved: bool,
 }
 
 impl Capture {
@@ -77,6 +80,12 @@ impl Capture {
             outcome,
         );
         evidence.frame_seq = Some(self.seq);
+        if self.moved {
+            evidence.born_stale = Some(format!(
+                "stale-frame: the page navigated while frame {} was captured",
+                self.seq
+            ));
+        }
         evidence
     }
 }

@@ -218,7 +218,35 @@ fn mirror(shared: &Shared, tabs: &Tabs) {
     }
 }
 
+/// How many times a capture is retried when the page navigates under it.
+const CAPTURE_TRIES: usize = 3;
+
+/// A capture whose screenshot and DOM come from one frame: the sequence is
+/// read before the screenshot and again after the DOM read, and a capture
+/// the page navigated under is retried, then marked born stale.
 fn capture(client: &mut CdpClient, shared: &Shared, tabs: &mut Tabs) -> Result<Capture, String> {
+    let mut tries = 0;
+    loop {
+        tries += 1;
+        let notifications = client.drain();
+        handle(client, shared, tabs, notifications);
+        let before = shared.state.lock().seq;
+        let mut capture = capture_once(client, shared, tabs)?;
+        if capture.seq == before {
+            return Ok(capture);
+        }
+        if tries >= CAPTURE_TRIES {
+            capture.moved = true;
+            return Ok(capture);
+        }
+    }
+}
+
+fn capture_once(
+    client: &mut CdpClient,
+    shared: &Shared,
+    tabs: &mut Tabs,
+) -> Result<Capture, String> {
     let session = tabs.active.clone().ok_or("the browser has no open page")?;
     let shot = client.call_in(
         Some(&session),
@@ -258,6 +286,7 @@ fn capture(client: &mut CdpClient, shared: &Shared, tabs: &mut Tabs) -> Result<C
         dom,
         console: state.console.clone(),
         network: state.network.clone(),
+        moved: false,
     })
 }
 

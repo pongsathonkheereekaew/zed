@@ -8,7 +8,8 @@
 //! `Fake.personInput` stands in for the person clicking in the window, and
 //! `Fake.childNavigate` for a child frame navigating; any `Input.*` command
 //! fires the page's input listener too, as real CDP input does.
-//! `Browser.close` exits, leaving `closed-by-cdp` in the profile;
+//! `Fake.navigateMidCapture {times}` navigates the page during each of the
+//! next `times` screenshots. `Browser.close` exits, leaving `closed-by-cdp` in the profile;
 //! `CEDIAN_FAKE_BROWSER_DELAY_MS` delays opening the debugging port.
 
 use base64::Engine as _;
@@ -32,6 +33,8 @@ pub const PNG: &[u8] = &[
 struct Page {
     url: String,
     frame: String,
+    /// Captures still to be interrupted by a navigation (`Fake.navigateMidCapture`).
+    navigate_mid_capture: u64,
 }
 
 /// Who an event goes to: a page socket, or a flat session on a browser
@@ -64,6 +67,7 @@ impl Browser {
             Page {
                 url: url.to_string(),
                 frame: format!("F{}", self.next_page),
+                navigate_mid_capture: 0,
             },
         );
         let info = json!({"targetId": id, "type": "page", "url": url});
@@ -376,7 +380,25 @@ fn answer_page(request: &Value, target: &str, browser: &Arc<Mutex<Browser>>) -> 
             json!({})
         }
         "Page.getFrameTree" => json!({"frameTree": {"frame": {"id": frame, "url": url_now}}}),
+        "Fake.navigateMidCapture" => {
+            if let Some(page) = browser.pages.get_mut(target) {
+                page.navigate_mid_capture = params["times"].as_u64().unwrap_or(1);
+            }
+            json!({})
+        }
         "Page.captureScreenshot" => {
+            if let Some(page) = browser.pages.get_mut(target)
+                && page.navigate_mid_capture > 0
+            {
+                page.navigate_mid_capture -= 1;
+                let url = format!("https://moved.test/{}", page.navigate_mid_capture);
+                page.url = url.clone();
+                browser.broadcast(
+                    target,
+                    "Page.frameNavigated",
+                    json!({"frame": {"id": frame, "url": url}}),
+                );
+            }
             json!({"data": base64::engine::general_purpose::STANDARD.encode(PNG)})
         }
         "Runtime.evaluate" => {

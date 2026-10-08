@@ -148,7 +148,6 @@ fn apply(
                     state.url = text(&params, "/frame/url");
                     state.console.clear();
                     state.network.clear();
-                    requests.clear();
                 }
                 "Runtime.consoleAPICalled" => {
                     let args: Vec<String> = params["args"]
@@ -186,8 +185,7 @@ fn apply(
                 }
                 "Network.responseReceived" => {
                     let request = requests
-                        .get(&text(&params, "/requestId"))
-                        .cloned()
+                        .remove(&text(&params, "/requestId"))
                         .unwrap_or_else(|| text(&params, "/response/url"));
                     let status = params
                         .pointer("/response/status")
@@ -197,8 +195,7 @@ fn apply(
                 }
                 "Network.loadingFailed" => {
                     let request = requests
-                        .get(&text(&params, "/requestId"))
-                        .cloned()
+                        .remove(&text(&params, "/requestId"))
                         .unwrap_or_default();
                     push(
                         &mut state.network,

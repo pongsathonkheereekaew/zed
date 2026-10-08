@@ -543,6 +543,7 @@ mod tests {
             },
             code_state: Some(ws().bind(&[])),
             born_stale: None,
+            frame_seq: None,
             measurement: None,
             feature: None,
         }
@@ -736,6 +737,7 @@ mod tests {
             },
             code_state: Some(ws().bind(&[])),
             born_stale: None,
+            frame_seq: None,
             measurement: None,
             feature: None,
         })

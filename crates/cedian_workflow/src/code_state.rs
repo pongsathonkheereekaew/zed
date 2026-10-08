@@ -26,6 +26,8 @@ pub enum CodeState {
 pub struct CurrentState {
     pub files: BTreeMap<String, u64>,
     pub tree: u64,
+    /// The shared browser's current frame sequence, when it runs.
+    pub frame_seq: Option<u64>,
 }
 
 /// FNV-1a 64: stable across processes and toolchains (unlike `DefaultHasher`).
@@ -54,6 +56,7 @@ impl CurrentState {
         Self {
             tree: content_hash(&flat),
             files,
+            frame_seq: None,
         }
     }
 

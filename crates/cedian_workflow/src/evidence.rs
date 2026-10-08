@@ -122,6 +122,10 @@ pub struct Evidence {
     /// The verification-profile feature this item proves (ADR-0025).
     #[serde(default)]
     pub feature: Option<crate::verification::FeatureRef>,
+    /// The browser frame sequence a capture was taken at (§29 R4); a later
+    /// navigation makes it `stale-frame`.
+    #[serde(default)]
+    pub frame_seq: Option<u64>,
 }
 
 impl Evidence {
@@ -149,6 +153,7 @@ impl Evidence {
             born_stale: None,
             measurement: None,
             feature: None,
+            frame_seq: None,
         }
     }
 
@@ -171,6 +176,7 @@ impl Evidence {
             born_stale: None,
             measurement: None,
             feature: None,
+            frame_seq: None,
         }
     }
 
@@ -188,6 +194,13 @@ impl Evidence {
     pub fn stale_reason(&self, current: &CurrentState) -> Option<String> {
         if let Some(reason) = &self.born_stale {
             return Some(reason.clone());
+        }
+        if let (Some(at), Some(now)) = (self.frame_seq, current.frame_seq) {
+            if at < now {
+                return Some(format!(
+                    "stale-frame: captured at frame {at}, the browser is at {now}"
+                ));
+            }
         }
         match &self.code_state {
             None => Some("no code state recorded".to_string()),
@@ -255,5 +268,28 @@ mod tests {
         assert_eq!(e.stale_reason(&ws), None);
         e.born_stale = Some("edited after the call".to_string());
         assert!(e.stale_reason(&ws).is_some());
+    }
+
+    #[test]
+    fn a_capture_from_an_earlier_frame_reads_stale_frame() {
+        let mut ws = CurrentState::from_files([("a.rs".to_string(), b"1".as_slice())]);
+        let mut e = Evidence::attributed(
+            "shot",
+            EvidenceKind::Screenshot,
+            &["g"],
+            "s",
+            Outcome::Pass,
+            "t",
+            "c",
+        )
+        .with_code_state(ws.bind(&["a.rs".to_string()]));
+        e.frame_seq = Some(3);
+        ws.frame_seq = Some(3);
+        assert_eq!(e.stale_reason(&ws), None, "same frame");
+        ws.frame_seq = Some(4);
+        let reason = e.stale_reason(&ws).unwrap();
+        assert!(reason.starts_with("stale-frame"), "{reason}");
+        ws.frame_seq = None;
+        assert_eq!(e.stale_reason(&ws), None, "no browser, no frame check");
     }
 }

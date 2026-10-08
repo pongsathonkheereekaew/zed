@@ -526,6 +526,96 @@ impl CedianPanel {
         .detach();
     }
 
+    /// Capture the shared page: screenshot, DOM, console and network.
+    pub fn capture_browser(&mut self, cx: &mut Context<Self>) {
+        let Some(host) = self.browser.clone() else {
+            return;
+        };
+        let task = cx.background_spawn(async move { host.capture() });
+        cx.spawn(async move |this, cx| {
+            if let Err(e) = task.await {
+                this.update(cx, |this, cx| {
+                    this.notice = Some(format!("browser capture failed: {e}"));
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// The shared browser: its latest capture, with the frame it was taken
+    /// at, and the console and network lines it carries.
+    fn render_browser(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let state = self.browser.as_ref()?.state();
+        if !state.running && state.latest.is_none() && state.error.is_none() {
+            return None;
+        }
+        const LINES: usize = 20;
+        let tail = |lines: &[String]| -> Vec<AnyElement> {
+            lines[lines.len().saturating_sub(LINES)..]
+                .iter()
+                .map(|l| {
+                    Label::new(l.clone())
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .into_any_element()
+                })
+                .collect()
+        };
+        let capture = state.latest.as_ref().map(|c| {
+            v_flex()
+                .debug_selector(|| "cedian-browser-capture".to_string())
+                .gap_1()
+                .child(
+                    gpui::img(Arc::new(gpui::Image::from_bytes(
+                        gpui::ImageFormat::Png,
+                        c.png.to_vec(),
+                    )))
+                    .w_full()
+                    .h(px(180.))
+                    .object_fit(gpui::ObjectFit::Contain),
+                )
+                .child(
+                    Label::new(format!("capture at frame {} · {}", c.seq, c.url))
+                        .size(LabelSize::Small),
+                )
+                .child(Label::new("Console").size(LabelSize::Small))
+                .children(tail(&c.console))
+                .child(Label::new("Network").size(LabelSize::Small))
+                .children(tail(&c.network))
+        });
+        Some(
+            v_flex()
+                .debug_selector(|| "cedian-browser".to_string())
+                .gap_1()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Label::new(if state.running {
+                                format!("Browser · frame {} · {}", state.seq, state.url)
+                            } else {
+                                "Browser closed".to_string()
+                            })
+                            .size(LabelSize::Small),
+                        )
+                        .when(state.running, |row| {
+                            row.child(
+                                Button::new("cedian-browser-capture", "Capture").on_click(
+                                    cx.listener(|this, _, _, cx| this.capture_browser(cx)),
+                                ),
+                            )
+                        }),
+                )
+                .when_some(state.error, |col, e| {
+                    col.child(Label::new(e).size(LabelSize::Small).color(Color::Error))
+                })
+                .children(capture)
+                .into_any_element(),
+        )
+    }
+
     /// The prompt as OMP gets it: the bounded snapshot of what the person
     /// sees (§39), then their text.
     fn with_context(&self, text: &str, cx: &App) -> String {
@@ -1426,6 +1516,7 @@ impl Render for CedianPanel {
             }
         );
         let review = self.show_review.then(|| self.render_review(cx));
+        let browser = self.render_browser(cx);
         v_flex()
             .key_context("CedianPanel")
             .track_focus(&self.focus_handle)
@@ -1492,6 +1583,7 @@ impl Render for CedianPanel {
                         .children(rows),
                 )
             })
+            .children(browser)
             .children(dialogs)
             .when_some(self.notice.clone(), |panel, notice| {
                 panel.child(

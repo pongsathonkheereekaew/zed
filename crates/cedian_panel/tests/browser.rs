@@ -5,10 +5,14 @@
 //! 1. The endpoint OMP is given starts the browser on its first connection,
 //!    points discovery back at itself and forwards CDP; dropping the host
 //!    closes the endpoint and the browser.
+//! 2. Captures carry a frame id and a sequence that run across the
+//!    browser's life: capture A, navigate, capture B; evidence on A reads
+//!    `stale-frame`, B passes a fresh gate.
 //!
 //! Harness off: launched with `--user-data-dir` this binary is the browser.
 
 use cedian_panel::browser::{BrowserHost, fake};
+use cedian_workflow::{CurrentState, Gate, GateKind, GatePredicate, GateStatus, Outcome};
 use serde_json::{Value, json};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -25,6 +29,9 @@ fn main() {
     std::fs::create_dir_all(&root).unwrap();
     run("first_connection_starts_the_browser", || {
         first_connection_starts_the_browser(&root)
+    });
+    run("frames_are_bound_to_the_browser", || {
+        frames_are_bound_to_the_browser(&root)
     });
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -138,4 +145,56 @@ fn first_connection_starts_the_browser(root: &std::path::Path) {
         "the endpoint is closed"
     );
     assert!(profile.exists(), "the profile outlives the browser");
+}
+
+fn frames_are_bound_to_the_browser(root: &std::path::Path) {
+    let host = BrowserHost::open(root.join("frames-profile"), exe(), || {}).unwrap();
+    let a = host.capture().unwrap();
+    assert_eq!(a.png.as_slice(), fake::PNG, "the screenshot");
+    assert_eq!(a.frame_id, "F1");
+    assert!(a.dom.contains("about:blank"), "the DOM: {}", a.dom);
+
+    let list: Value = serde_json::from_str(&get(&host.url(), "/json/list").unwrap()).unwrap();
+    let (mut omp, _) =
+        tungstenite::connect(list[0]["webSocketDebuggerUrl"].as_str().unwrap()).unwrap();
+    call(&mut omp, "Page.navigate", json!({"url": "https://b.test/"}));
+    wait_until("the navigation", || host.state().seq > a.seq);
+    let b = host.capture().unwrap();
+    assert_eq!(b.seq, a.seq + 1, "the sequence advances across captures");
+    assert_eq!(b.url, "https://b.test/");
+    assert_eq!(b.console, ["log: loaded https://b.test/"]);
+    assert_eq!(b.network, ["200 GET https://b.test/"]);
+    assert_eq!(
+        host.state().latest.map(|c| c.seq),
+        Some(b.seq),
+        "the panel shows the latest capture"
+    );
+
+    let mut now = CurrentState::from_files([("a.rs".to_string(), b"x".as_slice())]);
+    now.frame_seq = Some(host.state().seq);
+    let bind = |e: cedian_workflow::Evidence| e.with_code_state(now.bind(&["a.rs".to_string()]));
+    let on_a = bind(a.evidence("shot-a", &["looks"], Outcome::Pass));
+    let on_b = bind(b.evidence("shot-b", &["looks"], Outcome::Pass));
+    let reason = on_a.stale_reason(&now).unwrap();
+    assert!(reason.starts_with("stale-frame"), "{reason}");
+    let gate = Gate::register(
+        "looks",
+        GateKind::Visual,
+        false,
+        GatePredicate {
+            kinds: vec![],
+            min_items: 1,
+            require_ok: true,
+            fresh: true,
+            feature: None,
+        },
+        false,
+    )
+    .unwrap();
+    let only_a = gate.evaluate(std::slice::from_ref(&on_a), &now);
+    assert_ne!(only_a.status, GateStatus::Passed, "{}", only_a.reason);
+    assert!(only_a.reason.contains("1 stale"), "{}", only_a.reason);
+    let both = gate.evaluate(&[on_a, on_b], &now);
+    assert_eq!(both.status, GateStatus::Passed, "{}", both.reason);
+    assert_eq!(both.deciding, ["shot-b"]);
 }

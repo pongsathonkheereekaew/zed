@@ -16,6 +16,7 @@ mod endpoint;
 pub mod fake;
 mod monitor;
 
+use cedian_workflow::{Evidence, EvidenceKind, Outcome};
 use chromium::Chromium;
 use parking_lot::Mutex;
 use std::net::TcpListener;
@@ -44,6 +45,21 @@ pub struct Capture {
     pub dom: String,
     pub console: Vec<String>,
     pub network: Vec<String>,
+}
+
+impl Capture {
+    /// Evidence for `gates` from this capture, bound to its frame.
+    pub fn evidence(&self, id: &str, gates: &[&str], outcome: Outcome) -> Evidence {
+        let mut evidence = Evidence::unattributed(
+            id,
+            EvidenceKind::Screenshot,
+            gates,
+            format!("{} at frame {}", self.url, self.seq),
+            outcome,
+        );
+        evidence.frame_seq = Some(self.seq);
+        evidence
+    }
 }
 
 /// What the panel shows.

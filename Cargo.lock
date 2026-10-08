@@ -2876,6 +2876,7 @@ dependencies = [
  "cedian_panel",
  "cedian_review",
  "cedian_shell",
+ "cedian_workflow",
  "cedian_workspace",
  "clock",
  "collections",

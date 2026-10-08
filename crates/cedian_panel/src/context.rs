@@ -109,6 +109,10 @@ pub(crate) fn serve(
     })
 }
 
+/// How long a code-intelligence read waits for language servers to start,
+/// inside [`APP_TIMEOUT`].
+const SERVER_START_WAIT: Duration = Duration::from_secs(15);
+
 /// Answer one `cedian://` read from Zed.
 pub(crate) fn answer(
     url: &str,
@@ -271,13 +275,27 @@ pub(crate) fn lsp_read(
             p.register_buffer_with_language_servers(&buffer, cx)
         });
         let store = project.read_with(cx, |p, _| p.lsp_store());
-        let has_server = store.update(cx, |store, cx| {
-            buffer.update(cx, |buffer, cx| {
-                !store
-                    .language_servers_for_local_buffer(buffer, cx)
-                    .is_empty()
-            })
-        });
+        // Registering only starts the buffer's servers; wait for them, within
+        // the read bound, before deciding the file has none.
+        let started = std::time::Instant::now();
+        let has_server = loop {
+            let (running, starting) = store.update(cx, |store, cx| {
+                let ids = buffer.update(cx, |buffer, cx| {
+                    store.language_servers_for_local_buffer(buffer, cx)
+                });
+                let running = ids
+                    .iter()
+                    .filter(|id| store.language_server_for_id(**id).is_some())
+                    .count();
+                (running, ids.len() - running)
+            });
+            if starting == 0 || started.elapsed() >= SERVER_START_WAIT {
+                break running > 0;
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(50))
+                .await;
+        };
         if !has_server {
             return Err(format!("no language server for {file}"));
         }
@@ -585,6 +603,58 @@ mod tests {
             .unwrap();
         let server = servers.next().await.unwrap();
         (project, server, handle)
+    }
+
+    /// A file nobody has open gets its language server started by the read,
+    /// and the read waits for it instead of answering there is none.
+    #[gpui::test]
+    async fn lsp_reads_wait_for_a_starting_server(cx: &mut TestAppContext) {
+        init(cx);
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/ws", serde_json::json!({"src": {"main.rs": MAIN}}))
+            .await;
+        let project = Project::test(fs, [Path::new("/ws")], cx).await;
+        let languages = project.read_with(cx, |p, _| p.languages().clone());
+        languages.add(rust_lang());
+        let mut servers = languages.register_fake_lsp(
+            "Rust",
+            FakeLspAdapter {
+                capabilities: lsp::ServerCapabilities {
+                    document_symbol_provider: Some(lsp::OneOf::Left(true)),
+                    ..Default::default()
+                },
+                initializer: Some(Box::new(|server| {
+                    server.set_request_handler::<lsp::request::DocumentSymbolRequest, _, _>(
+                        |_, _| async move {
+                            #[allow(deprecated)]
+                            Ok(Some(lsp::DocumentSymbolResponse::Nested(vec![
+                                lsp::DocumentSymbol {
+                                    name: "helper".into(),
+                                    detail: None,
+                                    kind: lsp::SymbolKind::FUNCTION,
+                                    tags: None,
+                                    deprecated: None,
+                                    range: lsp::Range::new(
+                                        lsp::Position::new(0, 0),
+                                        lsp::Position::new(0, 14),
+                                    ),
+                                    selection_range: lsp::Range::new(
+                                        lsp::Position::new(0, 3),
+                                        lsp::Position::new(0, 9),
+                                    ),
+                                    children: None,
+                                },
+                            ])))
+                        },
+                    );
+                })),
+                ..Default::default()
+            },
+        );
+        let read = cx.update(|cx| answer("cedian://symbols/file/src/main.rs", None, &project, cx));
+        let _server = servers.next().await.unwrap();
+        let answer = read.await.unwrap();
+        assert!(answer.content.contains("helper"), "{}", answer.content);
     }
 
     const LIB: &str = "fn a() { /* éé */ helper(); }\n";

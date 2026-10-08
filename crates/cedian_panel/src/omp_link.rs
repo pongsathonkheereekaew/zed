@@ -290,6 +290,20 @@ impl Gate {
         }
     }
 
+    /// OMP accepted a steer or follow-up. Its `queue_update` lists it too,
+    /// but the event thread may not have read that yet when Stop comes.
+    fn accepted(&self, text: &str, steer: bool) {
+        let mut queue = self.queue.lock();
+        let list = if steer {
+            &mut queue.steering
+        } else {
+            &mut queue.follow_up
+        };
+        if !list.iter().any(|queued| queued == text) {
+            list.push(text.to_string());
+        }
+    }
+
     /// Abort the run. OMP's `abort` keeps queued user messages, and a kept
     /// steer starts a new run right after it, so each queued message is
     /// taken back first and handed to the composer.
@@ -525,6 +539,7 @@ impl OmpLink {
     /// Steer the running turn (`steer`) or queue a message after it
     /// (`follow_up`), off the UI thread; OMP's `queue_update` shows it.
     pub fn queue(&self, text: String, steer: bool) {
+        let gate = Arc::clone(&self.gate);
         let not_running = LinkEvent::QueueRefused("OMP is not running".to_string());
         self.off_thread(not_running, move |control| {
             let sent = if steer {
@@ -533,7 +548,10 @@ impl OmpLink {
                 control.follow_up(&text)
             };
             match sent {
-                Ok(()) => LinkEvent::Queued(text),
+                Ok(()) => {
+                    gate.accepted(&text, steer);
+                    LinkEvent::Queued(text)
+                }
                 Err(e) => LinkEvent::QueueRefused(e.to_string()),
             }
         });
@@ -1038,6 +1056,30 @@ mod tests {
         assert!(result.is_err(), "{result:?}");
         assert_eq!(sent.borrow().len(), 2, "every dialog got its cancel");
         assert!(gate.open.is_empty());
+    }
+
+    #[test]
+    fn stop_takes_back_a_steer_whose_queue_update_is_not_read_yet() {
+        let gate = Gate {
+            control: Mutex::default(),
+            turn: Mutex::default(),
+            state: Mutex::default(),
+            queue: Mutex::default(),
+            events: futures::channel::mpsc::unbounded().0,
+        };
+        gate.observe_run(&RouterEvent::Queue {
+            steering: Vec::new(),
+            follow_up: vec!["two".to_string()],
+        });
+        gate.accepted("faster", true);
+        gate.accepted("two", false);
+        let queue = gate.queue.lock().clone();
+        assert_eq!(
+            queue.steering,
+            ["faster"],
+            "OMP said yes to it: Stop takes it back"
+        );
+        assert_eq!(queue.follow_up, ["two"], "listed once");
     }
 
     #[test]

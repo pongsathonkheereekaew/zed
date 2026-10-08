@@ -920,6 +920,9 @@ impl CedianPanel {
         }
         let project = self.project.clone();
         cx.spawn(async move |this, cx| {
+            // Files the person opened and edited meanwhile: their buffer
+            // stays theirs, so a write to it imports nothing.
+            let mut held: Vec<(Entity<Buffer>, String)> = Vec::new();
             let mut marks = call.marks;
             for (path, before) in call.unopened {
                 let opened = project
@@ -928,7 +931,12 @@ impl CedianPanel {
                 match opened {
                     Ok(buffer) => {
                         let before = before.unwrap_or_default();
-                        let mark = buffer.update(cx, |b, cx| import::begin_from(b, &before, cx));
+                        let mark = buffer.update(cx, |b, cx| {
+                            import::begin_from(b, &before, cx).unwrap_or_else(|| {
+                                held.push((cx.entity(), before.clone()));
+                                import::begin(b)
+                            })
+                        });
                         marks.push((buffer, mark));
                     }
                     Err(e) => {
@@ -953,7 +961,23 @@ impl CedianPanel {
                         Ok(ImportOutcome::Stale) => {
                             this.review.import_refused(&buffer, &tool_call_id, cx)
                         }
-                        Ok(ImportOutcome::Unchanged) => this.review.import_done(&buffer, cx),
+                        Ok(ImportOutcome::Unchanged) => {
+                            let written = held
+                                .iter()
+                                .find(|(b, _)| *b == buffer)
+                                .is_some_and(|(_, before)| buffer.read(cx).text() != *before);
+                            if written {
+                                let path = buffer.read(cx).file().map(|f| f.full_path(cx));
+                                this.review.could_not_review(
+                                    path.unwrap_or_default(),
+                                    format!(
+                                        "it was open with your own edits when OMP wrote it \
+                                         (call {tool_call_id}); nothing was imported"
+                                    ),
+                                );
+                            }
+                            this.review.import_done(&buffer, cx);
+                        }
                         Err(e) => {
                             let path = buffer.read(cx).file().map(|f| f.full_path(cx));
                             this.review
@@ -1750,6 +1774,48 @@ mod tests {
             })
             .unwrap();
         assert_eq!((old.as_str(), new.as_str()), ("one\n", "ONE\n"));
+    }
+
+    /// The person opens the file and types between the tool's start and its
+    /// end: their buffer is kept as it is, dirty, and the file shows STALE
+    /// with the reason.
+    #[gpui::test]
+    async fn a_file_the_user_opened_and_typed_in_during_the_call_keeps_their_text(
+        cx: &mut TestAppContext,
+    ) {
+        let (f, _notes) = fixture(cx).await;
+        tool_start(&f, cx, "c1", &["other.txt"]);
+        cx.run_until_parked();
+        let other = f
+            .project
+            .update(cx, |p, cx| p.open_local_buffer("/ws/other.txt", cx))
+            .await
+            .unwrap();
+        other.update(cx, |b, cx| b.edit([(0..0, "USER ")], None, cx));
+        omp_writes(&f, "/ws/other.txt", "ONE\ntwo\n").await;
+        tool_end(&f, cx, "c1");
+        other.read_with(cx, |b, _| {
+            assert_eq!(b.text(), "USER one\ntwo\n", "the user's text is kept");
+            assert!(b.is_dirty(), "and still unsaved");
+        });
+        let (stale, unreviewable) = f
+            .window
+            .update(cx, |panel, _, _| {
+                (
+                    panel
+                        .review
+                        .files()
+                        .iter()
+                        .filter_map(|f| f.stale_import().map(str::to_string))
+                        .collect::<Vec<_>>(),
+                    panel.review.unreviewable().to_vec(),
+                )
+            })
+            .unwrap();
+        assert!(
+            stale.iter().any(|r| r.contains("c1")) || !unreviewable.is_empty(),
+            "the file shows STALE or unreviewed with a reason: {stale:?} {unreviewable:?}"
+        );
     }
 
     /// A write that creates a file: one all-added hunk; reject empties it.

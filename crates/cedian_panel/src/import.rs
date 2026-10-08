@@ -59,9 +59,19 @@ pub fn begin(buffer: &mut Buffer) -> Mark {
 /// text the tool started from. If the write already landed in what the
 /// buffer loaded, the buffer is set back to that text first, as saved
 /// state and outside the undo history, so the write imports as the one
-/// transaction on top of it.
-pub fn begin_from(buffer: &mut Buffer, text_at_start: &str, cx: &mut Context<Buffer>) -> Mark {
+/// transaction on top of it. `None` when the buffer is the person's: they
+/// opened it meanwhile and it holds their unsaved text or their undo
+/// history, which is never rewritten (ADR-0006); [`begin`] applies and
+/// [`finish`] reports `Stale` or `Unchanged`.
+pub fn begin_from(
+    buffer: &mut Buffer,
+    text_at_start: &str,
+    cx: &mut Context<Buffer>,
+) -> Option<Mark> {
     if buffer.text() != text_at_start {
+        if buffer.is_dirty() || top(buffer).is_some() {
+            return None;
+        }
         buffer.set_text(text_at_start, cx);
         if let Some(txn) = top(buffer) {
             buffer.forget_transaction(txn);
@@ -69,7 +79,7 @@ pub fn begin_from(buffer: &mut Buffer, text_at_start: &str, cx: &mut Context<Buf
         let mtime = buffer.file().and_then(|f| f.disk_state().mtime());
         buffer.did_reload(buffer.version(), buffer.line_ending(), mtime, cx);
     }
-    begin(buffer)
+    Some(begin(buffer))
 }
 
 /// Load the disk text and import it as one transaction. The import applies
@@ -293,7 +303,9 @@ mod tests {
             .update(cx, |p, cx| p.open_local_buffer("/ws/other.txt", cx))
             .await
             .unwrap();
-        let mark = buffer.update(cx, |b, cx| begin_from(b, "one\ntwo\n", cx));
+        let mark = buffer
+            .update(cx, |b, cx| begin_from(b, "one\ntwo\n", cx))
+            .expect("a fresh load is set back to the start text");
         assert_eq!(mark.start().text(), "one\ntwo\n");
         let outcome = finish(buffer.clone(), mark, &mut cx.to_async())
             .await
@@ -309,6 +321,30 @@ mod tests {
             assert_eq!(b.undo(cx), Some(txn), "one undo is the agent's write");
             assert_eq!(b.text(), "one\ntwo\n");
             assert_eq!(b.undo(cx), None, "nothing under it");
+        });
+    }
+
+    /// A buffer the person opened and saved their own edits in before the
+    /// write landed is theirs: it is not set back to the tool's start text.
+    #[gpui::test]
+    async fn begin_from_leaves_a_buffer_with_user_history_alone(cx: &mut TestAppContext) {
+        let (fs, project, _notes) = setup(cx).await;
+        fs.insert_tree("/ws", json!({"other.txt": "one\ntwo\n"}))
+            .await;
+        let buffer = project
+            .update(cx, |p, cx| p.open_local_buffer("/ws/other.txt", cx))
+            .await
+            .unwrap();
+        buffer.update(cx, |b, cx| b.edit([(0..0, "USER ")], None, cx));
+        project
+            .update(cx, |p, cx| p.save_buffer(buffer.clone(), cx))
+            .await
+            .unwrap();
+        let mark = buffer.update(cx, |b, cx| begin_from(b, "one\ntwo\n", cx));
+        assert!(mark.is_none(), "the buffer holds the user's history");
+        buffer.read_with(cx, |b, _| {
+            assert_eq!(b.text(), "USER one\ntwo\n");
+            assert!(b.peek_undo_stack().is_some(), "their undo history is kept");
         });
     }
 

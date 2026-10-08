@@ -19,7 +19,7 @@ use cedian_shell::audit::AuditLog;
 use cedian_shell::{Policy, RunKind};
 use collections::HashMap;
 use futures::channel::mpsc::UnboundedSender;
-use omp_rpc::{ExtensionUiRequest, ExtensionUiResponse, ImageContent};
+use omp_rpc::{ExtensionUiRequest, ExtensionUiResponse, HostUri, ImageContent};
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -89,11 +89,13 @@ pub struct LaunchSpec {
     pub policy_note: Option<String>,
     /// OMP's state root, where session owner leases live.
     pub omp_state: Option<PathBuf>,
+    /// The host URI schemes registered before the session opens.
+    pub uris: Vec<HostUri>,
 }
 
 impl LaunchSpec {
     /// Resolve settings, policy and paths for `workdir`. The app registers no
-    /// host tools yet (U5 adds them).
+    /// host tools yet; the panel adds its `cedian://` scheme to `uris`.
     pub fn resolve(workdir: &Path) -> Result<Self, String> {
         let settings = cedian_shell::resolve_settings(workdir).map_err(|e| e.to_string())?;
         let binary = cedian_shell::launch::omp_binary()?;
@@ -114,6 +116,7 @@ impl LaunchSpec {
             policy,
             policy_note,
             omp_state: cedian_omp::driver::state_root(),
+            uris: Vec::new(),
         })
     }
 }
@@ -499,6 +502,16 @@ fn run(
             return;
         }
     };
+    if !spec.uris.is_empty()
+        && let Err(e) = runtime.set_host_uris(spec.uris)
+    {
+        let _ = events.unbounded_send(LinkEvent::Failed(format!(
+            "OMP refused cedian:// context: {e}"
+        )));
+        let own = runtime.pid();
+        shutdown(runtime, &gate, own);
+        return;
+    }
     let own = runtime.pid();
     pid.store(own.unwrap_or(0), Ordering::Relaxed);
     *gate.control.lock() = Some(runtime.control());
@@ -885,6 +898,7 @@ mod tests {
             policy: SpawnPolicy::default(),
             policy_note: None,
             omp_state: cedian_omp::driver::state_root(),
+            uris: Vec::new(),
         };
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         let link = OmpLink::start(spec(), tx, None);

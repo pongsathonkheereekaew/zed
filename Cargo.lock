@@ -2902,6 +2902,7 @@ dependencies = [
  "gpui",
  "language",
  "log",
+ "lsp",
  "omp-rpc",
  "parking_lot",
  "project",

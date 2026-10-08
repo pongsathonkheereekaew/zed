@@ -3,6 +3,8 @@
 {"dir":"out","frame":{"command":"negotiate_protocol","data":{"protocolVersion":2},"id":"req_1","success":true,"type":"response"}}
 {"dir":"in","frame":{"enabled":true,"id":"req_2","type":"set_ask_dialog"}}
 {"dir":"out","frame":{"command":"set_ask_dialog","data":{"enabled":true},"id":"req_2","success":true,"type":"response"}}
+{"dir":"in","frame":{"id":"req_uris_1","schemes":[{"immutable":false,"scheme":"cedian","writable":false}],"type":"set_host_uri_schemes"}}
+{"dir":"out","frame":{"command":"set_host_uri_schemes","data":{"schemes":["cedian"]},"id":"req_uris_1","success":true,"type":"response"}}
 {"dir":"in","frame":{"id":"req_3","type":"get_state"}}
 {"dir":"out","frame":{"command":"get_state","id":"req_3","success":true,"type":"response","data":{"sessionId":"0b1d0000-0000-7000-8000-000000000001","sessionFile":"${CEDIAN_SESSION_DIR}/held.jsonl"}}}
 {"dir":"in","frame":{"id":"req_4","sessionDir":"${CEDIAN_SESSION_DIR}","type":"open_session"}}

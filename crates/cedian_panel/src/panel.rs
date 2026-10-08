@@ -17,6 +17,7 @@
 //! view lists each file's hunks with Accept and Reject, Accept all, and
 //! Revert turn.
 
+use crate::context;
 use crate::dialogs::OpenDialog;
 use crate::import::{self, ImportOutcome, Mark};
 use crate::omp_link::{AnswerError, LaunchSpec, LinkEvent, OmpLink, Prompt};
@@ -25,6 +26,7 @@ use crate::review::{ReviewError, TaskReview};
 use cedian_agent::Thread;
 use cedian_omp::{RouterEvent, UserAnswer};
 use cedian_review::{HunkKey, HunkStatus};
+use cedian_workspace::{capture_ambient, render_snapshot};
 use collections::{HashMap, HashSet, IndexMap};
 use editor::{Editor, actions::Paste};
 use futures::{StreamExt, channel::mpsc};
@@ -34,7 +36,7 @@ use gpui::{
     Window, actions, px,
 };
 use language::{Buffer, BufferEvent};
-use omp_rpc::{ExtensionUiRequest, ImageContent};
+use omp_rpc::{ExtensionUiRequest, HostUriRead, ImageContent};
 use project::Project;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -159,7 +161,11 @@ pub struct CedianPanel {
     /// The OMP settings page, shown instead of the thread when open.
     settings: Option<Entity<OmpSettings>>,
     show_settings: bool,
+    /// The workspace whose active editor gives the selection OMP sees.
+    workspace: Option<WeakEntity<Workspace>>,
     _events: Option<Task<()>>,
+    /// Answers OMP's `cedian://` reads.
+    _context: Option<Task<()>>,
 }
 
 impl CedianPanel {
@@ -170,7 +176,12 @@ impl CedianPanel {
         cx.spawn(async move |cx| {
             workspace.update_in(cx, |workspace, window, cx| {
                 let project = workspace.project().clone();
-                cx.new(|cx| Self::new(project, window, cx))
+                let handle = cx.entity().downgrade();
+                cx.new(|cx| {
+                    let mut panel = Self::new(project, window, cx);
+                    panel.set_workspace(handle);
+                    panel
+                })
             })
         })
     }
@@ -200,12 +211,19 @@ impl CedianPanel {
             images: Vec::new(),
             settings: None,
             show_settings: false,
+            workspace: None,
             _events: None,
+            _context: None,
         };
         if this.workspace_root(cx).is_some() {
             this.start(window, cx);
         }
         this
+    }
+
+    /// The workspace whose active editor and selection OMP is told about.
+    pub fn set_workspace(&mut self, workspace: WeakEntity<Workspace>) {
+        self.workspace = Some(workspace);
     }
 
     pub fn connection(&self) -> &Connection {
@@ -418,7 +436,7 @@ impl CedianPanel {
             self.connection = Connection::Stopped("open a folder first".to_string());
             return;
         };
-        let spec = match LaunchSpec::resolve(&root) {
+        let mut spec = match LaunchSpec::resolve(&root) {
             Ok(spec) => spec,
             Err(e) => {
                 self.connection = Connection::Stopped(e);
@@ -426,6 +444,17 @@ impl CedianPanel {
                 return;
             }
         };
+        let (read_tx, mut read_rx) = mpsc::unbounded::<context::Read>();
+        spec.uris.push(context::scheme(read_tx));
+        self._context = Some(cx.spawn(async move |this, cx| {
+            while let Some(read) = read_rx.next().await {
+                let Ok(answer) = this.update(cx, |this, cx| this.read_context(&read.url, cx))
+                else {
+                    break;
+                };
+                let _ = read.reply.send(answer.await);
+            }
+        }));
         let (event_tx, mut event_rx) = mpsc::unbounded::<LinkEvent>();
         self.link = Some(OmpLink::start(spec, event_tx, previous));
         self.connection = Connection::Starting;
@@ -440,6 +469,29 @@ impl CedianPanel {
             }
         }));
         cx.notify();
+    }
+
+    /// Answer one `cedian://` read from what Zed holds now.
+    fn read_context(&self, url: &str, cx: &mut Context<Self>) -> Task<Result<HostUriRead, String>> {
+        Task::ready(
+            match context::host(self.workspace.as_ref(), &self.project, cx) {
+                Some(host) => host.read_uri(url).map_err(|e| e.to_string()),
+                None => Err("no folder is open".to_string()),
+            },
+        )
+    }
+
+    /// The prompt as OMP gets it: the bounded snapshot of what the person
+    /// sees (§39), then their text.
+    fn with_context(&self, text: &str, cx: &App) -> String {
+        let snapshot = context::host(self.workspace.as_ref(), &self.project, cx)
+            .map(|host| render_snapshot(&capture_ambient(&host)))
+            .unwrap_or_default();
+        if snapshot.is_empty() {
+            text.to_string()
+        } else {
+            format!("{snapshot}\n{text}")
+        }
     }
 
     /// The Retry button of a taken session.
@@ -593,7 +645,7 @@ impl CedianPanel {
                 Err(format!("{reason}; start a new session or retry"))
             }
             (_, Some(link)) => link.send(Prompt {
-                text: text.clone(),
+                text: self.with_context(&text, cx),
                 images: self.images.clone(),
             }),
             (_, None) => Err("OMP is not running; restart it".to_string()),

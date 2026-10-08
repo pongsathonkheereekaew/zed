@@ -2,9 +2,10 @@
 //!
 //! Server (`out`) frames are emitted in recorded order. At each recorded host
 //! (`in`) frame, replay blocks for the host's next line and checks its `type`
-//! matches, and a dialog answer (and a prompt's text and recorded images)
-//! matches whole; the host's fresh request id is mapped onto the recorded one so the
-//! recorded `response` frames correlate.
+//! matches, and a dialog answer (and a prompt's text and recorded images,
+//! and a host URI read's content) matches whole; the host's fresh request id
+//! is mapped onto the recorded one so the recorded `response` frames
+//! correlate.
 //! Any divergence exits with [`crate::EXIT_DIVERGED`] — the host sees a
 //! closed transport, never a hang.
 
@@ -106,6 +107,19 @@ pub(crate) fn run(fixture: &Path, cwd: &Path, placeholders: &Placeholders) -> i3
                         got.get("message")
                     );
                     return crate::EXIT_DIVERGED;
+                }
+                // A host URI read must answer what the recording answered.
+                if got_type == Some("host_uri_result") {
+                    for field in ["content", "isError", "error"] {
+                        if got.get(field) != expected.get(field) {
+                            eprintln!(
+                                "fake-omp replay: divergence at record {n}: expected {field} {:?}, host sent {:?}",
+                                expected.get(field),
+                                got.get(field)
+                            );
+                            return crate::EXIT_DIVERGED;
+                        }
+                    }
                 }
                 // Images the recording prompted with must reach OMP too.
                 let expected = record.frame.get("images");

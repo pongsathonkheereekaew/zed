@@ -1,0 +1,22 @@
+{"dir":"out","frame":{"maxFrameBytes":1048576,"maxReassembledFrameBytes":67108864,"protocolVersion":1,"supportedProtocolVersions":[1,2],"type":"ready"}}
+{"dir":"in","frame":{"id":"req_1","protocolVersion":2,"type":"negotiate_protocol"}}
+{"dir":"out","frame":{"id":"159c3f6c83cc2319","method":"setWidget","type":"extension_ui_request","widgetKey":"autoresearch"}}
+{"dir":"out","frame":{"type":"advisor_cost_changed"}}
+{"dir":"out","frame":{"command":"negotiate_protocol","data":{"protocolVersion":2},"id":"req_1","success":true,"type":"response"}}
+{"dir":"in","frame":{"enabled":true,"id":"req_2","type":"set_ask_dialog"}}
+{"dir":"out","frame":{"command":"set_ask_dialog","data":{"enabled":true},"id":"req_2","success":true,"type":"response"}}
+{"dir":"in","frame":{"id":"req_uris_1","schemes":[{"immutable":false,"scheme":"cedian","writable":false}],"type":"set_host_uri_schemes"}}
+{"dir":"out","frame":{"command":"set_host_uri_schemes","data":{"schemes":["cedian"]},"id":"req_uris_1","success":true,"type":"response"}}
+{"dir":"in","frame":{"id":"req_3","type":"get_state"}}
+{"dir":"out","frame":{"command":"get_state","id":"req_3","success":true,"type":"response","data":{"sessionId":"01a113c8-6171-72ca-9b6b-1c696dd443e1","sessionFile":"${CEDIAN_SESSION_DIR}/2026-10-07T00-34-21-681Z_01a113c8-6171-72ca-9b6b-1c696dd443e1.jsonl"}}}
+{"dir":"in","frame":{"id":"req_5","sessionDir":"${CEDIAN_SESSION_DIR}","type":"open_session"}}
+{"dir":"out","frame":{"command":"open_session","data":{"cancelled":false,"resumed":false,"sessionFile":"${CEDIAN_SESSION_DIR}/2026-10-07T00-34-21-681Z_01a113c8-6171-72ca-9b6b-1c696dd443e1.jsonl","sessionId":"01a113c8-6171-72ca-9b6b-1c696dd443e1"},"id":"req_5","success":true,"type":"response"}}
+{"dir":"in","frame":{"id":"req_6","message":"active-file: src/main.rs\nselection:\nsrc/main.rs bytes 16-31\nlet unused = 1;\ndiagnostics:\nwarning src/main.rs:1 unused variable: `unused`\n\nFix this","type":"prompt"}}
+{"dir":"out","frame":{"command":"prompt","id":"req_6","success":true,"type":"response"}}
+{"dir":"out","frame":{"type":"agent_start"}}
+{"dir":"out","frame":{"type":"host_uri_request","id":"uri_1","operation":"read","url":"cedian://diagnostics"}}
+{"dir":"in","frame":{"type":"host_uri_result","id":"uri_1","content":"warning /src/main.rs:1 unused variable: `unused`"}}
+{"dir":"out","frame":{"type":"host_uri_request","id":"uri_2","operation":"read","url":"cedian://selection"}}
+{"dir":"in","frame":{"type":"host_uri_result","id":"uri_2","content":"/src/main.rs:16-31\nlet unused = 1;"}}
+{"dir":"out","frame":{"agentInvoked":true,"id":"req_6","sessionSettled":true,"status":"completed","type":"prompt_result"}}
+{"dir":"out","frame":{"type":"session_settled"}}

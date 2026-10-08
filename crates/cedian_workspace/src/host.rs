@@ -306,12 +306,14 @@ impl HostTools {
     /// with `isError`, never silent empty (forward-compat for browser/ios/review).
     pub fn cedian_uri_scheme(self: &Arc<Self>) -> HostUri {
         let host = Arc::clone(self);
-        HostUri::new("cedian", move |url, _ctx| {
-            let uri = crate::parse_cedian_uri(url)
-                .map_err(|e| -> omp_rpc::HostUriError { e.to_string().into() })?;
-            host.serve_uri(&uri)
-        })
-        .expect("cedian scheme is valid")
+        HostUri::new("cedian", move |url, _ctx| host.read_uri(url)).expect("cedian scheme is valid")
+    }
+
+    /// Serve one `cedian://` read.
+    pub fn read_uri(&self, url: &str) -> Result<omp_rpc::HostUriRead, omp_rpc::HostUriError> {
+        let uri = crate::parse_cedian_uri(url)
+            .map_err(|e| -> omp_rpc::HostUriError { e.to_string().into() })?;
+        self.serve_uri(&uri)
     }
 
     /// Serve one parsed `cedian://` URL. Pure dispatch — each kind has its own

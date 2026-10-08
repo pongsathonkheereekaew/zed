@@ -25,6 +25,7 @@ use crate::omp_link::{AnswerError, LaunchSpec, LinkEvent, OmpLink, Prompt};
 use crate::omp_settings::OmpSettings;
 use crate::review::{ReviewError, TaskReview};
 use cedian_agent::Thread;
+use cedian_agent_ui::{SubagentRow, SubagentTree, ToolCard};
 use cedian_omp::{RouterEvent, UserAnswer};
 use cedian_review::{HunkKey, HunkStatus};
 use cedian_workflow::{CurrentState, Evidence, Gate, GateResult, Outcome};
@@ -145,6 +146,8 @@ pub struct CedianPanel {
     project: Entity<Project>,
     input: Entity<Editor>,
     thread: Thread,
+    /// OMP's subagents, each under the `task` call that started it.
+    subagents: SubagentTree,
     link: Option<OmpLink>,
     connection: Connection,
     calls: HashMap<String, CallMarks>,
@@ -214,6 +217,7 @@ impl CedianPanel {
             project,
             input,
             thread: Thread::new(),
+            subagents: SubagentTree::default(),
             link: None,
             connection: Connection::NotStarted,
             calls: HashMap::default(),
@@ -275,18 +279,47 @@ impl CedianPanel {
         self.dialogs.keys().cloned().collect()
     }
 
-    /// The thread as the panel renders it: messages, then tool cards.
+    /// The thread as the panel renders it: messages, then tool cards, each
+    /// followed by the subagents it started.
     pub fn transcript(&self) -> Vec<String> {
         let (messages, cards) = cedian_agent_ui::render_thread(self.thread.events());
-        messages
+        let mut lines: Vec<String> = messages
             .into_iter()
             .map(|m| format!("{:?}: {}", m.role, m.text))
-            .chain(
-                cards
-                    .into_iter()
-                    .map(|c| format!("[{:?}] {}", c.status, c.display_line())),
-            )
-            .collect()
+            .collect();
+        for entry in self.cards_with_subagents(cards) {
+            match entry {
+                Ok(card) => lines.push(card_line(&card)),
+                Err(row) => lines.push(subagent_line(row)),
+            }
+        }
+        lines
+    }
+
+    pub fn subagents(&self) -> &SubagentTree {
+        &self.subagents
+    }
+
+    /// Cards in order, each followed by its subagents; subagents whose card
+    /// is not in the thread come last.
+    fn cards_with_subagents(&self, cards: Vec<ToolCard>) -> Vec<Result<ToolCard, &SubagentRow>> {
+        let mut out = Vec::new();
+        for card in &cards {
+            out.push(Ok(card.clone()));
+            out.extend(self.subagents.under(&card.call_id).into_iter().map(Err));
+        }
+        out.extend(
+            self.subagents
+                .rows()
+                .iter()
+                .filter(|row| {
+                    !row.parent_tool_call_id
+                        .as_ref()
+                        .is_some_and(|parent| cards.iter().any(|c| &c.call_id == parent))
+                })
+                .map(Err),
+        );
+        out
     }
 
     pub fn dialog(&self, id: &str) -> Option<&OpenDialog> {
@@ -918,6 +951,7 @@ impl CedianPanel {
             }
             _ => {}
         }
+        self.subagents.apply(&event);
         self.thread.apply(&event);
         cx.notify();
     }
@@ -1050,6 +1084,15 @@ impl CedianPanel {
         }
         self.images.extend(images);
         cx.notify();
+    }
+
+    fn render_subagent(&self, row: &SubagentRow, _cx: &mut Context<Self>) -> AnyElement {
+        let selector = format!("cedian-subagent-{}", row.id);
+        div()
+            .debug_selector(move || selector)
+            .pl_4()
+            .child(Label::new(subagent_line(row)).size(LabelSize::Small))
+            .into_any_element()
     }
 
     fn render_dialog(&self, id: &str, dialog: &OpenDialog, cx: &mut Context<Self>) -> AnyElement {
@@ -1532,14 +1575,22 @@ impl Focusable for CedianPanel {
 impl Render for CedianPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (messages, cards) = cedian_agent_ui::render_thread(self.thread.events());
-        let rows = messages
+        let mut rows: Vec<AnyElement> = messages
             .into_iter()
             .map(|m| Label::new(format!("{:?}: {}", m.role, m.text)).into_any_element())
-            .chain(cards.into_iter().map(|c| {
-                Label::new(format!("[{:?}] {}", c.status, c.display_line()))
-                    .color(Color::Muted)
-                    .into_any_element()
-            }));
+            .collect();
+        for entry in self.cards_with_subagents(cards) {
+            rows.push(match entry {
+                Ok(card) => {
+                    let selector = format!("cedian-tool-{}", card.call_id);
+                    div()
+                        .debug_selector(move || selector)
+                        .child(Label::new(card_line(&card)).color(Color::Muted))
+                        .into_any_element()
+                }
+                Err(row) => self.render_subagent(row, cx),
+            });
+        }
         let connection = match &self.connection {
             Connection::NotStarted => "OMP not started".to_string(),
             Connection::Starting => "starting OMP…".to_string(),
@@ -2921,4 +2972,12 @@ mod tests {
         });
         eprintln!("tool_call_id={call_id}: OMP edit imported and reverted by one undo");
     }
+}
+
+fn card_line(card: &ToolCard) -> String {
+    format!("[{:?}] {}", card.status, card.display_line())
+}
+
+fn subagent_line(row: &SubagentRow) -> String {
+    format!("↳ [{:?}] {} — {}", row.status, row.agent, row.description)
 }

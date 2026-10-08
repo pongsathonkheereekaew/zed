@@ -512,6 +512,14 @@ fn run(
         shutdown(runtime, &gate, own);
         return;
     }
+    if let Err(e) = runtime.subscribe_subagents() {
+        let _ = events.unbounded_send(LinkEvent::Failed(format!(
+            "OMP refused the subagent subscription: {e}"
+        )));
+        let own = runtime.pid();
+        shutdown(runtime, &gate, own);
+        return;
+    }
     let own = runtime.pid();
     pid.store(own.unwrap_or(0), Ordering::Relaxed);
     *gate.control.lock() = Some(runtime.control());

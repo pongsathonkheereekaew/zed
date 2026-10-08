@@ -95,3 +95,7 @@ harness = false
 [[test]]
 name = "browser"
 harness = false
+
+[[test]]
+name = "subagents"
+harness = false

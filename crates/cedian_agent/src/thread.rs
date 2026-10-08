@@ -192,9 +192,13 @@ impl Thread {
                     follow_up: follow_up.clone(),
                 });
             }
-            RouterEvent::UiRequest(_) | RouterEvent::Unknown { .. } => {
-                // Dialogs render outside the thread; unknown frames are
-                // tolerated + counted upstream (metric). Neither is rendered.
+            RouterEvent::UiRequest(_)
+            | RouterEvent::Unknown { .. }
+            | RouterEvent::SubagentLifecycle { .. }
+            | RouterEvent::SubagentProgress { .. } => {
+                // Dialogs render outside the thread, subagents in their own
+                // tree (`cedian_agent_ui::subagents`); unknown frames are
+                // tolerated. None is a thread entry.
             }
             RouterEvent::Disconnected => {
                 let running: Vec<String> = self

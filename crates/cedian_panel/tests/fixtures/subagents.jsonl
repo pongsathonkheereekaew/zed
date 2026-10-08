@@ -11,14 +11,17 @@
 {"dir":"out","frame":{"command":"get_state","id":"req_3","success":true,"type":"response","data":{"sessionId":"7e1f0000-0000-7000-8000-000000000001","sessionFile":"${CEDIAN_CWD}/session.jsonl"}}}
 {"dir":"in","frame":{"id":"req_4","sessionDir":"${CEDIAN_CWD}","type":"open_session"}}
 {"dir":"out","frame":{"command":"open_session","data":{"cancelled":false,"resumed":true,"sessionFile":"${CEDIAN_CWD}/session.jsonl","sessionId":"7e1f0000-0000-7000-8000-000000000001"},"id":"req_4","success":true,"type":"response"}}
-{"dir":"in","frame":{"id":"req_5","message":"five","type":"prompt"}}
+{"dir":"in","frame":{"id":"req_5","message":"fan out","type":"prompt"}}
 {"dir":"out","frame":{"command":"prompt","id":"req_5","success":true,"type":"response"}}
 {"dir":"out","frame":{"type":"agent_start"}}
-{"dir":"out","frame":{"agentInvoked":true,"id":"req_5","sessionSettled":true,"status":"completed","type":"prompt_result"}}
+{"dir":"out","frame":{"args":{"description":"map the code"},"toolCallId":"call-task","toolName":"task","type":"tool_execution_start"}}
+{"dir":"out","frame":{"type":"subagent_lifecycle","payload":{"id":"sa-1","agent":"explore","agentSource":"bundled","status":"started","index":0,"parentToolCallId":"call-task","description":"map the router"}}}
+{"dir":"out","frame":{"type":"subagent_lifecycle","payload":{"id":"sa-2","agent":"explore","agentSource":"bundled","status":"started","index":1,"parentToolCallId":"call-task","description":"map the panel"}}}
+{"dir":"out","frame":{"type":"subagent_progress","payload":{"index":0,"agent":"explore","agentSource":"bundled","task":"Map the router.","parentToolCallId":"call-task","progress":{"id":"sa-1","status":"running","description":"reading event_router.rs"}}}}
+{"dir":"in","frame":{"id":"req_6","type":"abort"}}
+{"dir":"out","frame":{"command":"abort","id":"req_6","success":true,"type":"response"}}
+{"dir":"out","frame":{"type":"subagent_lifecycle","payload":{"id":"sa-1","agent":"explore","agentSource":"bundled","status":"completed","index":0,"parentToolCallId":"call-task"}}}
+{"dir":"out","frame":{"type":"subagent_lifecycle","payload":{"id":"sa-2","agent":"explore","agentSource":"bundled","status":"failed","index":1,"parentToolCallId":"call-task"}}}
+{"dir":"out","frame":{"isError":false,"result":{"content":[{"text":"2 subagents","type":"text"}],"details":{}},"toolCallId":"call-task","toolName":"task","type":"tool_execution_end"}}
+{"dir":"out","frame":{"agentInvoked":true,"id":"req_5","sessionSettled":true,"status":"aborted","type":"prompt_result"}}
 {"dir":"out","frame":{"type":"session_settled"}}
-{"dir":"in","frame":{"id":"req_6","message":"hang","type":"prompt"}}
-{"dir":"fs","frame":{"type":"fs_hold","path":"session.jsonl"}}
-{"dir":"out","frame":{"command":"prompt","id":"req_6","success":true,"type":"response"}}
-{"dir":"out","frame":{"type":"agent_start"}}
-{"dir":"in","frame":{"id":"req_7","type":"abort"}}
-{"dir":"fs","frame":{"type":"fs_sleep","ms":60000}}

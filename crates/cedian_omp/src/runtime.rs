@@ -18,6 +18,7 @@
 use crate::{
     EventRouter, OmpError, SessionBinding, Sessions, SpawnPolicy, SpawnProfile, resolve_on_path,
 };
+use omp_rpc::wire::{SetSubagentSubscriptionCommand, SubagentSubscriptionLevel};
 use omp_rpc::{
     AbortCommand, Client, ClientOptions, Event, ExtensionUiResponse, GetStateCommand, HostTool,
     HostUri, ImageContent, NewSessionCommand, OpenSessionCommand, OpenSessionResult, PromptCommand,
@@ -367,6 +368,17 @@ impl OmpRuntime {
     /// Replace the host-owned URI scheme set.
     pub fn set_host_uris(&self, uris: Vec<HostUri>) -> Result<Vec<String>, OmpError> {
         self.client().set_host_uris(uris).map_err(OmpError::from)
+    }
+
+    /// Have OMP send `subagent_lifecycle` and `subagent_progress` (ADR-0050:
+    /// level `progress`, never every subagent token).
+    pub fn subscribe_subagents(&self) -> Result<(), OmpError> {
+        self.client()
+            .call(&SetSubagentSubscriptionCommand {
+                level: SubagentSubscriptionLevel::Progress,
+            })
+            .map(|_| ())
+            .map_err(OmpError::from)
     }
 
     /// Active workspace↔session binding, if adopted.

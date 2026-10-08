@@ -12,6 +12,7 @@
 
 use omp_rpc::wire::{
     AgentMessage, AssistantMessageEvent, ExtensionUiRequest, RpcAgentEvent, RpcNotification,
+    SubagentLifecycleStatus,
 };
 use parking_lot::Mutex;
 use std::collections::{BTreeSet, HashMap};
@@ -63,6 +64,22 @@ pub enum RouterEvent {
         steering: Vec<String>,
         follow_up: Vec<String>,
     },
+    /// An OMP subagent started or ended (ADR-0050). `parent_tool_call_id`
+    /// is the `task` tool call that started it.
+    SubagentLifecycle {
+        id: String,
+        agent: String,
+        status: SubagentStatus,
+        parent_tool_call_id: Option<String>,
+        description: Option<String>,
+    },
+    /// A running subagent reported progress; its id is `progress.id`.
+    SubagentProgress {
+        id: String,
+        agent: String,
+        parent_tool_call_id: Option<String>,
+        description: Option<String>,
+    },
     /// A dialog or UI notice from OMP: approvals and `ask` wait for an
     /// answer (`crate::dialog`); the rest are fire-and-forget.
     UiRequest(ExtensionUiRequest),
@@ -80,6 +97,26 @@ pub enum DeltaKind {
     Thinking,
     ToolCall,
     Other,
+}
+
+/// Where an OMP subagent is: OMP's `started` is `Running`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubagentStatus {
+    Running,
+    Completed,
+    Failed,
+    Aborted,
+}
+
+impl From<SubagentLifecycleStatus> for SubagentStatus {
+    fn from(s: SubagentLifecycleStatus) -> Self {
+        match s {
+            SubagentLifecycleStatus::Started => Self::Running,
+            SubagentLifecycleStatus::Completed => Self::Completed,
+            SubagentLifecycleStatus::Failed => Self::Failed,
+            SubagentLifecycleStatus::Aborted => Self::Aborted,
+        }
+    }
 }
 
 /// Terminal status of one prompt ticket. Mirrors the wire enum.
@@ -287,6 +324,31 @@ fn classify_notification(frame: &RpcNotification) -> RouterEvent {
         },
         RpcNotification::SessionSettled(_) => RouterEvent::Settled,
         RpcNotification::ExtensionUiRequest(request) => RouterEvent::UiRequest(request.clone()),
+        RpcNotification::SubagentLifecycle(event) => {
+            let p = &event.payload;
+            RouterEvent::SubagentLifecycle {
+                id: p.id.clone(),
+                agent: p.agent.clone(),
+                status: p.status.into(),
+                parent_tool_call_id: p.parent_tool_call_id.clone(),
+                description: p.description.clone(),
+            }
+        }
+        RpcNotification::SubagentProgress(event) => {
+            let p = &event.payload;
+            let text = |key: &str| p.progress.get(key).and_then(|v| v.as_str());
+            match text("id") {
+                Some(id) => RouterEvent::SubagentProgress {
+                    id: id.to_string(),
+                    agent: p.agent.clone(),
+                    parent_tool_call_id: p.parent_tool_call_id.clone(),
+                    description: text("description").map(str::to_string),
+                },
+                None => RouterEvent::Unknown {
+                    frame_type: "subagent_progress".to_string(),
+                },
+            }
+        }
         RpcNotification::Unknown(raw) => RouterEvent::Unknown {
             frame_type: raw
                 .get("type")
@@ -620,6 +682,47 @@ mod tests {
             ["opencode-go/glm-5.3", "opencode-go/muse-spark-1.3"],
             "each model once, sorted"
         );
+    }
+
+    #[test]
+    fn subagent_frames_are_typed_and_progress_takes_its_id_from_progress() {
+        let frame = |json: serde_json::Value| RpcNotification::from_value(json).unwrap();
+        let lifecycle = frame(serde_json::json!({
+            "type": "subagent_lifecycle",
+            "payload": {"id": "sa-1", "agent": "explore", "agentSource": "bundled",
+                        "status": "started", "index": 0, "parentToolCallId": "call-task",
+                        "description": "map the router"},
+        }));
+        match classify_notification(&lifecycle) {
+            RouterEvent::SubagentLifecycle {
+                id,
+                agent,
+                status,
+                parent_tool_call_id,
+                description,
+            } => {
+                assert_eq!((id.as_str(), agent.as_str()), ("sa-1", "explore"));
+                assert_eq!(status, SubagentStatus::Running);
+                assert_eq!(parent_tool_call_id.as_deref(), Some("call-task"));
+                assert_eq!(description.as_deref(), Some("map the router"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let progress = frame(serde_json::json!({
+            "type": "subagent_progress",
+            "payload": {"index": 0, "agent": "explore", "agentSource": "bundled",
+                        "task": "long assignment", "parentToolCallId": "call-task",
+                        "progress": {"id": "sa-1", "status": "running", "description": "reading"}},
+        }));
+        match classify_notification(&progress) {
+            RouterEvent::SubagentProgress {
+                id, description, ..
+            } => {
+                assert_eq!(id, "sa-1");
+                assert_eq!(description.as_deref(), Some("reading"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]

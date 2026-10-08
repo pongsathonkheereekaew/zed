@@ -218,6 +218,9 @@ fn handle(
                 }
                 "Target.detachedFromTarget" => {
                     let session = text(&notification.params, "/sessionId");
+                    if tabs.by_session.iter().any(|(s, _)| *s == session) {
+                        shared.state.lock().seq += 1;
+                    }
                     tabs.by_session.retain(|(s, _)| *s != session);
                     if tabs.active.as_deref() == Some(session.as_str()) {
                         tabs.active = tabs.by_session.last().map(|(s, _)| s.clone());
@@ -328,10 +331,10 @@ fn capture_once(
     })
 }
 
-/// One page notification. Main-frame navigations in any page advance the
-/// one browser-wide sequence: evidence is bound to the browser, not a tab,
-/// so a navigation anywhere the agent could have looked makes earlier
-/// captures stale.
+/// One page notification. Main-frame navigations in any page, same-document
+/// ones included, advance the one browser-wide sequence: evidence is bound
+/// to the browser, not a tab, so a navigation anywhere the agent could have
+/// looked makes earlier captures stale. Closing a followed page does too.
 fn apply(shared: &Shared, tabs: &mut Tabs, notification: Notification) {
     let Notification {
         method,
@@ -351,6 +354,14 @@ fn apply(shared: &Shared, tabs: &mut Tabs, notification: Notification) {
             tab.network.clear();
             shared.state.lock().seq += 1;
             tabs.active = Some(session);
+        }
+        "Page.navigatedWithinDocument" => {
+            let frame = text(&params, "/frameId");
+            if frame.is_empty() || frame == tab.frame_id {
+                tab.url = text(&params, "/url");
+                shared.state.lock().seq += 1;
+                tabs.active = Some(session);
+            }
         }
         "Runtime.consoleAPICalled" => {
             let args: Vec<String> = params["args"]

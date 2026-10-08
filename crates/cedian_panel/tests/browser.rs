@@ -77,6 +77,12 @@ fn main() {
     run("a_capture_binds_the_frame_it_shows", || {
         a_capture_binds_the_frame_it_shows(&root)
     });
+    run("a_same_document_navigation_stales_a_capture", || {
+        a_same_document_navigation_stales_a_capture(&root)
+    });
+    run("closing_the_captured_tab_stales_a_capture", || {
+        closing_the_captured_tab_stales_a_capture(&root)
+    });
     run("drop_during_launch_returns_at_once", || {
         drop_during_launch_returns_at_once(&root)
     });
@@ -460,6 +466,80 @@ fn a_capture_binds_the_frame_it_shows(root: &std::path::Path) {
         .stale_reason(&now)
         .expect("a page that never holds still gives a capture born stale");
     assert!(reason.starts_with("stale-frame"), "{reason}");
+}
+
+fn stale_reason(capture: &cedian_panel::browser::Capture, seq: u64) -> Option<String> {
+    let mut now = CurrentState::default();
+    now.frame_seq = Some(seq);
+    capture
+        .evidence("shot", &[], Outcome::Pass)
+        .with_code_state(now.bind(&[]))
+        .stale_reason(&now)
+}
+
+fn a_same_document_navigation_stales_a_capture(root: &std::path::Path) {
+    let host = BrowserHost::open(root.join("spa-profile"), exe(), || {}).unwrap();
+    host.start().unwrap();
+    let list: Value = serde_json::from_str(&get(&host.url(), "/json/list").unwrap()).unwrap();
+    let (mut omp, _) =
+        tungstenite::connect(list[0]["webSocketDebuggerUrl"].as_str().unwrap()).unwrap();
+    let a = host.capture().unwrap();
+    call(
+        &mut omp,
+        "Fake.pushState",
+        json!({"url": "about:blank#/route"}),
+    );
+    wait_until("the route change advances the sequence", || {
+        host.state().seq > a.seq
+    });
+    assert_eq!(host.state().url, "about:blank#/route");
+    let reason = stale_reason(&a, host.state().seq).expect("stale after pushState");
+    assert!(reason.starts_with("stale-frame"), "{reason}");
+}
+
+fn closing_the_captured_tab_stales_a_capture(root: &std::path::Path) {
+    let host = BrowserHost::open(root.join("close-tab-profile"), exe(), || {}).unwrap();
+    host.start().unwrap();
+    let version: Value = serde_json::from_str(&get(&host.url(), "/json/version").unwrap()).unwrap();
+    let (mut browser, _) =
+        tungstenite::connect(version["webSocketDebuggerUrl"].as_str().unwrap()).unwrap();
+    call(
+        &mut browser,
+        "Target.createTarget",
+        json!({"url": "https://other.test/"}),
+    );
+    let (mut omp, _) = tungstenite::connect(list_ws(&host, "P1")).unwrap();
+    call(
+        &mut omp,
+        "Page.navigate",
+        json!({"url": "https://shown.test/"}),
+    );
+    wait_until("the captured tab is active", || {
+        host.state().url == "https://shown.test/"
+    });
+    let a = host.capture().unwrap();
+    assert_eq!(a.url, "https://shown.test/");
+    call(
+        &mut browser,
+        "Target.closeTarget",
+        json!({"targetId": "P1"}),
+    );
+    wait_until("closing the tab advances the sequence", || {
+        host.state().seq > a.seq
+    });
+    let reason = stale_reason(&a, host.state().seq).expect("stale after the tab closed");
+    assert!(reason.starts_with("stale-frame"), "{reason}");
+}
+
+fn list_ws(host: &BrowserHost, id: &str) -> String {
+    let list: Value = serde_json::from_str(&get(&host.url(), "/json/list").unwrap()).unwrap();
+    list.as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == id)
+        .and_then(|t| t["webSocketDebuggerUrl"].as_str())
+        .unwrap()
+        .to_string()
 }
 
 #[allow(clippy::disallowed_methods, reason = "a test probe")]

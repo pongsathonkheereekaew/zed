@@ -7,7 +7,8 @@
 //! emit `Page.frameNavigated`, a console line and a network exchange.
 //! `Fake.personInput {type?}` stands in for the person using the window
 //! (a `pointerdown` unless `type` says otherwise), `Fake.childNavigate` for
-//! a child frame navigating, and `Fake.pageScriptCalls {name, payload}` for
+//! a child frame navigating, `Fake.pushState {url}` for a
+//! same-document navigation (`history.pushState`), and `Fake.pageScriptCalls {name, payload}` for
 //! a page's own script calling a binding by name, which reaches only a
 //! binding added without an `executionContextName`. An `Input.*` command
 //! fires the page's input listener with the events real CDP input makes
@@ -410,6 +411,18 @@ fn answer_page(request: &Value, target: &str, browser: &Arc<Mutex<Browser>>) -> 
                 target,
                 "Page.frameNavigated",
                 json!({"frame": {"id": format!("{frame}-child"), "parentId": frame, "url": params["url"]}}),
+            );
+            json!({})
+        }
+        "Fake.pushState" => {
+            let url = params["url"].as_str().unwrap_or_default().to_string();
+            if let Some(page) = browser.pages.get_mut(target) {
+                page.url = url.clone();
+            }
+            browser.broadcast(
+                target,
+                "Page.navigatedWithinDocument",
+                json!({"frameId": frame, "url": url}),
             );
             json!({})
         }

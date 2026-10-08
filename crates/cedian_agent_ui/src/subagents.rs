@@ -22,6 +22,15 @@ pub struct SubagentTree {
 
 impl SubagentTree {
     pub fn apply(&mut self, event: &RouterEvent) {
+        if let RouterEvent::Disconnected = event {
+            // OMP is gone, and its subagents with it.
+            for row in &mut self.rows {
+                if row.status == SubagentStatus::Running {
+                    row.status = SubagentStatus::Aborted;
+                }
+            }
+            return;
+        }
         let (id, agent, parent, description, status) = match event {
             RouterEvent::SubagentLifecycle {
                 id,

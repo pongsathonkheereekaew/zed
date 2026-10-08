@@ -19,7 +19,9 @@ use cedian_shell::audit::AuditLog;
 use cedian_shell::{Policy, RunKind};
 use collections::HashMap;
 use futures::channel::mpsc::UnboundedSender;
-use omp_rpc::{ExtensionUiRequest, ExtensionUiResponse, HostTool, HostUri, ImageContent};
+use omp_rpc::{
+    ExtensionUiRequest, ExtensionUiResponse, HostTool, HostUri, ImageContent, RpcAgentEvent,
+};
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -63,6 +65,9 @@ pub enum LinkEvent {
     /// Stop took these queued messages back out of OMP's queue before the
     /// abort, oldest first, for the composer.
     Restored(Vec<String>),
+    /// Stop found these queued messages already delivered into the turn it
+    /// aborts: OMP cannot give them back.
+    Delivered(Vec<String>),
     /// OMP's answer to a Steer on subagent `id`.
     SubagentSteered {
         id: String,
@@ -183,6 +188,16 @@ pub fn set_previous_exit(limit: Duration) {
     PREVIOUS_EXIT_MS.store(limit.as_millis() as u64, Ordering::Relaxed);
 }
 
+/// A Cancel on a subagent with no OMP to take it is still the person's
+/// cancel: its audit row (ADR-0050 decision 4), in `workdir`'s log.
+pub fn cancel_without_omp(workdir: &Path, id: &str) -> Result<(), String> {
+    let settings = cedian_shell::resolve_settings(workdir).map_err(|e| e.to_string())?;
+    let choice = settings.policy_for(workdir, RunKind::Interactive);
+    let policy = cedian_shell::launch::spawn_policy(&settings, choice.policy, &[]);
+    let mut audit = AuditLog::open(&cedian_shell::state::dir(workdir)?, policy.approvals)?;
+    audit.subagent_cancel(id, &Err("OMP is not running".to_string()))
+}
+
 /// Why [`OmpLink::answer`] failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnswerError {
@@ -201,15 +216,64 @@ struct Gate {
     control: Mutex<Option<RuntimeControl>>,
     turn: Mutex<TurnState>,
     state: Mutex<GateState>,
-    /// OMP's latest `queue_update`: what Stop takes back before aborting.
+    /// What OMP has queued: what Stop takes back before aborting.
     queue: Mutex<Queue>,
+    /// Held by a steer or follow-up from the moment it is checked against
+    /// Stop until OMP answered and it is in `queue`, and by Stop while it
+    /// takes the queue back and aborts: none lands after Stop's snapshot.
+    sending: Mutex<()>,
+    /// Counts Stops; a queue call made before the latest is refused.
+    stops: AtomicU64,
     events: UnboundedSender<LinkEvent>,
 }
 
+/// A queued message: its text and whether it steers (else a follow-up).
+type Queued = (String, bool);
+
 #[derive(Default, Clone)]
 struct Queue {
-    steering: Vec<String>,
-    follow_up: Vec<String>,
+    /// OMP's latest `queue_update`, steers first, in OMP's own text.
+    listed: Vec<Queued>,
+    /// What OMP said yes to since it last settled. Its `queue_update` may
+    /// not be read yet, and two identical steers are two entries.
+    accepted: Vec<Queued>,
+}
+
+impl Queue {
+    /// What Stop removes: everything OMP lists, then each accepted message
+    /// the list does not cover, steers first.
+    fn take_back(&self) -> Vec<Queued> {
+        let mut plan = self.listed.clone();
+        let mut covered = self.listed.clone();
+        for item in &self.accepted {
+            match covered.iter().position(|listed| listed == item) {
+                Some(index) => {
+                    covered.swap_remove(index);
+                }
+                None => plan.push(item.clone()),
+            }
+        }
+        plan.sort_by_key(|(_, steering)| !steering);
+        plan
+    }
+}
+
+/// Listed messages OMP would not give back: it had already delivered them
+/// into the run Stop aborts.
+fn delivered(listed: &Queue, restored: &[Queued]) -> Vec<String> {
+    let mut restored = restored.to_vec();
+    listed
+        .listed
+        .iter()
+        .filter(|item| match restored.iter().position(|r| r == *item) {
+            Some(index) => {
+                restored.swap_remove(index);
+                false
+            }
+            None => true,
+        })
+        .map(|(text, _)| text.clone())
+        .collect()
 }
 
 /// The one prompt in flight, shared by the panel (send, Stop, Drop), the OMP
@@ -226,6 +290,8 @@ struct TurnState {
     /// OMP started a run no prompt of ours asked for (its own drain of a
     /// queued steer) and has not settled it yet.
     unprompted: bool,
+    /// Our prompt's call returned before its `agent_start` was read.
+    ours_unread: bool,
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
@@ -248,7 +314,8 @@ impl Gate {
     /// Cancel the current prompt; with `close`, every later one too. One
     /// abort stops what runs: our started prompt, or a run of OMP's own,
     /// even while a prompt of ours still waits.
-    fn cancel(&self, close: bool) {
+    fn cancel(self: &Arc<Self>, close: bool) {
+        self.stops.fetch_add(1, Ordering::SeqCst);
         let mut turn = self.turn.lock();
         let first = !std::mem::replace(&mut turn.cancelled, true);
         turn.closed |= close;
@@ -262,74 +329,105 @@ impl Gate {
     /// starts once our prompt is sent is that prompt (aborted at once if
     /// cancelled); any other is OMP's own. Both are decided under one lock,
     /// so our run is never taken for OMP's.
-    fn observe_run(&self, event: &RouterEvent) {
+    fn observe_run(self: &Arc<Self>, event: &RouterEvent) {
         match event {
             RouterEvent::AgentStart => {
                 let mut turn = self.turn.lock();
-                match turn.phase {
+                let phase = turn.phase;
+                match phase {
                     Phase::Sent => {
                         turn.phase = Phase::Started;
                         if turn.cancelled {
                             self.abort();
                         }
                     }
+                    _ if std::mem::take(&mut turn.ours_unread) => {}
                     _ => turn.unprompted = true,
                 }
             }
-            RouterEvent::Settled => self.turn.lock().unprompted = false,
+            RouterEvent::Settled => {
+                self.turn.lock().unprompted = false;
+                self.queue.lock().accepted.clear();
+            }
             RouterEvent::Queue {
                 steering,
                 follow_up,
             } => {
-                *self.queue.lock() = Queue {
-                    steering: steering.clone(),
-                    follow_up: follow_up.clone(),
-                }
+                let steering = steering.iter().map(|text| (text.clone(), true));
+                let follow_up = follow_up.iter().map(|text| (text.clone(), false));
+                self.queue.lock().listed = steering.chain(follow_up).collect();
             }
             _ => {}
         }
     }
 
-    /// OMP accepted a steer or follow-up. Its `queue_update` lists it too,
-    /// but the event thread may not have read that yet when Stop comes.
+    /// Our prompt's call returned; `omp_started` says whether its events
+    /// held an `agent_start`. Returns whether it was cancelled and whether
+    /// the event thread had seen it start.
+    fn prompt_ended(&self, omp_started: bool) -> (bool, bool) {
+        let mut turn = self.turn.lock();
+        let started = turn.phase == Phase::Started;
+        // `prompt_result` can wake this call before the event thread reads
+        // the `agent_start` ahead of it: that one is still ours.
+        turn.ours_unread = omp_started && turn.phase == Phase::Sent;
+        turn.phase = Phase::Idle;
+        (turn.cancelled, started)
+    }
+
+    fn epoch(&self) -> u64 {
+        self.stops.load(Ordering::SeqCst)
+    }
+
+    /// Let a steer or follow-up made at `epoch` go out, unless Stop came
+    /// since. Hold the guard until OMP's answer is in `queue`.
+    fn admit(&self, epoch: u64) -> Option<parking_lot::MutexGuard<'_, ()>> {
+        let sending = self.sending.lock();
+        (self.epoch() == epoch).then_some(sending)
+    }
+
+    /// OMP accepted a steer or follow-up.
     fn accepted(&self, text: &str, steer: bool) {
-        let mut queue = self.queue.lock();
-        let list = if steer {
-            &mut queue.steering
-        } else {
-            &mut queue.follow_up
-        };
-        if !list.iter().any(|queued| queued == text) {
-            list.push(text.to_string());
-        }
+        self.queue.lock().accepted.push((text.to_string(), steer));
     }
 
     /// Abort the run. OMP's `abort` keeps queued user messages, and a kept
     /// steer starts a new run right after it, so each queued message is
     /// taken back first and handed to the composer.
-    fn abort(&self) {
+    fn abort(self: &Arc<Self>) {
         let Some(control) = self.control.lock().clone() else {
             return;
         };
-        let queue = self.queue.lock().clone();
-        let events = self.events.clone();
+        let gate = Arc::clone(self);
         std::thread::spawn(move || {
-            let queued = queue.steering.iter().map(|text| (text, true));
-            let queued = queued.chain(queue.follow_up.iter().map(|text| (text, false)));
-            let restored: Vec<String> = queued
+            let _sending = gate.sending.lock();
+            let queue = {
+                let mut queue = gate.queue.lock();
+                let snapshot = queue.clone();
+                queue.accepted.clear();
+                snapshot
+            };
+            let restored: Vec<Queued> = queue
+                .take_back()
+                .into_iter()
                 .filter(|(text, steering)| {
                     control.remove_queued(text, *steering).unwrap_or_else(|e| {
                         log::warn!("cedian: OMP kept a queued message on Stop: {e}");
                         false
                     })
                 })
-                .map(|(text, _)| text.clone())
                 .collect();
+            let delivered = delivered(&queue, &restored);
             if !restored.is_empty() {
-                let _ = events.unbounded_send(LinkEvent::Restored(restored));
+                let texts = restored.into_iter().map(|(text, _)| text).collect();
+                let _ = gate.events.unbounded_send(LinkEvent::Restored(texts));
+            }
+            if !delivered.is_empty() {
+                let _ = gate.events.unbounded_send(LinkEvent::Delivered(delivered));
             }
             if let Err(e) = control.abort() {
-                let _ = events.unbounded_send(LinkEvent::AbortFailed(e.to_string()));
+                let _ = gate
+                    .events
+                    .unbounded_send(LinkEvent::AbortFailed(e.to_string()));
             }
         });
     }
@@ -449,6 +547,8 @@ impl OmpLink {
             turn: Mutex::default(),
             state: Mutex::default(),
             queue: Mutex::default(),
+            sending: Mutex::default(),
+            stops: AtomicU64::default(),
             events: events.clone(),
         });
         let thread_pid = Arc::clone(&pid);
@@ -497,6 +597,17 @@ impl OmpLink {
         self.gate.turn.lock().phase == Phase::Queued
     }
 
+    /// Whether OMP runs a run of its own (a queued steer it drains).
+    pub fn runs_own(&self) -> bool {
+        self.gate.turn.lock().unprompted
+    }
+
+    /// Whether a prompt of ours is still in the link or in OMP.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn prompt_open(&self) -> bool {
+        self.gate.turn.lock().phase != Phase::Idle
+    }
+
     /// Whether OMP runs a run of its own, no prompt of ours in flight.
     #[cfg(any(test, feature = "test-support"))]
     pub fn runs_unprompted(&self) -> bool {
@@ -540,8 +651,12 @@ impl OmpLink {
     /// (`follow_up`), off the UI thread; OMP's `queue_update` shows it.
     pub fn queue(&self, text: String, steer: bool) {
         let gate = Arc::clone(&self.gate);
+        let epoch = gate.epoch();
         let not_running = LinkEvent::QueueRefused("OMP is not running".to_string());
         self.off_thread(not_running, move |control| {
+            let Some(_sending) = gate.admit(epoch) else {
+                return LinkEvent::QueueRefused("Stop came first; it stays here".to_string());
+            };
             let sent = if steer {
                 control.steer(&text)
             } else {
@@ -806,12 +921,12 @@ fn run(
                     turn.phase = Phase::Sent;
                 }
                 let result = runtime.prompt(&prompt.text, prompt.images);
-                let (cancelled, started) = {
-                    let mut turn = gate.turn.lock();
-                    let started = turn.phase == Phase::Started;
-                    idle(&mut turn);
-                    (turn.cancelled, started)
-                };
+                let omp_started = result.as_ref().is_ok_and(|turn| {
+                    turn.events
+                        .iter()
+                        .any(|event| matches!(event, RpcAgentEvent::AgentStart(_)))
+                });
+                let (cancelled, started) = gate.prompt_ended(omp_started);
                 if let Err(e) = result {
                     let _ = events.unbounded_send(match (cancelled, started) {
                         (true, true) => LinkEvent::PromptStopped(e.to_string()),
@@ -1060,26 +1175,100 @@ mod tests {
 
     #[test]
     fn stop_takes_back_a_steer_whose_queue_update_is_not_read_yet() {
-        let gate = Gate {
-            control: Mutex::default(),
-            turn: Mutex::default(),
-            state: Mutex::default(),
-            queue: Mutex::default(),
-            events: futures::channel::mpsc::unbounded().0,
-        };
+        let gate = Arc::new(bare_gate());
         gate.observe_run(&RouterEvent::Queue {
             steering: Vec::new(),
             follow_up: vec!["two".to_string()],
         });
         gate.accepted("faster", true);
         gate.accepted("two", false);
-        let queue = gate.queue.lock().clone();
         assert_eq!(
-            queue.steering,
-            ["faster"],
-            "OMP said yes to it: Stop takes it back"
+            gate.queue.lock().take_back(),
+            [steer("faster"), ("two".to_string(), false)],
+            "OMP said yes to faster: Stop takes it back; two once"
         );
-        assert_eq!(queue.follow_up, ["two"], "listed once");
+    }
+
+    fn bare_gate() -> Gate {
+        Gate {
+            control: Mutex::default(),
+            turn: Mutex::default(),
+            state: Mutex::default(),
+            queue: Mutex::default(),
+            sending: Mutex::default(),
+            stops: AtomicU64::default(),
+            events: futures::channel::mpsc::unbounded().0,
+        }
+    }
+
+    fn steer(text: &str) -> (String, bool) {
+        (text.to_string(), true)
+    }
+
+    #[test]
+    fn two_identical_steers_are_both_taken_back() {
+        let gate = Arc::new(bare_gate());
+        gate.accepted("again", true);
+        gate.accepted("again", true);
+        let plan = gate.queue.lock().take_back();
+        assert_eq!(plan, [steer("again"), steer("again")]);
+    }
+
+    #[test]
+    fn stop_takes_back_omps_text_and_each_accepted_message_once() {
+        let gate = Arc::new(bare_gate());
+        gate.observe_run(&RouterEvent::Queue {
+            steering: vec!["/review shown".to_string()],
+            follow_up: Vec::new(),
+        });
+        gate.accepted("/review typed", true);
+        gate.accepted("later", false);
+        gate.observe_run(&RouterEvent::Queue {
+            steering: vec!["/review shown".to_string()],
+            follow_up: vec!["later".to_string()],
+        });
+        let plan = gate.queue.lock().take_back();
+        assert_eq!(
+            plan,
+            [
+                steer("/review shown"),
+                steer("/review typed"),
+                ("later".to_string(), false)
+            ],
+            "OMP's own text first; an accepted text it does not list is tried too"
+        );
+    }
+
+    #[test]
+    fn a_listed_message_omp_kept_was_delivered_into_the_stopped_turn() {
+        let gate = Arc::new(bare_gate());
+        gate.observe_run(&RouterEvent::Queue {
+            steering: vec!["faster".to_string()],
+            follow_up: vec!["two".to_string()],
+        });
+        let listed = gate.queue.lock().clone();
+        let restored = [("two".to_string(), false)];
+        assert_eq!(delivered(&listed, &restored), ["faster"]);
+    }
+
+    #[test]
+    fn our_run_read_after_its_prompt_returned_is_still_ours() {
+        let gate = Arc::new(bare_gate());
+        gate.turn.lock().phase = Phase::Sent;
+        gate.prompt_ended(true);
+        gate.observe_run(&RouterEvent::AgentStart);
+        assert!(!gate.turn.lock().unprompted, "our own run read late");
+        gate.observe_run(&RouterEvent::AgentStart);
+        assert!(gate.turn.lock().unprompted, "the next one is OMP's");
+    }
+
+    #[test]
+    fn a_queue_call_after_stop_is_refused() {
+        let gate = Arc::new(bare_gate());
+        let epoch = gate.epoch();
+        gate.cancel(false);
+        assert!(gate.admit(epoch).is_none(), "Stop was pressed first");
+        assert!(gate.admit(gate.epoch()).is_some());
     }
 
     #[test]
@@ -1094,6 +1283,8 @@ mod tests {
                 turn: Mutex::default(),
                 state: Mutex::new(gate(&dir)),
                 queue: Mutex::default(),
+                sending: Mutex::default(),
+                stops: AtomicU64::default(),
                 events,
             }),
             thread: None,

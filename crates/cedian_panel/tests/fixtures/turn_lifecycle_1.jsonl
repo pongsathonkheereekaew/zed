@@ -22,6 +22,8 @@
 {"dir":"out","frame":{"type":"queue_update","steering":["faster"],"followUp":[]}}
 {"dir":"out","frame":{"command":"steer","id":"req_s1","success":true,"type":"response"}}
 {"dir":"in","frame":{"id":"req_f1","message":"two","type":"follow_up"}}
+{"dir":"fs","frame":{"type":"fs_write","path":"omp-got-two","content":""}}
+{"dir":"fs","frame":{"type":"fs_sleep","ms":1000}}
 {"dir":"out","frame":{"type":"queue_update","steering":["faster"],"followUp":["two"]}}
 {"dir":"out","frame":{"command":"follow_up","id":"req_f1","success":true,"type":"response"}}
 {"dir":"in","frame":{"id":"req_r1","message":"faster","queue":"steering","type":"remove_queued_message"}}

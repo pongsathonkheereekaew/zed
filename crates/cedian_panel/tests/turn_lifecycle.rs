@@ -9,7 +9,8 @@
 //!    steer OMP refuses keeps its text in the composer; Stop takes each
 //!    queued message back out of OMP's queue (`remove_queued_message`,
 //!    since OMP's `abort` keeps them and runs a kept steer), puts them back
-//!    in the composer, and aborts the turn once;
+//!    in the composer, and aborts the turn once, also when Stop comes while
+//!    a follow-up's call is still in flight (OMP answers it a second late);
 //! 3. a prompt OMP rejects returns the panel to idle with the reason;
 //! 4. an answer OMP got but the audit lost fails the turn with exactly one
 //!    abort (a second would meet the next recorded prompt and end the
@@ -28,8 +29,15 @@
 //!    killed and the new OMP opens the session, not Taken;
 //! 8. a turn of ours never shows as a run OMP started on its own, not even
 //!    between its `prompt_result` and `session_settled`;
-//! 9. Stop while our prompt still waits and OMP runs a run of its own
-//!    aborts OMP's run, and our prompt never reaches OMP.
+//! 9. a steer OMP takes after our turn's last step starts a run of its
+//!    own (OMP drains a queued steer); a Stop pressed before that run
+//!    starts leaves it shown as running, and a second Stop aborts it.
+//!
+//! The frames are OMP 18.6.1's, but fixtures 1, 3 and 4 are not recorded:
+//! their order (a `queue_update` before its command's response, `abort`'s
+//! response with no `queue_update`, the runs OMP starts on its own) is
+//! hand-ordered from OMP's RPC handlers, and the `fs_sleep`s only stretch
+//! a gap real OMP leaves short.
 //!
 //! Harness off: invoked with `--mode` (or `config`) this binary is fake-omp.
 
@@ -159,10 +167,8 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
         (Turn::Streaming, ""),
         "turn one still runs"
     );
-    wait(cx, &window, "the follow-up chip", |p| {
-        p.transcript()
-            .iter()
-            .any(|l| l.ends_with("queued: faster / two"))
+    wait(cx, &window, "OMP to have the follow-up", |_| {
+        ws.join("omp-got-two").exists()
     });
     set_prompt(cx, &window, "typed meanwhile");
     click(&mut vcx, "cedian-stop");
@@ -307,29 +313,32 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
     });
     assert_ready(cx, &window);
 
-    // 9. Stop while our prompt waits behind the parked OMP thread and OMP
-    // runs a run of its own (started after the subagent cancel): that run
-    // is aborted, and our prompt never goes out.
-    let hold = window
-        .update(cx, |panel, window, cx| {
-            let hold = panel.hold_omp();
-            panel.set_prompt("held", window, cx);
-            panel.submit(window, cx);
-            assert!(panel.prompt_queued(), "our prompt waits");
-            panel.cancel_subagent("none", cx);
-            hold
-        })
-        .unwrap();
-    wait(cx, &window, "OMP's own run while ours waits", |p| {
-        p.turn() == &Turn::Streaming
+    // 9. A steer OMP takes once our turn's last step is done starts a run
+    // of its own. Stop before that run starts sends nothing (no run, no
+    // queue the panel knows of); the run then shows as running, and the
+    // second Stop takes the steer back (OMP has delivered it) and aborts.
+    submit(cx, &window, "last");
+    wait(cx, &window, "turn last's step to end", |p| {
+        p.turn() == &Turn::Streaming && !p.prompt_open()
+    });
+    set_prompt(cx, &window, "kept");
+    click(&mut vcx, "cedian-steer");
+    wait(cx, &window, "the kept steer's chip", |p| {
+        p.transcript()
+            .iter()
+            .any(|l| l.ends_with("queued: kept / "))
     });
     click(&mut vcx, "cedian-stop");
-    wait(cx, &window, "OMP's own run to be aborted", |_| {
-        ws.join("own-run-aborted").exists()
+    assert_eq!(
+        window.update(cx, |p, _, _| p.turn().clone()).unwrap(),
+        Turn::Stopping
+    );
+    wait(cx, &window, "OMP's own run, shown as running", |p| {
+        p.turn() == &Turn::Streaming && p.omp_runs_unprompted()
     });
-    drop(hold);
-    wait(cx, &window, "our prompt dropped", |p| {
-        p.turn() == &Turn::Idle && !p.transcript().iter().any(|l| l == "User: held")
+    click(&mut vcx, "cedian-stop");
+    wait(cx, &window, "OMP's own run to be aborted", |p| {
+        ws.join("own-run-aborted").exists() && p.turn() == &Turn::Idle
     });
     assert_ready(cx, &window);
 }

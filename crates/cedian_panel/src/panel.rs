@@ -295,8 +295,8 @@ impl CedianPanel {
             .collect();
         for entry in self.cards_with_subagents(cards) {
             match entry {
-                Ok(card) => lines.push(card_line(&card)),
-                Err(row) => lines.push(subagent_line(row)),
+                Entry::Card(card) => lines.push(card_line(&card)),
+                Entry::Subagent(row) => lines.push(subagent_line(row)),
             }
         }
         lines
@@ -343,7 +343,16 @@ impl CedianPanel {
                 link.cancel_subagent(id.to_string());
                 "cancelling…"
             }
-            None => "OMP is not running",
+            None => {
+                let recorded = self
+                    .workspace_root(cx)
+                    .ok_or_else(|| "no folder is open".to_string())
+                    .and_then(|root| crate::omp_link::cancel_without_omp(&root, id));
+                if let Err(e) = recorded {
+                    self.audit_failed(e, cx);
+                }
+                "OMP is not running"
+            }
         };
         self.subagent_notes.insert(id.to_string(), note.to_string());
         cx.notify();
@@ -351,11 +360,16 @@ impl CedianPanel {
 
     /// Cards in order, each followed by its subagents; subagents whose card
     /// is not in the thread come last.
-    fn cards_with_subagents(&self, cards: Vec<ToolCard>) -> Vec<Result<ToolCard, &SubagentRow>> {
+    fn cards_with_subagents(&self, cards: Vec<ToolCard>) -> Vec<Entry<'_>> {
         let mut out = Vec::new();
         for card in &cards {
-            out.push(Ok(card.clone()));
-            out.extend(self.subagents.under(&card.call_id).into_iter().map(Err));
+            out.push(Entry::Card(card.clone()));
+            out.extend(
+                self.subagents
+                    .under(&card.call_id)
+                    .into_iter()
+                    .map(Entry::Subagent),
+            );
         }
         out.extend(
             self.subagents
@@ -366,7 +380,7 @@ impl CedianPanel {
                         .as_ref()
                         .is_some_and(|parent| cards.iter().any(|c| &c.call_id == parent))
                 })
-                .map(Err),
+                .map(Entry::Subagent),
         );
         out
     }
@@ -404,6 +418,12 @@ impl CedianPanel {
     #[cfg(any(test, feature = "test-support"))]
     pub fn prompt_queued(&self) -> bool {
         self.link.as_ref().is_some_and(OmpLink::prompt_queued)
+    }
+
+    /// Whether a prompt the panel sent is still in the link or in OMP.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn prompt_open(&self) -> bool {
+        self.link.as_ref().is_some_and(OmpLink::prompt_open)
     }
 
     /// Whether OMP runs a run no prompt of the panel's started.
@@ -929,6 +949,12 @@ impl CedianPanel {
             }
             LinkEvent::QueueRefused(e) => self.notice = Some(format!("OMP did not queue it: {e}")),
             LinkEvent::Restored(texts) => self.restore_to_composer(texts, window, cx),
+            LinkEvent::Delivered(texts) => {
+                self.notice = Some(format!(
+                    "already in the stopped turn, so not given back: {}",
+                    texts.join(" · ")
+                ))
+            }
             LinkEvent::SubagentSteered { id, result } => {
                 let note = match result {
                     Ok(()) => "steered".to_string(),
@@ -1007,6 +1033,7 @@ impl CedianPanel {
     fn stop(&mut self, reason: String, cx: &mut Context<Self>) {
         self.link = None;
         self.dialogs.clear();
+        self.subagents.apply(&RouterEvent::Disconnected);
         for (id, call) in std::mem::take(&mut self.calls) {
             self.release(&id, call, cx);
         }
@@ -1101,9 +1128,14 @@ impl CedianPanel {
                     self.import_when_ready(tool_call_id.clone(), cx);
                 }
             }
-            // Idle: OMP started a run of its own (a queued steer it drains);
-            // it shows as running so Stop can stop it.
-            RouterEvent::AgentStart if matches!(self.turn, Turn::Queued | Turn::Idle) => {
+            // OMP started a run of its own (a queued steer it drains): it
+            // shows as running so Stop can stop it, also while an earlier
+            // Stop still waits for OMP to settle.
+            RouterEvent::AgentStart
+                if matches!(self.turn, Turn::Queued | Turn::Idle)
+                    || (self.turn == Turn::Stopping
+                        && self.link.as_ref().is_some_and(OmpLink::runs_own)) =>
+            {
                 self.set_turn(Turn::Streaming)
             }
             RouterEvent::Settled => {
@@ -1793,14 +1825,14 @@ impl Render for CedianPanel {
             .collect();
         for entry in self.cards_with_subagents(cards) {
             rows.push(match entry {
-                Ok(card) => {
+                Entry::Card(card) => {
                     let selector = format!("cedian-tool-{}", card.call_id);
                     div()
                         .debug_selector(move || selector)
                         .child(Label::new(card_line(&card)).color(Color::Muted))
                         .into_any_element()
                 }
-                Err(row) => self.render_subagent(row, cx),
+                Entry::Subagent(row) => self.render_subagent(row, cx),
             });
         }
         let connection = match &self.connection {
@@ -3192,6 +3224,12 @@ mod tests {
         });
         eprintln!("tool_call_id={call_id}: OMP edit imported and reverted by one undo");
     }
+}
+
+/// A tool card, or a subagent shown under the card that started it.
+enum Entry<'a> {
+    Card(ToolCard),
+    Subagent(&'a SubagentRow),
 }
 
 fn card_line(card: &ToolCard) -> String {

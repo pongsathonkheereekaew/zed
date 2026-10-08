@@ -16,13 +16,15 @@
 //!    ADR-0033 brief is refused naming the missing fields, with no tree;
 //!    one with it gets a tree, a registry row and its stored brief;
 //! 7. Restart while a subagent runs: the old OMP's rows, steer boxes and
-//!    notes go with it (`subagents_2.jsonl` is the new OMP).
+//!    notes go with it (`subagents_2.jsonl` is the new OMP);
+//! 8. OMP is killed while a subagent runs: the row ends with it and offers
+//!    no Steer or Cancel, and a Cancel made then is still an audit row.
 //!
 //! Harness off: invoked with `--mode` (or `config`) this binary is fake-omp.
 
 #![allow(
     clippy::disallowed_methods,
-    reason = "test setup runs git to make the workspace a repository"
+    reason = "test setup runs git to make the workspace a repository and kills OMP with a real signal"
 )]
 
 use cedian_omp::SubagentStatus;
@@ -267,6 +269,42 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
         "the old OMP's subagents went"
     );
     assert!(rendered(&mut vcx, "cedian-subagent-sa-3").is_none());
+
+    // 8. OMP dies with a subagent running: the row ends with it.
+    submit(cx, &window, "after restart");
+    wait(cx, &window, "a running subagent", |p| {
+        statuses(p) == [("sa-4", SubagentStatus::Running)]
+    });
+    assert!(rendered(&mut vcx, "cedian-subagent-sa-4-cancel").is_some());
+    let pid = window.update(cx, |p, _, _| p.omp_pid()).unwrap().unwrap();
+    let killed = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    wait(cx, &window, "OMP gone and its subagent ended", |p| {
+        matches!(p.connection(), Connection::Stopped(_))
+            && statuses(p) == [("sa-4", SubagentStatus::Aborted)]
+    });
+    for control in ["cedian-subagent-sa-4-cancel", "cedian-subagent-sa-4-steer"] {
+        assert!(
+            rendered(&mut vcx, control).is_none(),
+            "{control} after OMP died"
+        );
+    }
+    window
+        .update(cx, |p, _, cx| p.cancel_subagent("sa-4", cx))
+        .unwrap();
+    let audited = std::fs::read_to_string(state.join("audit.jsonl"))
+        .unwrap()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .any(|row| {
+            row["item"]["tool"] == "cancel_subagent"
+                && row["item"]["command"] == "sa-4"
+                && row["item"]["error"] == "OMP is not running"
+        });
+    assert!(audited, "a Cancel with OMP gone is an audit row");
 }
 
 fn row<'a>(p: &'a CedianPanel, id: &str) -> &'a cedian_agent_ui::SubagentRow {

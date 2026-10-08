@@ -1040,6 +1040,7 @@ impl CedianPanel {
                             this.review.import_done(&buffer, &tool_call_id, cx);
                         }
                     }
+                    this.still_writing(&buffer, cx);
                     this.watch_reviewed_buffers(cx);
                     this.after_review_change(cx);
                 })
@@ -1049,6 +1050,21 @@ impl CedianPanel {
                 .ok();
         })
         .detach();
+    }
+
+    /// An outcome may have just created the file's review; the calls still
+    /// in flight that marked the buffer are writing it, and the review
+    /// only learns of a call at its observe, so they are told again.
+    fn still_writing(&mut self, buffer: &Entity<Buffer>, cx: &mut Context<Self>) {
+        let ids: Vec<String> = self
+            .calls
+            .iter()
+            .filter(|(_, c)| c.marks.iter().any(|(b, _)| b == buffer))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            self.review.observe(buffer, &id, cx);
+        }
     }
 
     /// A call that imports nothing: its marked buffers are the user's again.
@@ -2482,6 +2498,42 @@ mod tests {
             assert_eq!(b.text(), "USER one\ntwo\n");
             assert!(b.is_dirty());
         });
+    }
+
+    /// Two calls start on a file with no review yet and the short one ends
+    /// first: its outcome creates the file's review, which must know the
+    /// long call is still writing it, so Reject is refused until that one
+    /// ends.
+    #[gpui::test]
+    async fn a_review_created_mid_call_knows_the_call_still_writing_it(cx: &mut TestAppContext) {
+        let (f, buffer) = fixture(cx).await;
+        tool_start(&f, cx, "c1", &["notes.txt"]);
+        tool_start(&f, cx, "c2", &["notes.txt"]);
+        omp_writes(&f, "/ws/notes.txt", "alpha\nBETA\ngamma\n").await;
+        tool_end(&f, cx, "c2");
+        assert_eq!(hunks(&f, cx)[0].1, HunkStatus::Pending);
+        let (path, key) = first_hunk(&f, cx);
+        f.window
+            .update(cx, |panel, _, cx| panel.reject_hunk(&path, &key, cx))
+            .unwrap();
+        assert_eq!(
+            notice(&f, cx).as_deref(),
+            Some("OMP is writing ws/notes.txt; try again when the call ends")
+        );
+        assert_eq!(
+            buffer.read_with(cx, |b, _| b.text()),
+            "alpha\nBETA\ngamma\n",
+            "nothing was put back"
+        );
+        tool_end(&f, cx, "c1");
+        f.window
+            .update(cx, |panel, _, cx| {
+                panel.notice = None;
+                panel.reject_hunk(&path, &key, cx);
+                assert_eq!(panel.notice(), None, "the reject went through");
+            })
+            .unwrap();
+        assert_eq!(buffer.read_with(cx, |b, _| b.text()), ORIGINAL);
     }
 
     #[gpui::test]

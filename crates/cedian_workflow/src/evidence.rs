@@ -195,12 +195,19 @@ impl Evidence {
         if let Some(reason) = &self.born_stale {
             return Some(reason.clone());
         }
-        if let (Some(at), Some(now)) = (self.frame_seq, current.frame_seq) {
-            if at < now {
+        match (self.frame_seq, current.frame_seq) {
+            (Some(at), Some(now)) if at < now => {
                 return Some(format!(
                     "stale-frame: captured at frame {at}, the browser is at {now}"
                 ));
             }
+            // The captured page closed with the browser.
+            (Some(at), None) => {
+                return Some(format!(
+                    "stale-frame: captured at frame {at}, the browser is not running"
+                ));
+            }
+            _ => {}
         }
         match &self.code_state {
             None => Some("no code state recorded".to_string()),
@@ -289,7 +296,9 @@ mod tests {
         ws.frame_seq = Some(4);
         let reason = e.stale_reason(&ws).unwrap();
         assert!(reason.starts_with("stale-frame"), "{reason}");
+        // The captured page is gone with the browser: never a pass.
         ws.frame_seq = None;
-        assert_eq!(e.stale_reason(&ws), None, "no browser, no frame check");
+        let reason = e.stale_reason(&ws).unwrap_or_default();
+        assert!(reason.starts_with("stale-frame"), "{reason:?}");
     }
 }

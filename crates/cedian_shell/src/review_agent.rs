@@ -27,6 +27,9 @@ pub struct ReviewTask {
     pub diffs: Vec<FileDiff>,
     pub baseline: HashMap<PathBuf, String>,
     pub editors: Vec<String>,
+    /// Some reviewed change has no known model: the review cannot be
+    /// independent (ADR-0039), so it is inconclusive.
+    pub editors_unknown: bool,
 }
 
 /// Where a review runs: the workspace, its state dir (ADR-0044) and the
@@ -297,6 +300,7 @@ pub fn run_review(
         session_dir,
     } = place;
     let (workdir, state_dir) = (workdir.as_path(), state_dir.as_path());
+    let _claim = claim_review(state_dir)?;
     let diff = render_diff(&task.diffs, &task.baseline);
     if diff.is_empty() {
         return Err("nothing to review: no open hunks in this task".to_string());
@@ -305,8 +309,7 @@ pub fn run_review(
     if !found.is_empty() {
         return refuse_review(state_dir, &found, requester);
     }
-    let mut editors = task.editors;
-    editors.extend(requester.implementer_models.iter().cloned());
+    let editors = implementers(&task, &requester.implementer_models);
 
     let layout = ReviewerLayout {
         dir: reviewer_dir(session_dir, workdir)?,
@@ -406,7 +409,7 @@ pub fn run_review(
     let attribution = ReviewAttribution {
         role: role.to_string(),
         reviewer: reviewer_models,
-        implementer: editors.into_iter().collect(),
+        implementer: editors,
     };
     let mut findings = review_findings::load(state_dir)?;
     for f in findings.findings.iter_mut().skip(before) {
@@ -446,6 +449,39 @@ pub fn run_review(
         reply.push_str(&format!("\nnote: {note}"));
     }
     Ok(reply)
+}
+
+/// One review at a time per state dir, across processes: a second would
+/// reset the first's run dir and interleave `findings.json`. Held until the
+/// returned file drops.
+fn claim_review(state_dir: &Path) -> Result<std::fs::File, String> {
+    std::fs::create_dir_all(state_dir).map_err(|e| format!("state dir: {e}"))?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(state_dir.join("review.lock"))
+        .map_err(|e| format!("review lock: {e}"))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            Err("a review is already running; ask again when it ends".to_string())
+        }
+        Err(std::fs::TryLockError::Error(e)) => Err(format!("review lock: {e}")),
+    }
+}
+
+/// The models a review must be independent of: the task's editors and the
+/// requester's, or none (unknown) when some reviewed change has no known
+/// model.
+fn implementers(task: &ReviewTask, requester: &[String]) -> Vec<String> {
+    if task.editors_unknown {
+        return Vec::new();
+    }
+    let mut models: Vec<String> = task.editors.iter().chain(requester).cloned().collect();
+    models.sort();
+    models.dedup();
+    models
 }
 
 fn or_unknown(models: &[String]) -> String {
@@ -515,6 +551,42 @@ pub fn review_request_tool(
 mod tests {
     use super::*;
     use cedian_review::Hunk;
+
+    #[test]
+    fn a_second_review_on_one_state_dir_is_refused() {
+        let dir = std::env::temp_dir().join(format!("cedian-review-lock-{}", std::process::id()));
+        let first = claim_review(&dir).unwrap();
+        let second = claim_review(&dir).unwrap_err();
+        assert!(second.contains("already running"), "{second}");
+        drop(first);
+        // Another test's fork may hold the descriptor until its exec.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while let Err(e) = claim_review(&dir) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "free again once the first ends: {e}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unknown_editor_leaves_the_implementers_unknown() {
+        let mut task = ReviewTask {
+            editors: vec!["a/one".to_string()],
+            ..ReviewTask::default()
+        };
+        assert_eq!(
+            implementers(&task, &["b/two".to_string()]),
+            vec!["a/one".to_string(), "b/two".to_string()]
+        );
+        task.editors_unknown = true;
+        assert!(
+            implementers(&task, &["b/two".to_string()]).is_empty(),
+            "a change whose model is unknown: not independent of anyone"
+        );
+    }
 
     #[test]
     fn diff_lists_open_hunks_with_before_and_after_lines() {

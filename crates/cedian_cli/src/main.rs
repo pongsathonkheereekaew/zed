@@ -754,6 +754,7 @@ fn read_review_task(workdir: &Path) -> Result<review_agent::ReviewTask, String> 
             .map(|(key, text)| (PathBuf::from(key), text.clone()))
             .collect(),
         editors: store.models.into_iter().collect(),
+        editors_unknown: false,
     })
 }
 

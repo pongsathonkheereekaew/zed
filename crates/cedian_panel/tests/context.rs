@@ -120,7 +120,7 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
             let handle = cx.entity().downgrade();
             cx.new(|cx| {
                 let mut panel = CedianPanel::new(project.clone(), window, cx);
-                panel.set_workspace(handle);
+                panel.set_workspace(handle, cx);
                 panel
             })
         })

@@ -193,6 +193,9 @@ pub struct AgentTxn {
     /// call's text back (the whole transaction is cedian's, so its own
     /// edited ranges would attribute nothing).
     pub restored: Option<Range<Anchor>>,
+    /// The models that had answered in OMP when the call was imported
+    /// (ADR-0039: none of them may review it); empty when unknown.
+    pub models: Vec<String>,
 }
 
 /// One reviewable change: `old` in baseline offsets, `new` in current ones,
@@ -777,6 +780,7 @@ impl TaskReview {
         tool_call_id: &str,
         transaction: TransactionId,
         baseline: text::BufferSnapshot,
+        models: Vec<String>,
         cx: &App,
     ) {
         let turn = self.current_turn();
@@ -825,6 +829,7 @@ impl TaskReview {
             turn,
             transaction,
             restored: None,
+            models,
         });
         file.last_seen = buffer.version();
         file.stale_import = None;
@@ -1064,7 +1069,7 @@ impl TaskReview {
                     reverted += plan.edits.len();
                     // The text put back is the earlier turns' work: credit
                     // each restored range to their calls that had the hunk.
-                    let earlier: Vec<(Range<usize>, usize, Vec<(String, u32)>)> = plan
+                    let earlier: Vec<(Range<usize>, usize, Vec<(String, u32, Vec<String>)>)> = plan
                         .edits
                         .iter()
                         .map(|(range, text)| {
@@ -1078,7 +1083,7 @@ impl TaskReview {
                                         .filter(|t| {
                                             t.turn < n && h.tool_call_ids.contains(&t.tool_call_id)
                                         })
-                                        .map(|t| (t.tool_call_id.clone(), t.turn))
+                                        .map(|t| (t.tool_call_id.clone(), t.turn, t.models.clone()))
                                 })
                                 .collect();
                             (range.clone(), text.len(), calls)
@@ -1096,12 +1101,13 @@ impl TaskReview {
                         let restored = snapshot.anchor_at(start, text::Bias::Right)
                             ..snapshot.anchor_at(start + len, text::Bias::Left);
                         delta += len as i64 - range.len() as i64;
-                        for (tool_call_id, turn) in calls {
+                        for (tool_call_id, turn, models) in calls {
                             file.agent_txns.push(AgentTxn {
                                 tool_call_id,
                                 turn,
                                 transaction: txn,
                                 restored: Some(restored.clone()),
+                                models,
                             });
                         }
                     }
@@ -1155,9 +1161,27 @@ impl TaskReview {
                 statuses: file.hunks.iter().map(|h| h.status).collect(),
                 snapshot: buffer.text(),
             });
+            for hunk in file
+                .hunks
+                .iter()
+                .filter(|h| !matches!(h.status, HunkStatus::Accepted | HunkStatus::Rejected))
+            {
+                let txns: Vec<&AgentTxn> = file
+                    .agent_txns
+                    .iter()
+                    .filter(|t| hunk.tool_call_ids.contains(&t.tool_call_id))
+                    .collect();
+                if txns.is_empty() || txns.iter().any(|t| t.models.is_empty()) {
+                    task.editors_unknown = true;
+                }
+                task.editors
+                    .extend(txns.iter().flat_map(|t| t.models.iter().cloned()));
+            }
             task.baseline
                 .insert(PathBuf::from(key), file.baseline.text());
         }
+        task.editors.sort();
+        task.editors.dedup();
         task
     }
 
@@ -1290,6 +1314,18 @@ mod tests {
     /// OMP's edit tool writes the disk; the panel's ToolStart/ToolEnd path
     /// imports it as one transaction attributed to `call`.
     async fn agent_writes(f: &mut Fixture, call: &str, text: &str, cx: &mut TestAppContext) {
+        agent_writes_as(f, call, text, &["test/model"], cx).await
+    }
+
+    /// `agent_writes` while `models` had answered in OMP.
+    async fn agent_writes_as(
+        f: &mut Fixture,
+        call: &str,
+        text: &str,
+        models: &[&str],
+        cx: &mut TestAppContext,
+    ) {
+        let models: Vec<String> = models.iter().map(|m| m.to_string()).collect();
         cx.update(|cx| f.review.observe(&f.buffer, call, cx));
         let mark = f.buffer.update(cx, |b, cx| import::begin(b, cx));
         let baseline = mark.start().clone();
@@ -1301,9 +1337,10 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
         match outcome {
-            ImportOutcome::Imported(txn) => {
-                cx.update(|cx| f.review.agent_edited(&f.buffer, call, txn, baseline, cx))
-            }
+            ImportOutcome::Imported(txn) => cx.update(|cx| {
+                f.review
+                    .agent_edited(&f.buffer, call, txn, baseline, models, cx)
+            }),
             ImportOutcome::Stale => cx.update(|cx| f.review.import_refused(&f.buffer, call, cx)),
             ImportOutcome::Unchanged => panic!("the write changed nothing"),
         }
@@ -1329,6 +1366,22 @@ mod tests {
             .iter()
             .map(|h| h.status)
             .collect()
+    }
+
+    /// ADR-0039 across an OMP restart: every model that wrote a hunk under
+    /// review is an editor, and a hunk whose model is unknown makes the
+    /// editors unknown (the review is then inconclusive).
+    #[gpui::test]
+    async fn every_model_that_wrote_a_reviewed_hunk_is_an_editor(cx: &mut TestAppContext) {
+        let mut f = setup(cx).await;
+        agent_writes_as(&mut f, "c1", "ALPHA\nbeta\ngamma\n", &["a/one"], cx).await;
+        agent_writes_as(&mut f, "c2", "ALPHA\nbeta\nGAMMA\n", &["b/two"], cx).await;
+        let task = cx.update(|cx| f.review.review_task(cx));
+        assert_eq!(task.editors, vec!["a/one".to_string(), "b/two".to_string()]);
+        assert!(!task.editors_unknown);
+        agent_writes_as(&mut f, "c3", "ALPHA\nBETA\nGAMMA\n", &[], cx).await;
+        let task = cx.update(|cx| f.review.review_task(cx));
+        assert!(task.editors_unknown, "a hunk with no known model");
     }
 
     #[gpui::test]
@@ -1712,7 +1765,14 @@ mod tests {
         let txn = f.review.files()[0].agent_txns()[0].transaction;
         let baseline = f.review.files()[0].baseline.clone();
         cx.update(|cx| {
-            fresh.agent_edited(&f.buffer, "c1", txn, baseline, cx);
+            fresh.agent_edited(
+                &f.buffer,
+                "c1",
+                txn,
+                baseline,
+                vec!["test/model".to_string()],
+                cx,
+            );
             fresh.restore_statuses(records, cx);
         });
         assert_eq!(
@@ -1853,7 +1913,14 @@ mod tests {
         };
         cx.update(|cx| {
             f.review.rebuild(cx);
-            f.review.agent_edited(&f.buffer, "c1", txn, baseline, cx);
+            f.review.agent_edited(
+                &f.buffer,
+                "c1",
+                txn,
+                baseline,
+                vec!["test/model".to_string()],
+                cx,
+            );
         });
         assert_eq!(statuses(&f), vec![HunkStatus::Pending, HunkStatus::Pending]);
     }

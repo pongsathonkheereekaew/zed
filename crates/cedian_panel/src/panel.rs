@@ -30,7 +30,7 @@ use cedian_agent_ui::{SubagentRow, SubagentTree, ToolCard};
 use cedian_omp::{RouterEvent, SubagentStatus, TextBefore, UserAnswer};
 use cedian_review::{AttachedFinding, FindingSeverity, HunkKey, HunkStatus};
 use cedian_workflow::{
-    CurrentState, Evidence, EvidenceKind, Gate, GateResult, Outcome, Provenance, WorkflowChannel,
+    CurrentState, Evidence, EvidenceKind, Gate, GateResult, Provenance, WorkflowChannel,
     WorkflowStatus,
 };
 use cedian_workspace::{capture_ambient, render_snapshot};
@@ -249,6 +249,10 @@ pub struct CedianPanel {
     /// The runtime's router once OMP runs: the models that implemented.
     router: Option<Arc<std::sync::OnceLock<Arc<cedian_omp::EventRouter>>>>,
     _review_run: Option<Task<()>>,
+    /// The settings OMP was launched with: the person's reviews use them too.
+    launch_settings: Option<cedian_shell::Settings>,
+    /// New editors get the open findings' blocks at once.
+    _workspace_items: Option<gpui::Subscription>,
     /// The blocks open findings put under their hunk in open editors.
     finding_blocks: Vec<FindingBlock>,
 }
@@ -268,7 +272,7 @@ impl CedianPanel {
                 let handle = cx.entity().downgrade();
                 cx.new(|cx| {
                     let mut panel = Self::new(project, window, cx);
-                    panel.set_workspace(handle);
+                    panel.set_workspace(handle, cx);
                     panel
                 })
             })
@@ -346,6 +350,8 @@ impl CedianPanel {
             dismissing: None,
             router: None,
             _review_run: None,
+            launch_settings: None,
+            _workspace_items: None,
             finding_blocks: Vec::new(),
         };
         this._worktree_changes = Some(cx.subscribe(&this.project, |this, project, event, cx| {
@@ -360,7 +366,14 @@ impl CedianPanel {
     }
 
     /// The workspace whose active editor and selection OMP is told about.
-    pub fn set_workspace(&mut self, workspace: WeakEntity<Workspace>) {
+    pub fn set_workspace(&mut self, workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) {
+        self._workspace_items = workspace.upgrade().map(|w| {
+            cx.subscribe(&w, |this, _, event: &workspace::Event, cx| {
+                if matches!(event, workspace::Event::ItemAdded { .. }) {
+                    this.sync_finding_blocks(cx);
+                }
+            })
+        });
         self.workspace = Some(workspace);
     }
 
@@ -800,12 +813,29 @@ impl CedianPanel {
         cx.notify();
     }
 
+    /// The models that answered in the OMP running now.
+    fn answered_models(&self) -> Vec<String> {
+        self.router
+            .as_ref()
+            .and_then(|cell| cell.get())
+            .map(|router| router.answered_models())
+            .unwrap_or_default()
+    }
+
     /// A person asks for a review of the task now (ADR-0055): the same
     /// reviewer OMP's `cedian_review_request` runs, its evidence not
     /// attributed to any call.
     pub fn request_review(&mut self, focus: String, cx: &mut Context<Self>) {
-        let (Some(root), Some(channel)) = (self.workspace_root(cx), self.workflow_channel.clone())
-        else {
+        if self._review_run.is_some() {
+            self.notice = Some("a review is already running".to_string());
+            cx.notify();
+            return;
+        }
+        let (Some(root), Some(channel), Some(settings)) = (
+            self.workspace_root(cx),
+            self.workflow_channel.clone(),
+            self.launch_settings.clone(),
+        ) else {
             self.notice = Some("start OMP before asking for a review".to_string());
             cx.notify();
             return;
@@ -819,18 +849,12 @@ impl CedianPanel {
             }
         };
         let read = Arc::clone(&self.review_reader);
-        let models = self
-            .router
-            .as_ref()
-            .and_then(|cell| cell.get())
-            .map(|router| router.answered_models())
-            .unwrap_or_default();
+        let models = self.answered_models();
         // Its own thread: the review blocks for minutes, and its reads of
         // the task cross back to this thread.
         let (done, run) = futures::channel::oneshot::channel();
         std::thread::spawn(move || {
             let review = || {
-                let settings = cedian_shell::resolve_settings(&root).map_err(|e| e.to_string())?;
                 let task = read()?;
                 let diffs: cedian_shell::review_findings::TaskDiffs =
                     Arc::new(move || read().map(|task| task.diffs));
@@ -855,6 +879,7 @@ impl CedianPanel {
                 .await
                 .unwrap_or_else(|_| Err("the review thread ended".to_string()));
             this.update(cx, |this, cx| {
+                this._review_run = None;
                 this.notice = Some(match reply {
                     Ok(reply) => reply,
                     Err(e) => format!("review failed: {e}"),
@@ -1004,6 +1029,7 @@ impl CedianPanel {
         self.workflow_channel = Some(Arc::clone(&spec.workflow));
         spec.review.set(Arc::clone(&self.review_reader)).ok();
         self.router = Some(Arc::clone(&spec.router));
+        self.launch_settings = Some(spec.settings.clone());
         self.load_findings(cx);
         let (read_tx, read_rx) = mpsc::unbounded::<context::Read>();
         spec.uris.push(context::scheme(read_tx));
@@ -1136,7 +1162,7 @@ impl CedianPanel {
                                 .evidence(
                                     &format!("browser-frame-{}", capture.seq),
                                     &[BROWSER_GATE],
-                                    Outcome::Pass,
+                                    capture.outcome(),
                                 )
                                 .with_code_state(code),
                         );
@@ -1159,15 +1185,15 @@ impl CedianPanel {
         else {
             return;
         };
+        let ended_at = host.state().seq;
         let task = cx.background_spawn(async move {
             let gates = channel.gates_taking(EvidenceKind::Browser)?;
             if gates.is_empty() {
                 return Ok(None);
             }
             let gates: Vec<&str> = gates.iter().map(String::as_str).collect();
-            let capture = host.capture()?;
-            let mut item = capture.evidence("", &gates, Outcome::from_ok(!is_error));
-            item.kind = EvidenceKind::Browser;
+            let mut item =
+                crate::browser::call_evidence(host.capture(), ended_at, is_error, &gates)?;
             item.provenance = Provenance::Attributed {
                 task_id: TASK_ID.to_string(),
                 tool_call_id: call.clone(),
@@ -2473,13 +2499,17 @@ impl CedianPanel {
                 let outcome = import::finish(buffer.clone(), mark.clone(), cx).await;
                 this.update(cx, |this, cx| {
                     match outcome {
-                        Ok(ImportOutcome::Imported(transaction)) => this.review.agent_edited(
-                            &buffer,
-                            &tool_call_id,
-                            transaction,
-                            mark.start().clone(),
-                            cx,
-                        ),
+                        Ok(ImportOutcome::Imported(transaction)) => {
+                            let models = this.answered_models();
+                            this.review.agent_edited(
+                                &buffer,
+                                &tool_call_id,
+                                transaction,
+                                mark.start().clone(),
+                                models,
+                                cx,
+                            )
+                        }
                         Ok(ImportOutcome::Stale) => {
                             this.review.import_refused(&buffer, &tool_call_id, cx)
                         }
@@ -2630,11 +2660,11 @@ impl CedianPanel {
                         div()
                             .debug_selector(|| "cedian-review-request".to_string())
                             .child(
-                                Button::new("cedian-review-request", "Ask for review").on_click(
-                                    cx.listener(|this, _, _, cx| {
+                                Button::new("cedian-review-request", "Ask for review")
+                                    .disabled(self._review_run.is_some())
+                                    .on_click(cx.listener(|this, _, _, cx| {
                                         this.request_review(String::new(), cx)
-                                    }),
-                                ),
+                                    })),
                             ),
                     )
                     .child(
@@ -2710,6 +2740,34 @@ impl CedianPanel {
                 )
             })
             .collect();
+        let on_hunks: std::collections::HashSet<&str> = self
+            .findings
+            .iter()
+            .filter(|f| {
+                files.iter().any(|(_, key, _, hunks)| {
+                    Some(&f.finding.path) == key.as_ref()
+                        && hunks.iter().any(|h| f.hunk_text == h.key.after_text)
+                })
+            })
+            .map(|f| f.id.as_str())
+            .collect();
+        let orphans: Vec<AttachedFinding> = self
+            .findings
+            .iter()
+            .filter(|f| f.dismissed.is_none() && !on_hunks.contains(f.id.as_str()))
+            .cloned()
+            .collect();
+        if !orphans.is_empty() {
+            let mut section = v_flex().gap_1().child(
+                Label::new("Findings whose change is no longer in the review")
+                    .size(LabelSize::Small)
+                    .color(Color::Warning),
+            );
+            for finding in &orphans {
+                section = section.child(self.render_finding(finding, cx));
+            }
+            body = body.child(section);
+        }
         for (path, reason) in self.review.unreviewable().to_vec() {
             let selector = format!("cedian-unreviewed-{}", path.display());
             body = body.child(

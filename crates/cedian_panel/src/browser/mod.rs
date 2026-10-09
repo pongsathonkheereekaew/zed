@@ -98,6 +98,15 @@ pub struct Capture {
 }
 
 impl Capture {
+    /// A pass only when a frame was really captured.
+    pub fn outcome(&self) -> Outcome {
+        if self.png.is_empty() {
+            Outcome::Inconclusive
+        } else {
+            Outcome::Pass
+        }
+    }
+
     /// Evidence for `gates` from this capture, bound to its frame.
     pub fn evidence(&self, id: &str, gates: &[&str], outcome: Outcome) -> Evidence {
         let mut evidence = Evidence::unattributed(
@@ -116,6 +125,48 @@ impl Capture {
         }
         evidence
     }
+}
+
+/// Evidence for the gates `gates` from OMP's `browser` call that ended at
+/// frame `ended_at`, out of the capture taken after it.
+pub fn call_evidence(
+    capture: Result<Capture, String>,
+    ended_at: u64,
+    is_error: bool,
+    gates: &[&str],
+) -> Result<Evidence, String> {
+    let mut item = match capture {
+        Ok(capture) => {
+            let outcome = if is_error {
+                Outcome::Fail
+            } else {
+                capture.outcome()
+            };
+            let mut item = capture.evidence("", gates, outcome);
+            if capture.seq > ended_at && item.born_stale.is_none() {
+                item.born_stale = Some(format!(
+                    "stale-frame: frame {} was captured after a later navigation; the call \
+                     ended at frame {ended_at}",
+                    capture.seq
+                ));
+            }
+            item
+        }
+        // No frame to judge: never a pass.
+        Err(e) => Evidence::unattributed(
+            "",
+            EvidenceKind::Browser,
+            gates,
+            format!("no capture: {e}"),
+            if is_error {
+                Outcome::Fail
+            } else {
+                Outcome::Inconclusive
+            },
+        ),
+    };
+    item.kind = EvidenceKind::Browser;
+    Ok(item)
 }
 
 /// What the panel shows.
@@ -199,9 +250,9 @@ impl BrowserHost {
         self.shared.start().map(|_| ())
     }
 
-    /// Capture the page: screenshot, DOM, console and network.
+    /// Capture the page: screenshot, DOM, console and network. A browser
+    /// that is not running is not started: its page is gone.
     pub fn capture(&self) -> Result<Capture, String> {
-        self.shared.start()?;
         let captures = self
             .shared
             .running
@@ -388,5 +439,53 @@ impl Shared {
 
     fn closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn capture(seq: u64, png: &[u8]) -> Capture {
+        Capture {
+            frame_id: "F1".to_string(),
+            seq,
+            png: Arc::new(png.to_vec()),
+            url: "https://a.test/".to_string(),
+            title: String::new(),
+            dom: String::new(),
+            console: Vec::new(),
+            network: Vec::new(),
+            moved: false,
+        }
+    }
+
+    fn outcome(item: &Result<Evidence, String>) -> Option<Outcome> {
+        item.as_ref().ok().map(|e| e.outcome)
+    }
+
+    #[test]
+    fn only_a_clean_call_with_a_frame_passes() {
+        let ok = call_evidence(Ok(capture(3, b"png")), 3, false, &["ui"]);
+        assert_eq!(outcome(&ok), Some(Outcome::Pass));
+        assert_eq!(ok.unwrap().born_stale, None);
+        let errored = call_evidence(Ok(capture(3, b"png")), 3, true, &["ui"]);
+        assert_eq!(outcome(&errored), Some(Outcome::Fail), "the call errored");
+        let blank = call_evidence(Ok(capture(3, b"")), 3, false, &["ui"]);
+        assert_eq!(outcome(&blank), Some(Outcome::Inconclusive), "no frame");
+        let failed = call_evidence(Err("closed".to_string()), 3, false, &["ui"]);
+        assert_eq!(
+            outcome(&failed),
+            Some(Outcome::Inconclusive),
+            "a failed capture is evidence that never passes: {failed:?}"
+        );
+    }
+
+    #[test]
+    fn a_capture_after_a_later_navigation_is_born_stale() {
+        let late = call_evidence(Ok(capture(5, b"png")), 3, false, &["ui"]).unwrap();
+        assert_eq!(late.frame_seq, Some(5), "bound to the frame it shows");
+        let reason = late.born_stale.unwrap_or_default();
+        assert!(reason.starts_with("stale-frame"), "{reason:?}");
     }
 }

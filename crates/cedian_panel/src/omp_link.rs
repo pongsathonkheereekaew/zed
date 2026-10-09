@@ -127,6 +127,8 @@ pub struct LaunchSpec {
     /// The panel's reader of the task's review once it is set: the
     /// reviewer reads its diffs from Zed's buffers (ADR-0055).
     pub review: Arc<OnceLock<ReviewReader>>,
+    /// The settings resolved for this launch; every review of it uses them.
+    pub settings: cedian_shell::Settings,
 }
 
 /// Reads the task's review on the app thread. Never call it there.
@@ -226,6 +228,7 @@ impl LaunchSpec {
             browser,
             workflow: channel,
             review,
+            settings,
         })
     }
 }
@@ -1684,6 +1687,7 @@ mod tests {
                 cedian_workflow::CurrentState::default,
             ),
             review: Arc::default(),
+            settings: cedian_shell::Settings::default(),
         };
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         let link = OmpLink::start(spec(), tx, None);

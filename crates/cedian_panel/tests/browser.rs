@@ -88,6 +88,9 @@ fn main() {
     run("closing_the_captured_tab_stales_a_capture", || {
         closing_the_captured_tab_stales_a_capture(&root)
     });
+    run("a_capture_does_not_relaunch_the_browser", || {
+        a_capture_does_not_relaunch_the_browser(&root)
+    });
     run("closing_now_closes_the_browser_before_returning", || {
         closing_now_closes_the_browser_before_returning(&root)
     });
@@ -330,6 +333,7 @@ fn first_connection_starts_the_browser(root: &std::path::Path) {
 
 fn frames_are_bound_to_the_browser(root: &std::path::Path) {
     let host = BrowserHost::open(root.join("frames-profile"), exe(), || {}).unwrap();
+    host.start().unwrap();
     let a = host.capture().unwrap();
     assert_eq!(a.png.as_slice(), fake::PNG, "the screenshot");
     assert_eq!(a.frame_id, "F1");
@@ -556,6 +560,24 @@ fn closing_now_closes_the_browser_before_returning(root: &std::path::Path) {
     assert!(!alive(&pid), "the browser is gone when close_now returns");
     assert!(!host.state().running);
     assert!(host.start().is_err(), "a closed host does not relaunch");
+}
+
+/// A capture after OMP's call must show the page that call left: when the
+/// browser has gone, it fails instead of starting a fresh one.
+#[allow(clippy::disallowed_methods, reason = "a test probe")]
+fn a_capture_does_not_relaunch_the_browser(root: &std::path::Path) {
+    let profile = root.join("gone-profile");
+    let host = BrowserHost::open(profile.clone(), exe(), || {}).unwrap();
+    host.start().unwrap();
+    let pid = std::fs::read_to_string(profile.join("fake.pid")).unwrap();
+    std::process::Command::new("kill")
+        .args(["-9", pid.trim()])
+        .status()
+        .unwrap();
+    wait_until("the browser is gone", || !host.state().running);
+    let refused = host.capture().map(|c| c.seq).unwrap_err();
+    assert!(refused.contains("not running"), "{refused}");
+    assert!(!host.state().running, "the capture started no browser");
 }
 
 fn list_ws(host: &BrowserHost, id: &str) -> String {

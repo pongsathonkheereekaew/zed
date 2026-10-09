@@ -24,6 +24,11 @@
 //! not carry it); the block goes when the hunk's text changes, comes back
 //! with it, and goes when the finding is dismissed.
 //!
+//! Fix round: a second review asked for while one runs is refused; the
+//! review uses the launch's settings (cedian.toml is broken after spawn);
+//! notes.txt is opened only after the review and gets its block at once;
+//! a blocker whose hunk changed keeps a Dismiss in Review Changes.
+//!
 //! Harness off: invoked with `--mode` (or `config`) this binary is fake-omp.
 
 use cedian_panel::{CedianPanel, Connection, Turn};
@@ -141,23 +146,21 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
         .unwrap();
     assert_eq!(hunks, vec!["BETA\n".to_string()]);
 
-    // U9j: notes.txt is open in an editor of the person's workspace.
+    // U9j: the person's workspace; notes.txt is opened in it only after
+    // the review.
     let buffer = window
         .update(cx, |p, _, _| p.review().files()[0].buffer().clone())
         .unwrap();
     let workspace_window =
         cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
     let workspace_handle = workspace_window
-        .update(cx, |workspace, window, cx| {
-            let editor =
-                cx.new(|cx| Editor::for_buffer(buffer.clone(), Some(project.clone()), window, cx));
-            workspace.add_item_to_active_pane(Box::new(editor), None, true, window, cx);
-            cx.entity().downgrade()
-        })
+        .update(cx, |_, _, cx| cx.entity().downgrade())
         .unwrap();
     window
-        .update(cx, |p, _, _| p.set_workspace(workspace_handle))
+        .update(cx, |p, _, cx| p.set_workspace(workspace_handle, cx))
         .unwrap();
+    // A review uses the settings OMP was launched with, not cedian.toml now.
+    std::fs::write(root.join("cedian.toml"), "schema = [unreadable\n").unwrap();
 
     let channel = window
         .update(cx, |p, _, _| p.workflow_channel())
@@ -173,7 +176,13 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
     // 2. The review reads the buffers; the finding shows on its hunk.
     window
         .update(cx, |p, _, cx| {
-            p.request_review("is the uppercase BETA intended".to_string(), cx)
+            p.request_review("is the uppercase BETA intended".to_string(), cx);
+            p.request_review("a second, at once".to_string(), cx);
+            assert_eq!(
+                p.notice(),
+                Some("a review is already running"),
+                "one review at a time"
+            );
         })
         .unwrap();
     wait(cx, &window, "the reviewer's finding", |p| {
@@ -212,8 +221,17 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
         .unwrap_or_else(|| panic!("review evidence: {workflow}"));
     assert_eq!(evidence["outcome"], "fail", "{evidence}");
 
-    // U9j: the finding is a block under its hunk in the open editor, never
-    // a diagnostic: the context OMP reads does not carry it.
+    // U9j: the person opens notes.txt now; the finding is a block under
+    // its hunk at once, never a diagnostic: the context OMP reads does not
+    // carry it.
+    workspace_window
+        .update(cx, |workspace, window, cx| {
+            let editor =
+                cx.new(|cx| Editor::for_buffer(buffer.clone(), Some(project.clone()), window, cx));
+            workspace.add_item_to_active_pane(Box::new(editor), None, true, window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
     let blocks = window.update(cx, |p, _, _| p.finding_blocks()).unwrap();
     assert_eq!(blocks, vec![("f1".to_string(), 1..2)]);
     {
@@ -237,6 +255,8 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
             .count()
     });
     assert_eq!(count, 0, "no Zed diagnostic on the buffer");
+    let mut vcx = VisualTestContext::from_window(window.into(), cx);
+    click(&mut vcx, "cedian-review-toggle");
     // The hunk changes: the block goes; it comes back with the hunk.
     buffer.update(cx, |b, cx| b.edit([(6..10, "BETAX")], None, cx));
     cx.run_until_parked();
@@ -246,6 +266,11 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
             .unwrap()
             .is_empty(),
         "a changed hunk has no block"
+    );
+    let mut vcx = VisualTestContext::from_window(window.into(), cx);
+    assert!(
+        rendered(&mut vcx, "cedian-dismiss-f1").is_some(),
+        "a blocker whose change left the review can still be dismissed"
     );
     buffer.update(cx, |b, cx| {
         b.undo(cx);
@@ -257,7 +282,6 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
     );
 
     let mut vcx = VisualTestContext::from_window(window.into(), cx);
-    click(&mut vcx, "cedian-review-toggle");
     assert!(
         rendered(&mut vcx, "cedian-finding-f1").is_some(),
         "the finding shows on its hunk"

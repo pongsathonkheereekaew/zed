@@ -17,6 +17,10 @@ const START_LIMIT: Duration = Duration::from_secs(60);
 /// How long Chromium gets to close itself (and flush cookies) before it is
 /// killed.
 const CLOSE_LIMIT: Duration = Duration::from_secs(3);
+/// How long an empty `DevToolsActivePort` gets to fill before it counts as
+/// nobody's. A complete file reads at once, so the wait only costs a profile
+/// left with an empty one; 200 ms lost the browser to scheduling slack on CI.
+const PORT_FILL_LIMIT: Duration = Duration::from_secs(2);
 
 pub struct Chromium {
     child: Option<Child>,
@@ -134,7 +138,7 @@ fn browser_close(port: u16, deadline: Instant) {
 /// take the profile.
 fn close_leftover(port_file: &Path) {
     // Chromium creates the file before writing it.
-    let deadline = Instant::now() + Duration::from_millis(200);
+    let deadline = Instant::now() + PORT_FILL_LIMIT;
     let port = loop {
         match std::fs::read_to_string(port_file) {
             Ok(text) if text.is_empty() && Instant::now() < deadline => {

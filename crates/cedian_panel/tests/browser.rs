@@ -656,7 +656,8 @@ fn a_browser_left_by_a_crash_is_closed(root: &std::path::Path) {
 }
 
 /// Chromium creates `DevToolsActivePort` before writing it; a launch that
-/// reads it in between still finds the browser a crash left.
+/// reads it in between still finds the browser a crash left, even when the
+/// write lands half a second later (a CI runner's scheduling slack).
 #[allow(
     clippy::disallowed_methods,
     reason = "a test stands in for a crashed cedian's browser"
@@ -677,7 +678,7 @@ fn a_half_written_port_file_is_waited_for(root: &std::path::Path) {
     let written = std::fs::read_to_string(&port_file).unwrap();
     std::fs::write(&port_file, "").unwrap();
     let writer = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(500));
         std::fs::write(&port_file, written).unwrap();
     });
     let host = BrowserHost::open(profile, exe(), || {}).unwrap();

@@ -2700,7 +2700,12 @@ impl CedianPanel {
                                 .child(
                                     Button::new(
                                         "cedian-revert-turn",
-                                        format!("Revert turn {turn}"),
+                                        match self.review.turn_label(turn) {
+                                            Some(label) => {
+                                                format!("Revert turn {turn}: inline edit {label}")
+                                            }
+                                            None => format!("Revert turn {turn}"),
+                                        },
                                     )
                                     .on_click(
                                         cx.listener(move |this, _, _, cx| {

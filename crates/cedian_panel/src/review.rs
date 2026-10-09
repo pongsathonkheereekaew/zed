@@ -229,6 +229,10 @@ fn key_of(baseline: &text::BufferSnapshot, old: &Range<usize>, new_text: &str) -
 #[derive(Debug, Clone)]
 pub enum TurnKind {
     Prompt,
+    /// An inline edit from the editor (ADR-0056), named by its label.
+    Edit {
+        label: String,
+    },
     /// The revert of turn `of`: one transaction per buffer it touched.
     Revert {
         of: u32,
@@ -703,6 +707,21 @@ impl TaskReview {
         n
     }
 
+    /// An inline-edit turn begins; returns its number.
+    pub fn begin_edit_turn(&mut self, label: String) -> u32 {
+        let n = self.begin_turn();
+        self.turns.last_mut().unwrap().1 = TurnKind::Edit { label };
+        n
+    }
+
+    /// The label of turn `n` when it is an inline edit.
+    pub fn turn_label(&self, n: u32) -> Option<&str> {
+        self.turns.iter().find_map(|(t, kind)| match kind {
+            TurnKind::Edit { label } if *t == n => Some(label.as_str()),
+            _ => None,
+        })
+    }
+
     /// The prompt turn settled (its agent is done).
     pub fn end_turn(&mut self) {
         self.turn_open = false;
@@ -1051,7 +1070,7 @@ impl TaskReview {
                 self.rebuild(cx);
                 (undone, 0, 0, 0, Vec::new())
             }
-            TurnKind::Prompt => {
+            TurnKind::Prompt | TurnKind::Edit { .. } => {
                 self.rebuild(cx);
                 let mut reverted = 0;
                 let mut stale = 0;
@@ -1553,6 +1572,26 @@ mod tests {
         assert_eq!(hunks.len(), 1, "{hunks:?}");
         assert_eq!(hunks[0].status, HunkStatus::Pending);
         assert_eq!(hunks[0].tool_call_ids, vec!["c1".to_string()]);
+    }
+
+    /// U10b (ADR-0056 decision 3): an inline edit is its own kind of turn,
+    /// named by its label, and reverts like any turn.
+    #[gpui::test]
+    async fn an_inline_edit_turn_is_named_and_reverts_like_any_turn(cx: &mut TestAppContext) {
+        let mut f = setup(cx).await;
+        f.review.end_turn();
+        let n = f
+            .review
+            .begin_edit_turn("notes.txt:2 make this line uppercase".into());
+        agent_writes(&mut f, "c1", "alpha\nBETA\ngamma\n", cx).await;
+        f.review.end_turn();
+        assert_eq!(
+            f.review.turn_label(n),
+            Some("notes.txt:2 make this line uppercase")
+        );
+        assert_eq!(f.review.turn_label(1), None, "a prompt turn has no label");
+        cx.update(|cx| f.review.revert_turn(n, cx)).unwrap();
+        assert_eq!(text(&f, cx), ORIGINAL);
     }
 
     #[gpui::test]

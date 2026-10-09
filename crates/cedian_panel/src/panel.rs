@@ -5897,7 +5897,9 @@ mod tests {
             notice(&f, &mut vcx).as_deref(),
             Some(
                 "turn 1 reverted: 1 hunk(s) put back, 1 STALE kept, \
-                 0 changed again by a later turn, kept, 0 accepted, kept"
+                 0 changed again by a later turn, kept, 0 accepted, kept; kept as STALE, \
+                 edited after the agent wrote it (an undo then redo counts as an edit): \
+                 /notes.txt line 3"
             )
         );
         buffer.update(&mut vcx, |b, cx| {

@@ -111,7 +111,8 @@ pub enum ReviewEvent {
     TurnReverted {
         turn: u32,
         reverted: usize,
-        stale: usize,
+        /// Each STALE change kept, as `<path> line <n>`.
+        stale: Vec<String>,
         /// Changes a later turn wrote over; they stay (revert that turn first).
         overwritten: usize,
         /// Changes the person accepted; they stay.
@@ -125,21 +126,33 @@ impl std::fmt::Display for ReviewEvent {
             Self::TurnReverted {
                 turn,
                 reverted: 0,
-                stale: 0,
+                stale,
                 overwritten: 0,
                 accepted: 0,
-            } => write!(f, "turn {turn}: nothing to do"),
+            } if stale.is_empty() => write!(f, "turn {turn}: nothing to do"),
             Self::TurnReverted {
                 turn,
                 reverted,
                 stale,
                 overwritten,
                 accepted,
-            } => write!(
-                f,
-                "turn {turn} reverted: {reverted} hunk(s) put back, {stale} STALE kept, \
-                 {overwritten} changed again by a later turn, kept, {accepted} accepted, kept"
-            ),
+            } => {
+                write!(
+                    f,
+                    "turn {turn} reverted: {reverted} hunk(s) put back, {} STALE kept, \
+                     {overwritten} changed again by a later turn, kept, {accepted} accepted, kept",
+                    stale.len()
+                )?;
+                if !stale.is_empty() {
+                    write!(
+                        f,
+                        "; kept as STALE, edited after the agent wrote it (an undo then \
+                         redo counts as an edit): {}",
+                        stale.join(", ")
+                    )?;
+                }
+                Ok(())
+            }
             other => write!(f, "{other:?}"),
         }
     }
@@ -243,7 +256,8 @@ pub enum TurnKind {
 #[derive(Default)]
 struct TurnRevert {
     edits: Vec<(Range<usize>, String)>,
-    stale: usize,
+    /// The first line (1-based) of each STALE change kept.
+    stale: Vec<u32>,
     overwritten: usize,
     accepted: usize,
 }
@@ -534,7 +548,7 @@ impl FileReview {
                 .sum();
             let now = (new.start as i64 + delta) as usize..(new.end as i64 + delta) as usize;
             if user.iter().any(|r| touches(&now, r)) {
-                plan.stale += 1;
+                plan.stale.push(snapshot.offset_to_point(now.start).row + 1);
                 continue;
             }
             if accepted.iter().any(|r| touches(&now, r)) {
@@ -1068,18 +1082,19 @@ impl TaskReview {
                     }
                 }
                 self.rebuild(cx);
-                (undone, 0, 0, 0, Vec::new())
+                (undone, Vec::new(), 0, 0, Vec::new())
             }
             TurnKind::Prompt | TurnKind::Edit { .. } => {
                 self.rebuild(cx);
                 let mut reverted = 0;
-                let mut stale = 0;
+                let mut stale = Vec::new();
                 let mut overwritten = 0;
                 let mut accepted = 0;
                 let mut transactions = Vec::new();
                 for file in &mut self.files {
                     let plan = file.turn_revert(n, cx);
-                    stale += plan.stale;
+                    let path = review_key(file.buffer.read(cx)).unwrap_or_default();
+                    stale.extend(plan.stale.iter().map(|line| format!("{path} line {line}")));
                     overwritten += plan.overwritten;
                     accepted += plan.accepted;
                     if plan.edits.is_empty() {
@@ -1562,7 +1577,7 @@ mod tests {
             ReviewEvent::TurnReverted {
                 turn: 2,
                 reverted: 1,
-                stale: 0,
+                stale: vec![],
                 overwritten: 0,
                 accepted: 0,
             }
@@ -1607,7 +1622,7 @@ mod tests {
             ReviewEvent::TurnReverted {
                 turn: 1,
                 reverted: 0,
-                stale: 0,
+                stale: vec![],
                 overwritten: 1,
                 accepted: 0,
             }
@@ -1638,7 +1653,7 @@ mod tests {
             ReviewEvent::TurnReverted {
                 turn: 2,
                 reverted: 1,
-                stale: 0,
+                stale: vec![],
                 overwritten: 0,
                 accepted: 0,
             }
@@ -1662,7 +1677,7 @@ mod tests {
             ReviewEvent::TurnReverted {
                 turn: 1,
                 reverted: 0,
-                stale: 0,
+                stale: vec![],
                 overwritten: 0,
                 accepted: 0,
             }
@@ -1705,7 +1720,7 @@ mod tests {
             ReviewEvent::TurnReverted {
                 turn: 1,
                 reverted: 1,
-                stale: 0,
+                stale: vec![],
                 overwritten: 0,
                 accepted: 1,
             }
@@ -1889,7 +1904,7 @@ mod tests {
             ReviewEvent::TurnReverted {
                 turn: 2,
                 reverted: 1,
-                stale: 1,
+                stale: vec!["/notes.txt line 4".to_string()],
                 overwritten: 0,
                 accepted: 0,
             }
@@ -1898,6 +1913,11 @@ mod tests {
             text(&f, cx),
             "ALPHA\nbeta\ngamma\ndelta by user\n",
             "turn 2's line 2 is back, the user's line 4 stays, turn 1's line 1 stays"
+        );
+        let said = event.to_string();
+        assert!(
+            said.contains("/notes.txt line 4") && said.contains("edited after the agent"),
+            "the notice names the STALE hunk it kept and why: {said}"
         );
         f.buffer.update(cx, |b, cx| {
             b.undo(cx);

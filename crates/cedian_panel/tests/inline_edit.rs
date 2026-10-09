@@ -234,7 +234,9 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
         notice.as_deref(),
         Some(
             "turn 2 reverted: 1 hunk(s) put back, 1 STALE kept, \
-             0 changed again by a later turn, kept, 0 accepted, kept"
+             0 changed again by a later turn, kept, 0 accepted, kept; kept as STALE, \
+             edited after the agent wrote it (an undo then redo counts as an edit): \
+             /notes.txt line 4"
         )
     );
     let mut wcx = VisualTestContext::from_window(workspace_window.into(), cx);

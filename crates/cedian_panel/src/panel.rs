@@ -344,13 +344,22 @@ impl CedianPanel {
                 "cancelling…"
             }
             None => {
-                let recorded = self
-                    .workspace_root(cx)
-                    .ok_or_else(|| "no folder is open".to_string())
-                    .and_then(|root| crate::omp_link::cancel_without_omp(&root, id));
-                if let Err(e) = recorded {
-                    self.audit_failed(e, cx);
-                }
+                let root = self.workspace_root(cx);
+                let id = id.to_string();
+                let task = cx.background_spawn(async move {
+                    let root = root.ok_or_else(|| "no folder is open".to_string())?;
+                    crate::omp_link::cancel_without_omp(&root, &id)
+                });
+                cx.spawn(async move |this, cx| {
+                    if let Err(e) = task.await {
+                        this.update(cx, |this, cx| {
+                            this.audit_failed(e, cx);
+                            cx.notify();
+                        })
+                        .ok();
+                    }
+                })
+                .detach();
                 "OMP is not running"
             }
         };
@@ -949,12 +958,7 @@ impl CedianPanel {
             }
             LinkEvent::QueueRefused(e) => self.notice = Some(format!("OMP did not queue it: {e}")),
             LinkEvent::Restored(texts) => self.restore_to_composer(texts, window, cx),
-            LinkEvent::Delivered(texts) => {
-                self.notice = Some(format!(
-                    "already in the stopped turn, so not given back: {}",
-                    texts.join(" · ")
-                ))
-            }
+            LinkEvent::TakeBackNotice(notice) => self.notice = Some(notice),
             LinkEvent::SubagentSteered { id, result } => {
                 let note = match result {
                     Ok(()) => "steered".to_string(),

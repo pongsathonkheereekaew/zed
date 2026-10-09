@@ -14,8 +14,7 @@
 //! 3. a prompt OMP rejects returns the panel to idle with the reason;
 //! 4. an answer OMP got but the audit lost fails the turn with exactly one
 //!    abort (a second would meet the next recorded prompt and end the
-//!    replay); then a run OMP starts on its own while the panel is idle
-//!    shows as running and Stop aborts it;
+//!    replay);
 //! 5. Restart with a prompt still queued: the old OMP never sends it (the
 //!    fixture would write `old-omp-got-four`), though it was alive and held
 //!    the prompt in its queue at the restart (its thread parked by the
@@ -170,8 +169,13 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
     wait(cx, &window, "OMP to have the follow-up", |_| {
         ws.join("omp-got-two").exists()
     });
-    set_prompt(cx, &window, "typed meanwhile");
     click(&mut vcx, "cedian-stop");
+    assert_eq!(
+        window.update(cx, |p, _, _| p.turn().clone()).unwrap(),
+        Turn::Stopping,
+        "Stopping at once, though OMP has not answered the follow-up yet"
+    );
+    set_prompt(cx, &window, "typed meanwhile");
     wait(cx, &window, "turn one to stop", |p| p.turn() == &Turn::Idle);
     wait(cx, &window, "the queue back in the composer", |p| {
         !p.transcript().iter().any(|l| l.contains("queued:"))
@@ -211,14 +215,6 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
         .update(cx, |p, _, _| p.notice().map(str::to_string))
         .unwrap();
     assert!(notice.is_some_and(|n| n.starts_with("turn failed: audit")));
-    submit(cx, &window, "after the audit");
-    wait(cx, &window, "OMP's own run after the audit's turn", |p| {
-        p.turn() == &Turn::Streaming && p.omp_runs_unprompted()
-    });
-    click(&mut vcx, "cedian-stop");
-    wait(cx, &window, "OMP's own run to stop", |p| {
-        p.turn() == &Turn::Idle && p.notice().is_none()
-    });
     assert_ready(cx, &window);
 
     // 5. Restart with a prompt queued behind a parked OMP thread. The
@@ -340,6 +336,14 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
     wait(cx, &window, "OMP's own run to be aborted", |p| {
         ws.join("own-run-aborted").exists() && p.turn() == &Turn::Idle
     });
+    let notice = window
+        .update(cx, |p, _, _| p.notice().map(str::to_string))
+        .unwrap()
+        .unwrap_or_default();
+    assert!(
+        notice.contains("already taken these into a run") && notice.contains("kept"),
+        "the drained steer is named, not lost silently: {notice:?}"
+    );
     assert_ready(cx, &window);
 }
 

@@ -18,7 +18,10 @@
 //! 7. Restart while a subagent runs: the old OMP's rows, steer boxes and
 //!    notes go with it (`subagents_2.jsonl` is the new OMP);
 //! 8. OMP is killed while a subagent runs: the row ends with it and offers
-//!    no Steer or Cancel, and a Cancel made then is still an audit row.
+//!    no Steer or Cancel, and a Cancel made then is still an audit row,
+//!    written off the UI thread. `subagents_2.jsonl` ends on an `abort`
+//!    the test never causes: it keeps replay reading stdin, so fake-omp
+//!    is still alive when the test kills it.
 //!
 //! Harness off: invoked with `--mode` (or `config`) this binary is fake-omp.
 
@@ -295,16 +298,27 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
     window
         .update(cx, |p, _, cx| p.cancel_subagent("sa-4", cx))
         .unwrap();
-    let audited = std::fs::read_to_string(state.join("audit.jsonl"))
-        .unwrap()
-        .lines()
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .any(|row| {
-            row["item"]["tool"] == "cancel_subagent"
-                && row["item"]["command"] == "sa-4"
-                && row["item"]["error"] == "OMP is not running"
-        });
-    assert!(audited, "a Cancel with OMP gone is an audit row");
+    let audited = || {
+        std::fs::read_to_string(state.join("audit.jsonl"))
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .any(|row| {
+                row["item"]["tool"] == "cancel_subagent"
+                    && row["item"]["command"] == "sa-4"
+                    && row["item"]["error"] == "OMP is not running"
+            })
+    };
+    assert!(
+        !audited(),
+        "the Cancel's audit row was written on the UI thread"
+    );
+    wait(
+        cx,
+        &window,
+        "a Cancel with OMP gone to be an audit row",
+        |_| audited(),
+    );
 }
 
 fn row<'a>(p: &'a CedianPanel, id: &str) -> &'a cedian_agent_ui::SubagentRow {

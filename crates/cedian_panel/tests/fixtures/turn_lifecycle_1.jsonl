@@ -47,14 +47,5 @@
 {"dir":"out","frame":{"command":"abort","id":"req_9","success":true,"type":"response"}}
 {"dir":"out","frame":{"agentInvoked":true,"id":"req_8","sessionSettled":true,"status":"aborted","type":"prompt_result"}}
 {"dir":"out","frame":{"type":"session_settled"}}
-{"dir":"in","frame":{"id":"req_10","message":"after the audit","type":"prompt"}}
-{"dir":"out","frame":{"command":"prompt","id":"req_10","success":true,"type":"response"}}
-{"dir":"out","frame":{"type":"agent_start"}}
-{"dir":"out","frame":{"agentInvoked":true,"id":"req_10","sessionSettled":true,"status":"completed","type":"prompt_result"}}
-{"dir":"out","frame":{"type":"session_settled"}}
-{"dir":"out","frame":{"type":"agent_start"}}
-{"dir":"in","frame":{"id":"req_10a","type":"abort"}}
-{"dir":"out","frame":{"command":"abort","id":"req_10a","success":true,"type":"response"}}
-{"dir":"out","frame":{"type":"session_settled"}}
 {"dir":"in","frame":{"id":"req_11","message":"four","type":"prompt"}}
 {"dir":"fs","frame":{"type":"fs_write","path":"old-omp-got-four","content":""}}

@@ -65,6 +65,8 @@ actions!(
         ToggleFocus,
         /// Revert the latest agent turn (ADR-0056).
         RevertTurn,
+        /// Ask OMP to edit the selection (ADR-0056).
+        OpenInlineEdit,
     ]
 );
 
@@ -81,6 +83,13 @@ pub fn init(cx: &mut App) {
             // Deferred: the revert reads the workspace to redraw finding blocks.
             if let Some(panel) = workspace.panel::<CedianPanel>(cx) {
                 cx.defer(move |cx| panel.update(cx, |panel, cx| panel.revert_latest_turn(cx)));
+            }
+        });
+        workspace.register_action(|workspace, _: &OpenInlineEdit, window, cx| {
+            let panel = workspace.panel::<CedianPanel>(cx);
+            let editor = workspace.active_item_as::<Editor>(cx);
+            if let (Some(panel), Some(editor)) = (panel, editor) {
+                panel.update(cx, |panel, cx| panel.open_instruction(editor, window, cx));
             }
         });
     })
@@ -174,6 +183,15 @@ const BROWSER_TOOL: &str = "browser";
 /// One finding's block in one editor (ADR-0055 decision 4): never a
 /// diagnostic, which would reach OMP's prompt through the U6 context.
 #[derive(Clone)]
+/// cedian's instruction block in an editor (ADR-0056 decision 2): the
+/// selection it edits and the line the person types the instruction in.
+struct InstructionBlock {
+    host: WeakEntity<Editor>,
+    block: CustomBlockId,
+    input: Entity<Editor>,
+    edit: InlineEdit,
+}
+
 struct FindingBlock {
     editor: WeakEntity<Editor>,
     block: CustomBlockId,
@@ -318,6 +336,7 @@ pub struct CedianPanel {
     _workspace_items: Option<gpui::Subscription>,
     /// The blocks open findings put under their hunk in open editors.
     finding_blocks: Vec<FindingBlock>,
+    instruction: Option<InstructionBlock>,
     /// Inline edits sent as follow-ups, oldest first, until OMP runs them.
     queued_edits: Vec<QueuedEdit>,
     /// The inline edit the review's current turn is running, with its turn.
@@ -421,6 +440,7 @@ impl CedianPanel {
             _workspace_items: None,
             finding_blocks: Vec::new(),
             queued_edits: Vec::new(),
+            instruction: None,
             edit_turn: None,
         };
         this._worktree_changes = Some(cx.subscribe(&this.project, |this, project, event, cx| {
@@ -1676,7 +1696,12 @@ impl CedianPanel {
 
     /// An inline edit from the editor (ADR-0056 decision 3): a turn in the
     /// live session, or a follow-up with its chip while a turn runs.
-    pub fn inline_edit(&mut self, edit: InlineEdit, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn inline_edit(
+        &mut self,
+        edit: InlineEdit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let message = edit.message(cx);
         match self.turn {
             Turn::Idle => {
@@ -1687,7 +1712,7 @@ impl CedianPanel {
                 if let Err(e) = self.send_prompt(prompt, window, cx) {
                     self.notice = Some(e);
                     cx.notify();
-                    return;
+                    return false;
                 }
                 self.thread.push_user(&message);
                 self.begin_edit_turn(edit, cx);
@@ -1698,7 +1723,7 @@ impl CedianPanel {
                 let Some(link) = &self.link else {
                     self.notice = Some("OMP is not running; restart it".to_string());
                     cx.notify();
-                    return;
+                    return false;
                 };
                 link.queue(message.clone(), false);
                 self.queued_edits.push(QueuedEdit {
@@ -1707,9 +1732,158 @@ impl CedianPanel {
                     in_queue: false,
                 });
             }
-            _ => self.notice = Some("the turn is starting or stopping; wait for it".to_string()),
+            _ => {
+                self.notice = Some("the turn is starting or stopping; wait for it".to_string());
+                cx.notify();
+                return false;
+            }
         }
         cx.notify();
+        true
+    }
+
+    /// ctrl-enter in an editor: the instruction block above the selection
+    /// (the cursor's line when nothing is selected), focused.
+    pub fn open_instruction(
+        &mut self,
+        editor: Entity<Editor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_instruction(cx);
+        let Some(buffer) = editor.read(cx).buffer().read(cx).as_singleton() else {
+            self.notice = Some("inline edit works in a single file's editor".to_string());
+            cx.notify();
+            return;
+        };
+        let Some(path) = buffer
+            .read(cx)
+            .file()
+            .map(|f| f.path().as_unix_str().to_string())
+        else {
+            self.notice = Some("inline edit needs a file in the project".to_string());
+            cx.notify();
+            return;
+        };
+        let selected = editor.update(cx, |editor, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            editor
+                .selections
+                .newest::<language::Point>(&snapshot)
+                .range()
+        });
+        let (start, end) = if selected.is_empty() {
+            let row = selected.start.row;
+            let max = buffer.read(cx).max_point();
+            let end = if row < max.row {
+                language::Point::new(row + 1, 0)
+            } else {
+                max
+            };
+            (language::Point::new(row, 0), end)
+        } else {
+            (selected.start, selected.end)
+        };
+        let range = buffer.read_with(cx, |b, _| b.anchor_before(start)..b.anchor_after(end));
+        let input = cx.new(|cx| {
+            let mut input = Editor::single_line(window, cx);
+            input.set_placeholder_text("Tell OMP how to edit the selection", window, cx);
+            input
+        });
+        let panel = cx.entity().downgrade();
+        let child = input.clone();
+        let block = editor.update(cx, |editor, cx| {
+            let anchor = editor.buffer().read(cx).snapshot(cx).anchor_before(start);
+            editor.insert_blocks(
+                [BlockProperties {
+                    placement: BlockPlacement::Above(anchor),
+                    height: Some(2),
+                    style: BlockStyle::Sticky,
+                    render: Arc::new(move |_| {
+                        let (submit, cancel) = (panel.clone(), panel.clone());
+                        div()
+                            .debug_selector(|| "cedian-inline-edit".to_string())
+                            .w_full()
+                            .capture_action(move |_: &editor::actions::Newline, window, cx| {
+                                cx.stop_propagation();
+                                submit
+                                    .update(cx, |p, cx| p.submit_instruction(window, cx))
+                                    .ok();
+                            })
+                            .capture_action(move |_: &editor::actions::Cancel, window, cx| {
+                                cx.stop_propagation();
+                                cancel
+                                    .update(cx, |p, cx| p.dismiss_instruction(window, cx))
+                                    .ok();
+                            })
+                            .child(child.clone())
+                            .into_any_element()
+                    }),
+                    priority: 0,
+                }],
+                None,
+                cx,
+            )[0]
+        });
+        input.focus_handle(cx).focus(window, cx);
+        self.instruction = Some(InstructionBlock {
+            host: editor.downgrade(),
+            block,
+            input,
+            edit: InlineEdit {
+                path,
+                buffer,
+                range,
+                instruction: String::new(),
+            },
+        });
+        cx.notify();
+    }
+
+    /// Enter in the instruction block: the inline edit goes to OMP; the
+    /// block stays, with its text, when it could not be sent.
+    fn submit_instruction(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(block) = &self.instruction else {
+            return;
+        };
+        let instruction = block.input.read(cx).text(cx);
+        if instruction.trim().is_empty() {
+            return;
+        }
+        let edit = InlineEdit {
+            instruction,
+            ..block.edit.clone()
+        };
+        if self.inline_edit(edit, window, cx) {
+            self.dismiss_instruction(window, cx);
+        }
+    }
+
+    /// The block goes and the editor it was in has the focus again.
+    fn dismiss_instruction(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let host = self.instruction.as_ref().and_then(|b| b.host.upgrade());
+        self.close_instruction(cx);
+        if let Some(host) = host {
+            host.focus_handle(cx).focus(window, cx);
+        }
+    }
+
+    /// Escape in the instruction block, or a new one opened: it goes.
+    fn close_instruction(&mut self, cx: &mut Context<Self>) {
+        let Some(block) = self.instruction.take() else {
+            return;
+        };
+        if let Some(host) = block.host.upgrade() {
+            host.update(cx, |editor, cx| {
+                editor.remove_blocks([block.block].into_iter().collect(), None, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    /// The instruction block is open.
+    pub fn instruction_open(&self) -> bool {
+        self.instruction.is_some()
     }
 
     fn begin_edit_turn(&mut self, edit: InlineEdit, cx: &App) {
@@ -4670,6 +4844,59 @@ mod tests {
         panel.update(cx, |panel, cx| panel.set_workspace(handle, cx));
         cx.run_until_parked();
         (window, editor)
+    }
+
+    /// U10f (ADR-0056 decisions 1-2): ctrl-enter in an editor opens
+    /// cedian's instruction block over the selection; Enter sends it through
+    /// the inline edit (here OMP is stopped, so the block keeps its text and
+    /// says why); Escape closes it and the editor has the focus again.
+    #[gpui::test]
+    async fn ctrl_enter_opens_the_instruction_block(cx: &mut TestAppContext) {
+        let (f, buffer) = fixture(cx).await;
+        bind_default_keymap(cx);
+        let (workspace, editor) = open_in_workspace(&f, &buffer, cx);
+        f.window
+            .update(cx, |panel, _, _| {
+                panel.connection = Connection::Stopped("OMP stopped".to_string());
+            })
+            .unwrap();
+        let mut vcx = VisualTestContext::from_window(workspace.into(), cx);
+        editor.update_in(&mut vcx, |editor, window, cx| {
+            editor.change_selections(Default::default(), window, cx, |s| {
+                s.select_ranges([language::Point::new(1, 0)..language::Point::new(1, 4)])
+            });
+        });
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("ctrl-enter");
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+        assert!(
+            vcx.debug_bounds("cedian-inline-edit").is_some(),
+            "the instruction block is in the editor"
+        );
+        vcx.simulate_input("shout");
+        vcx.simulate_keystrokes("enter");
+        vcx.run_until_parked();
+        assert_eq!(
+            notice(&f, &mut vcx).as_deref(),
+            Some("OMP stopped; restart OMP")
+        );
+        let open = f
+            .window
+            .read_with(&vcx, |p, _| p.instruction_open())
+            .unwrap();
+        assert!(open, "a refused edit keeps its block");
+        vcx.simulate_keystrokes("escape");
+        vcx.run_until_parked();
+        let open = f
+            .window
+            .read_with(&vcx, |p, _| p.instruction_open())
+            .unwrap();
+        assert!(!open);
+        let focused = vcx.update(|window, cx| editor.focus_handle(cx).is_focused(window));
+        assert!(focused, "the editor has the focus again");
+        assert_eq!(buffer.read_with(&vcx, |b, _| b.text()), ORIGINAL);
     }
 
     /// U10a (ADR-0056 decision 7): revert turn from the editor, by its key

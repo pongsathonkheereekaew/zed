@@ -10,7 +10,8 @@
 //! unchanged.
 //!
 //! P6's checks, through the app:
-//! 1. the inline edit of line 2 is a turn of its own kind, named in Review
+//! 1. the inline edit of line 2, asked for with ctrl-enter in the editor
+//!    (U10f), is a turn of its own kind, named in Review
 //!    Changes, and its change is one attributed hunk, one transaction;
 //! 2. the next prompt turn changes lines 1 and 4; the person edits line 4;
 //! 3. revert turn from the editor's key puts line 1 back, keeps the STALE
@@ -20,7 +21,7 @@
 //!
 //! Harness off: invoked with `--mode` (or `config`) this binary is fake-omp.
 
-use cedian_panel::{CedianPanel, Connection, InlineEdit, Turn};
+use cedian_panel::{CedianPanel, Connection, Turn};
 use editor::Editor;
 use gpui::AppContext as _;
 use gpui::{Focusable as _, TestAppContext, VisualTestContext, WindowHandle};
@@ -125,16 +126,35 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
         .update(cx, |p, _, cx| p.set_workspace(handle, cx))
         .unwrap();
 
-    // 1. The inline edit of line 2.
-    let edit = buffer.read_with(cx, |b, _| InlineEdit {
-        path: "notes.txt".to_string(),
-        buffer: buffer.clone(),
-        range: b.anchor_before(Point::new(1, 0))..b.anchor_after(Point::new(2, 0)),
-        instruction: "make this line uppercase".to_string(),
-    });
-    window
-        .update(cx, |p, window, cx| p.inline_edit(edit, window, cx))
+    // 1. The inline edit of line 2, asked for as the person does: select
+    // the line, ctrl-enter, type the instruction, Enter.
+    let editor = workspace_window
+        .read_with(cx, |multi, cx| {
+            multi
+                .workspace()
+                .read(cx)
+                .active_item_as::<Editor>(cx)
+                .unwrap()
+        })
         .unwrap();
+    let mut wcx = VisualTestContext::from_window(workspace_window.into(), cx);
+    editor.update_in(&mut wcx, |editor, window, cx| {
+        editor.change_selections(Default::default(), window, cx, |s| {
+            s.select_ranges([Point::new(1, 0)..Point::new(2, 0)])
+        });
+    });
+    wcx.update(|window, _| window.refresh());
+    wcx.run_until_parked();
+    wcx.simulate_keystrokes("ctrl-enter");
+    wcx.update(|window, _| window.refresh());
+    wcx.run_until_parked();
+    assert!(
+        wcx.debug_bounds("cedian-inline-edit").is_some(),
+        "ctrl-enter opens the instruction block"
+    );
+    wcx.simulate_input("make this line uppercase");
+    wcx.simulate_keystrokes("enter");
+    wcx.run_until_parked();
     wait(cx, &window, "the inline edit to settle", |p| {
         p.turn() == &Turn::Idle && p.transcript().iter().any(|l| l.contains("done"))
     });
@@ -182,6 +202,12 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
         "{button}"
     );
     // 2. The prompt turn, then the person's edit over line 4.
+    let mut wcx = VisualTestContext::from_window(workspace_window.into(), cx);
+    editor.update_in(&mut wcx, |editor, window, cx| {
+        editor.change_selections(Default::default(), window, cx, |s| {
+            s.select_ranges([Point::new(0, 0)..Point::new(0, 0)])
+        });
+    });
     window
         .update(cx, |p, window, cx| {
             p.set_prompt(PROMPT, window, cx);

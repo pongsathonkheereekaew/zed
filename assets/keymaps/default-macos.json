@@ -987,7 +987,7 @@
       "cmd-shift-e": "pane::RevealInProjectPanel",
       "cmd-f8": "editor::GoToHunk",
       "cmd-shift-f8": "editor::GoToPreviousHunk",
-      "ctrl-enter": "assistant::InlineAssist",
+      "ctrl-enter": "cedian_panel::OpenInlineEdit",
       "ctrl-:": "editor::ToggleInlayHints",
     },
   },

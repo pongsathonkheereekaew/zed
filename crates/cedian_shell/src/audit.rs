@@ -133,6 +133,16 @@ impl AuditLog {
         self.append(item, None)
     }
 
+    /// A review cedian refused to run because the workspace carries OMP
+    /// system-prompt files (ADR-0053).
+    pub fn review_refused(&mut self, files: &[String]) -> Result<(), String> {
+        let item = json!({
+            "kind": "review", "tool": "cedian_review_request", "refused": files,
+            "outcome": "inconclusive",
+        });
+        self.append(item, None)
+    }
+
     /// The person cancelled OMP subagent `id` (ADR-0050 decision 4):
     /// OMP's answer, `false` when it had already ended, or why the cancel
     /// did not reach OMP.

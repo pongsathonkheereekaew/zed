@@ -1717,6 +1717,48 @@ impl CedianPanel {
         self.edit_turn = Some((turn, edit));
     }
 
+    /// The inline edit's turn ended: each of its hunks outside the
+    /// selection is named, never rejected (ADR-0056 decision 6).
+    fn warn_outside_selection(&mut self, cx: &mut Context<Self>) {
+        let Some((turn, edit)) = self.edit_turn.take() else {
+            return;
+        };
+        let (first, last) = edit.lines(cx);
+        let mut outside = Vec::new();
+        for file in self.review.files() {
+            let calls: Vec<&String> = file
+                .agent_txns()
+                .iter()
+                .filter(|t| t.turn == turn && t.restored.is_none())
+                .map(|t| &t.tool_call_id)
+                .collect();
+            for hunk in file.hunks() {
+                if !hunk.tool_call_ids.iter().any(|id| calls.contains(&id)) {
+                    continue;
+                }
+                let (start, end) = (hunk.rows.start + 1, hunk.rows.end.max(hunk.rows.start + 1));
+                if file.buffer() != &edit.buffer || start < first || end > last {
+                    let path = file.buffer().read(cx).file().map_or_else(
+                        || self.review.path(file, cx).display().to_string(),
+                        |f| f.path().as_unix_str().to_string(),
+                    );
+                    outside.push(format!("{path}:{start}-{end}"));
+                }
+            }
+        }
+        if outside.is_empty() {
+            return;
+        }
+        let said = format!(
+            "the inline edit changed outside its selection: {}; review it in Review Changes",
+            outside.join(", ")
+        );
+        self.notice = Some(match self.notice.take() {
+            Some(notice) => format!("{notice}; {said}"),
+            None => said,
+        });
+    }
+
     /// OMP's queue changed: a queued inline edit that left it started
     /// running, so its own turn begins in the review.
     fn observe_queued_edits(&mut self, follow_up: &[String], cx: &mut Context<Self>) {
@@ -1729,6 +1771,7 @@ impl CedianPanel {
                 i += 1;
             } else if queued.in_queue {
                 let queued = self.queued_edits.remove(i);
+                self.warn_outside_selection(cx);
                 self.review.end_turn();
                 self.begin_edit_turn(queued.edit, cx);
             } else {
@@ -1816,6 +1859,7 @@ impl CedianPanel {
             }
             RouterEvent::Queue { follow_up, .. } => self.observe_queued_edits(follow_up, cx),
             RouterEvent::Settled => {
+                self.warn_outside_selection(cx);
                 self.review.end_turn();
                 if let Turn::Failed(reason) = std::mem::replace(&mut self.turn, Turn::Idle) {
                     self.notice = Some(format!("turn failed: {reason}"));
@@ -4517,6 +4561,45 @@ mod tests {
                 assert!(panel.queued_edits.is_empty());
             })
             .unwrap();
+    }
+
+    /// U10e (ADR-0056 decision 6): an inline edit that changed a line
+    /// outside its selection is named in a notice, and its hunk is kept.
+    #[gpui::test]
+    async fn an_inline_edit_outside_its_selection_is_warned_about(cx: &mut TestAppContext) {
+        let (f, buffer) = fixture(cx).await;
+        f.window
+            .update(cx, |panel, _, cx| {
+                panel.review.end_turn();
+                let edit = buffer.read_with(cx, |b, _| InlineEdit {
+                    path: "notes.txt".to_string(),
+                    buffer: buffer.clone(),
+                    range: b.anchor_before(language::Point::new(0, 0))
+                        ..b.anchor_after(language::Point::new(1, 0)),
+                    instruction: "shout".to_string(),
+                });
+                panel.begin_edit_turn(edit, cx);
+            })
+            .unwrap();
+        tool_start(&f, cx, "c1", &["notes.txt"]);
+        omp_writes(&f, "/ws/notes.txt", "ALPHA\nbeta\nGAMMA\n").await;
+        tool_end(&f, cx, "c1");
+        settled(&f, cx);
+        let notice = f
+            .window
+            .update(cx, |p, _, _| p.notice().map(str::to_string))
+            .unwrap();
+        assert_eq!(
+            notice.as_deref(),
+            Some(
+                "the inline edit changed outside its selection: notes.txt:3-3; \
+                 review it in Review Changes"
+            )
+        );
+        assert_eq!(
+            buffer.read_with(cx, |b, _| b.text()),
+            "ALPHA\nbeta\nGAMMA\n"
+        );
     }
 
     /// Zed's default keymap for this platform, as the app loads it; the

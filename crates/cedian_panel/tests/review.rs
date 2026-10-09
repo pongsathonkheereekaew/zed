@@ -19,16 +19,24 @@
 //!    `finding_dismissed` row and an audit row, and completion no longer
 //!    names the blocker.
 //!
+//! U9j: with notes.txt open in an editor of the workspace, the open finding
+//! is a block under its hunk (not a diagnostic: `cedian://diagnostics` does
+//! not carry it); the block goes when the hunk's text changes, comes back
+//! with it, and goes when the finding is dismissed.
+//!
 //! Harness off: invoked with `--mode` (or `config`) this binary is fake-omp.
 
 use cedian_panel::{CedianPanel, Connection, Turn};
 use cedian_review::FindingSeverity;
+use editor::Editor;
+use gpui::AppContext as _;
 use gpui::{Modifiers, TestAppContext, VisualTestContext, WindowHandle};
 use project::Project;
 use serde_json::{Value, json};
 use settings::SettingsStore;
 use std::path::Path;
 use std::time::{Duration, Instant};
+use workspace::Workspace;
 
 const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/review.jsonl");
 const REVIEWER_FIXTURE: &str = concat!(
@@ -133,6 +141,24 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
         .unwrap();
     assert_eq!(hunks, vec!["BETA\n".to_string()]);
 
+    // U9j: notes.txt is open in an editor of the person's workspace.
+    let buffer = window
+        .update(cx, |p, _, _| p.review().files()[0].buffer().clone())
+        .unwrap();
+    let workspace_window =
+        cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
+    let workspace_handle = workspace_window
+        .update(cx, |workspace, window, cx| {
+            let editor =
+                cx.new(|cx| Editor::for_buffer(buffer.clone(), Some(project.clone()), window, cx));
+            workspace.add_item_to_active_pane(Box::new(editor), None, true, window, cx);
+            cx.entity().downgrade()
+        })
+        .unwrap();
+    window
+        .update(cx, |p, _, _| p.set_workspace(workspace_handle))
+        .unwrap();
+
     let channel = window
         .update(cx, |p, _, _| p.workflow_channel())
         .unwrap()
@@ -186,6 +212,50 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
         .unwrap_or_else(|| panic!("review evidence: {workflow}"));
     assert_eq!(evidence["outcome"], "fail", "{evidence}");
 
+    // U9j: the finding is a block under its hunk in the open editor, never
+    // a diagnostic: the context OMP reads does not carry it.
+    let blocks = window.update(cx, |p, _, _| p.finding_blocks()).unwrap();
+    assert_eq!(blocks, vec![("f1".to_string(), 1..2)]);
+    {
+        let mut wcx = VisualTestContext::from_window(workspace_window.into(), cx);
+        assert!(
+            rendered(&mut wcx, "cedian-finding-block-f1").is_some(),
+            "the block renders in the editor"
+        );
+    }
+    let diagnostics = window
+        .update(cx, |p, _, cx| p.read_context("cedian://diagnostics", cx))
+        .unwrap();
+    let diagnostics = diagnostics.await.unwrap().content;
+    assert!(
+        !diagnostics.contains("f1") && !diagnostics.contains("Uppercase"),
+        "the finding is not a diagnostic: {diagnostics}"
+    );
+    let count = buffer.read_with(cx, |b, _| {
+        b.snapshot()
+            .diagnostics_in_range::<_, usize>(0..b.len(), false)
+            .count()
+    });
+    assert_eq!(count, 0, "no Zed diagnostic on the buffer");
+    // The hunk changes: the block goes; it comes back with the hunk.
+    buffer.update(cx, |b, cx| b.edit([(6..10, "BETAX")], None, cx));
+    cx.run_until_parked();
+    assert!(
+        window
+            .update(cx, |p, _, _| p.finding_blocks())
+            .unwrap()
+            .is_empty(),
+        "a changed hunk has no block"
+    );
+    buffer.update(cx, |b, cx| {
+        b.undo(cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        window.update(cx, |p, _, _| p.finding_blocks()).unwrap(),
+        vec![("f1".to_string(), 1..2)]
+    );
+
     let mut vcx = VisualTestContext::from_window(window.into(), cx);
     click(&mut vcx, "cedian-review-toggle");
     assert!(
@@ -227,6 +297,13 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
         .update(cx, |p, _, _| p.findings()[0].dismissed.clone())
         .unwrap();
     assert_eq!(dismissed.as_deref(), Some("uppercase is intended"));
+    assert!(
+        window
+            .update(cx, |p, _, _| p.finding_blocks())
+            .unwrap()
+            .is_empty(),
+        "a dismissed finding has no block"
+    );
     let corrections = std::fs::read_to_string(state.join("corrections.jsonl")).unwrap_or_default();
     assert!(
         corrections.contains("\"finding_dismissed\""),

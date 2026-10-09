@@ -35,7 +35,8 @@ use cedian_workflow::{
 };
 use cedian_workspace::{capture_ambient, render_snapshot};
 use collections::{HashMap, HashSet, IndexMap};
-use editor::{Editor, actions::Paste};
+use editor::display_map::{BlockPlacement, BlockProperties, BlockStyle, CustomBlockId};
+use editor::{Editor, RowHighlightOptions, actions::Paste};
 use futures::{StreamExt, channel::mpsc};
 use gpui::{
     Action, AnyElement, App, AsyncWindowContext, ClipboardEntry, Context, ElementId, Entity,
@@ -106,6 +107,19 @@ struct CallMarks {
 const BASH_TOOL: &str = "bash";
 /// OMP's browser tool: the page at its end is gate evidence (ADR-0055).
 const BROWSER_TOOL: &str = "browser";
+
+/// One finding's block in one editor (ADR-0055 decision 4): never a
+/// diagnostic, which would reach OMP's prompt through the U6 context.
+#[derive(Clone)]
+struct FindingBlock {
+    editor: WeakEntity<Editor>,
+    block: CustomBlockId,
+    finding: String,
+    rows: std::ops::Range<u32>,
+}
+
+/// The row highlight of a hunk an open finding is on.
+enum FindingRows {}
 
 /// How long the reviewer waits for the app to read the task's review.
 const REVIEW_READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -235,6 +249,8 @@ pub struct CedianPanel {
     /// The runtime's router once OMP runs: the models that implemented.
     router: Option<Arc<std::sync::OnceLock<Arc<cedian_omp::EventRouter>>>>,
     _review_run: Option<Task<()>>,
+    /// The blocks open findings put under their hunk in open editors.
+    finding_blocks: Vec<FindingBlock>,
 }
 
 /// How long a quitting app waits for Chromium to close itself (flushing its
@@ -330,6 +346,7 @@ impl CedianPanel {
             dismissing: None,
             router: None,
             _review_run: None,
+            finding_blocks: Vec::new(),
         };
         this._worktree_changes = Some(cx.subscribe(&this.project, |this, project, event, cx| {
             if let project::Event::WorktreeUpdatedEntries(worktree, changes) = event {
@@ -627,6 +644,138 @@ impl CedianPanel {
         self.report_review(result, cx);
     }
 
+    /// Each open finding as a block under its hunk, with the hunk's rows
+    /// highlighted, in every open editor of its file. A finding whose hunk
+    /// changed (stale) or that was dismissed has none.
+    fn sync_finding_blocks(&mut self, cx: &mut Context<Self>) {
+        let editors: Vec<Entity<Editor>> = self
+            .workspace
+            .as_ref()
+            .and_then(|w| w.upgrade())
+            .map(|w| w.read(cx).items_of_type::<Editor>(cx).collect())
+            .unwrap_or_default();
+        let mut wanted: Vec<(
+            Entity<Editor>,
+            Entity<Buffer>,
+            AttachedFinding,
+            std::ops::Range<u32>,
+        )> = Vec::new();
+        for file in self.review.files() {
+            let Some(key) = crate::review::review_key(file.buffer().read(cx)) else {
+                continue;
+            };
+            let open: Vec<&Entity<Editor>> = editors
+                .iter()
+                .filter(|e| {
+                    e.read(cx).buffer().read(cx).as_singleton().as_ref() == Some(file.buffer())
+                })
+                .collect();
+            for hunk in file.hunks() {
+                for finding in self.findings.iter().filter(|f| {
+                    f.dismissed.is_none()
+                        && f.finding.path == key
+                        && f.hunk_text == hunk.key.after_text
+                }) {
+                    for editor in &open {
+                        wanted.push((
+                            (*editor).clone(),
+                            file.buffer().clone(),
+                            finding.clone(),
+                            hunk.rows.clone(),
+                        ));
+                    }
+                }
+            }
+        }
+        let same = wanted.len() == self.finding_blocks.len()
+            && wanted
+                .iter()
+                .zip(&self.finding_blocks)
+                .all(|((e, _, f, r), b)| {
+                    b.editor.entity_id() == e.entity_id() && b.finding == f.id && b.rows == *r
+                });
+        if same {
+            return;
+        }
+        for block in std::mem::take(&mut self.finding_blocks) {
+            if let Some(editor) = block.editor.upgrade() {
+                editor.update(cx, |editor, cx| {
+                    editor.remove_blocks([block.block].into_iter().collect(), None, cx);
+                    editor.clear_row_highlights::<FindingRows>();
+                    cx.notify();
+                });
+            }
+        }
+        for (editor, file_buffer, finding, rows) in wanted {
+            let block = editor.update(cx, |editor, cx| {
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                let last = rows.end.saturating_sub(1).max(rows.start);
+                let start = snapshot.anchor_before(language::Point::new(rows.start, 0));
+                let column = file_buffer.read(cx).line_len(last);
+                let end = snapshot.anchor_after(language::Point::new(last, column));
+                editor.highlight_rows::<FindingRows>(
+                    start..end,
+                    |cx| cx.theme().status().error_background,
+                    RowHighlightOptions {
+                        include_gutter: true,
+                        ..Default::default()
+                    },
+                    cx,
+                );
+                let selector = format!("cedian-finding-block-{}", finding.id);
+                let text = format!(
+                    "{} {:?}: {}",
+                    finding.id, finding.finding.severity, finding.finding.message
+                );
+                editor.insert_blocks(
+                    [BlockProperties {
+                        placement: BlockPlacement::Below(end),
+                        height: Some(1),
+                        style: BlockStyle::Sticky,
+                        render: Arc::new(move |_| {
+                            let selector = selector.clone();
+                            div()
+                                .debug_selector(move || selector)
+                                .child(
+                                    Label::new(text.clone())
+                                        .size(LabelSize::Small)
+                                        .color(Color::Error),
+                                )
+                                .into_any_element()
+                        }),
+                        priority: 0,
+                    }],
+                    None,
+                    cx,
+                )[0]
+            });
+            self.finding_blocks.push(FindingBlock {
+                editor: editor.downgrade(),
+                block,
+                finding: finding.id.clone(),
+                rows,
+            });
+        }
+    }
+
+    /// The findings shown as blocks now: (finding id, the hunk's rows).
+    pub fn finding_blocks(&self) -> Vec<(String, std::ops::Range<u32>)> {
+        self.finding_blocks
+            .iter()
+            .map(|b| (b.finding.clone(), b.rows.clone()))
+            .collect()
+    }
+
+    /// A `cedian://` read as OMP makes it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn read_context(
+        &self,
+        url: &str,
+        cx: &mut App,
+    ) -> Task<Result<omp_rpc::HostUriRead, String>> {
+        context::answer(url, self.workspace.as_ref(), &self.project, cx)
+    }
+
     /// The open Dismiss reason box.
     #[cfg(any(test, feature = "test-support"))]
     pub fn dismiss_input(&self) -> Option<Entity<Editor>> {
@@ -647,6 +796,7 @@ impl CedianPanel {
             Ok(store) => self.findings = store.findings,
             Err(e) => self.notice = Some(format!("review findings: {e}")),
         }
+        self.sync_finding_blocks(cx);
         cx.notify();
     }
 
@@ -781,6 +931,7 @@ impl CedianPanel {
         if self.review.stale_count() == 0 {
             self.confirm_accept_all = false;
         }
+        self.sync_finding_blocks(cx);
         cx.notify();
     }
 

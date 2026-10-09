@@ -90,7 +90,17 @@ struct CallMarks {
     /// Each file's text before the call as OMP's result reports it, by
     /// absolute path.
     before: Vec<(PathBuf, TextBefore)>,
+    /// A `bash` call (ADR-0047): the files not open that changed while it
+    /// ran, `(absolute, as the review names it)`.
+    bash: Option<Vec<(PathBuf, PathBuf)>>,
+    /// Marked buffers another mutating call also marked while one of the
+    /// two was a `bash` call, with that call's id: which call wrote what is
+    /// unknown, so neither imports them.
+    overlapped: Vec<(Entity<Buffer>, String)>,
 }
+
+/// The tool whose writes cedian learns only from the files it changed.
+const BASH_TOOL: &str = "bash";
 
 /// How long a dialog waits on the person before cedian closes it (§63,
 /// ADR-0013).
@@ -200,6 +210,7 @@ pub struct CedianPanel {
     _workflow_load: Option<Task<()>>,
     /// The §54 escalation the blocked workflow waits on the person for.
     escalation: Option<String>,
+    _worktree_changes: Option<Subscription>,
 }
 
 /// How long a quitting app waits for Chromium to close itself (flushing its
@@ -263,7 +274,13 @@ impl CedianPanel {
             _browser_quit: None,
             browser_evidence: Vec::new(),
             _context: None,
+            _worktree_changes: None,
         };
+        this._worktree_changes = Some(cx.subscribe(&this.project, |this, project, event, cx| {
+            if let project::Event::WorktreeUpdatedEntries(worktree, changes) = event {
+                this.bash_changed(&project, *worktree, changes, cx);
+            }
+        }));
         if this.workspace_root(cx).is_some() {
             this.start(window, cx);
         }
@@ -1169,6 +1186,11 @@ impl CedianPanel {
             } if EDIT_TOOLS.contains(&tool_name.as_str()) => {
                 self.mark_before_write(tool_call_id.clone(), paths, cx);
             }
+            RouterEvent::ToolStart {
+                tool_call_id,
+                tool_name,
+                ..
+            } if tool_name == BASH_TOOL => self.mark_for_bash(tool_call_id.clone(), cx),
             RouterEvent::ToolEnd {
                 tool_call_id,
                 is_error,
@@ -1652,6 +1674,60 @@ impl CedianPanel {
     /// names, and open the named files that are not open yet so their write
     /// is imported too. A file the call does not name is never an outcome:
     /// the person's own save of it during the call is not the agent's.
+    /// ADR-0047: a `bash` call names no files, so every open buffer of the
+    /// workspace is marked; the ones it changes become its hunks.
+    fn mark_for_bash(&mut self, tool_call_id: String, cx: &mut Context<Self>) {
+        let Some(root) = self.workspace_root(cx) else {
+            return;
+        };
+        let open: Vec<PathBuf> = self
+            .project
+            .read(cx)
+            .opened_buffers(cx)
+            .into_iter()
+            .filter_map(|b| b.read(cx).file()?.as_local().map(|f| f.abs_path(cx)))
+            .filter(|path| path.starts_with(&root))
+            .collect();
+        self.mark_files(tool_call_id.clone(), open, cx);
+        if let Some(call) = self.calls.get_mut(&tool_call_id) {
+            call.bash = Some(Vec::new());
+        }
+    }
+
+    /// Files the worktree saw change: a running `bash` call's, when not open.
+    fn bash_changed(
+        &mut self,
+        project: &Entity<Project>,
+        worktree: worktree::WorktreeId,
+        changes: &worktree::UpdatedEntriesSet,
+        cx: &mut Context<Self>,
+    ) {
+        if !self
+            .calls
+            .values()
+            .any(|c| c.bash.is_some() && c.ended.is_none())
+        {
+            return;
+        }
+        let Some(worktree) = project.read(cx).worktree_for_id(worktree, cx) else {
+            return;
+        };
+        let worktree = worktree.read(cx);
+        let changed: Vec<(PathBuf, PathBuf)> = changes
+            .iter()
+            .map(|(rel, _, _)| (worktree.absolutize(rel), worktree.full_path(rel)))
+            .collect();
+        for call in self.calls.values_mut() {
+            if let (Some(seen), None) = (call.bash.as_mut(), call.ended) {
+                for path in &changed {
+                    if !seen.contains(path) {
+                        seen.push(path.clone());
+                    }
+                }
+            }
+        }
+    }
+
     fn mark_before_write(
         &mut self,
         tool_call_id: String,
@@ -1670,6 +1746,10 @@ impl CedianPanel {
                 }
             })
             .collect();
+        self.mark_files(tool_call_id, named, cx);
+    }
+
+    fn mark_files(&mut self, tool_call_id: String, named: Vec<PathBuf>, cx: &mut Context<Self>) {
         let buffers: Vec<(Entity<Buffer>, PathBuf)> = self
             .project
             .read(cx)
@@ -1709,6 +1789,8 @@ impl CedianPanel {
                 reading: to_open.len() + dirty.len(),
                 ended: None,
                 before: Vec::new(),
+                bash: None,
+                overlapped: Vec::new(),
             },
         );
         let fs = self.project.read(cx).fs().clone();
@@ -1762,9 +1844,91 @@ impl CedianPanel {
         if !ready {
             return;
         }
-        let call = self.calls.remove(&tool_call_id).expect("checked above");
-        if call.ended == Some(true) {
+        let mut call = self.calls.remove(&tool_call_id).expect("checked above");
+        // A failed edit wrote nothing; a failed command may have written.
+        if call.ended == Some(true) && call.bash.is_none() {
             return self.release(&tool_call_id, call, cx);
+        }
+        // ADR-0055 decision 6: a buffer two calls wrote while one was a
+        // `bash` call is imported by neither.
+        for (other_id, other) in &mut self.calls {
+            if call.bash.is_none() && other.bash.is_none() {
+                continue;
+            }
+            for (buffer, _) in &call.marks {
+                if other.marks.iter().any(|(b, _)| b == buffer) {
+                    call.overlapped.push((buffer.clone(), other_id.clone()));
+                    other
+                        .overlapped
+                        .push((buffer.clone(), tool_call_id.clone()));
+                }
+            }
+        }
+        let (overlapped, marks): (Vec<_>, Vec<_>) = std::mem::take(&mut call.marks)
+            .into_iter()
+            .partition(|(b, _)| call.overlapped.iter().any(|(o, _)| o == b));
+        call.marks = marks;
+        if let Some(changed) = &call.bash {
+            for (abs, shown) in changed {
+                let open = call.marks.iter().chain(&overlapped).any(|(b, _)| {
+                    b.read(cx)
+                        .file()
+                        .and_then(|f| f.as_local())
+                        .is_some_and(|f| f.abs_path(cx) == *abs)
+                });
+                if !open {
+                    self.review.could_not_review(
+                        shown.clone(),
+                        format!(
+                            "changed by bash call {tool_call_id}; it was not open, so cedian has \
+                             no text from before the call to review it against"
+                        ),
+                    );
+                }
+            }
+        }
+        let fs = self.project.read(cx).fs().clone();
+        for (buffer, mark) in overlapped {
+            let others: Vec<&str> = call
+                .overlapped
+                .iter()
+                .filter(|(b, _)| *b == buffer)
+                .map(|(_, id)| id.as_str())
+                .collect();
+            let reason = format!(
+                "changed while calls {tool_call_id} and {} both ran, so which call wrote what is \
+                 unknown; nothing was imported",
+                others.join(", ")
+            );
+            let file = buffer.read(cx).file().cloned();
+            let fs = fs.clone();
+            let id = tool_call_id.clone();
+            cx.spawn(async move |this, cx| {
+                let abs = cx.update(|cx| {
+                    file.as_ref()
+                        .and_then(|f| f.as_local())
+                        .map(|f| f.abs_path(cx))
+                });
+                let disk = match abs {
+                    Some(abs) => fs.load(&abs).await.ok(),
+                    None => None,
+                };
+                this.update(cx, |this, cx| {
+                    let mut start = mark.disk_text_at_start();
+                    text::LineEnding::normalize(&mut start);
+                    if disk.is_none_or(|mut d| {
+                        text::LineEnding::normalize(&mut d);
+                        d != start
+                    }) {
+                        let path = file.map(|f| f.full_path(cx)).unwrap_or_default();
+                        this.review.could_not_review(path, reason);
+                    }
+                    this.review.import_done(&buffer, &id, cx);
+                    this.after_review_change(cx);
+                })
+                .ok();
+            })
+            .detach();
         }
         let project = self.project.clone();
         cx.spawn(async move |this, cx| {
@@ -2544,9 +2708,19 @@ mod tests {
     }
 
     fn tool_start(f: &Fixture, cx: &mut TestAppContext, id: &str, paths: &[&str]) {
+        tool_start_named(f, cx, id, "edit", paths);
+    }
+
+    fn tool_start_named(
+        f: &Fixture,
+        cx: &mut TestAppContext,
+        id: &str,
+        name: &str,
+        paths: &[&str],
+    ) {
         let event = RouterEvent::ToolStart {
             tool_call_id: id.to_string(),
-            tool_name: "edit".to_string(),
+            tool_name: name.to_string(),
             args_preview: String::new(),
             paths: paths.iter().map(|p| p.to_string()).collect(),
         };
@@ -2572,9 +2746,19 @@ mod tests {
         id: &str,
         before: Vec<(String, cedian_omp::TextBefore)>,
     ) {
+        tool_end_named(f, cx, id, "edit", before);
+    }
+
+    fn tool_end_named(
+        f: &Fixture,
+        cx: &mut TestAppContext,
+        id: &str,
+        name: &str,
+        before: Vec<(String, cedian_omp::TextBefore)>,
+    ) {
         let event = RouterEvent::ToolEnd {
             tool_call_id: id.to_string(),
-            tool_name: "edit".to_string(),
+            tool_name: name.to_string(),
             result_summary: String::new(),
             is_error: false,
             before,
@@ -2802,6 +2986,122 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         raced_without_old_text(cx, Vec::new()).await;
+    }
+
+    fn unreviewable(f: &Fixture, cx: &mut TestAppContext) -> Vec<(PathBuf, String)> {
+        f.window
+            .update(cx, |panel, _, _| panel.review.unreviewable().to_vec())
+            .unwrap()
+    }
+
+    /// ADR-0047: an open buffer a `bash` call changes on disk is that
+    /// call's hunk.
+    #[gpui::test]
+    async fn a_bash_write_to_an_open_buffer_is_that_calls_hunk(cx: &mut TestAppContext) {
+        let (f, _buffer) = fixture(cx).await;
+        tool_start_named(&f, cx, "b1", "bash", &[]);
+        cx.run_until_parked();
+        omp_writes(&f, "/ws/notes.txt", "alpha\nBETA\ngamma\n").await;
+        cx.run_until_parked();
+        tool_end_named(&f, cx, "b1", "bash", Vec::new());
+        assert_eq!(
+            hunks(&f, cx),
+            vec![(
+                "ws/notes.txt".to_string(),
+                HunkStatus::Pending,
+                vec!["b1".to_string()]
+            )]
+        );
+        assert!(unreviewable(&f, cx).is_empty());
+    }
+
+    /// A command that exits non-zero may still have written: its changes
+    /// are its hunks too.
+    #[gpui::test]
+    async fn a_failed_bash_calls_writes_are_still_its_hunks(cx: &mut TestAppContext) {
+        let (f, _buffer) = fixture(cx).await;
+        tool_start_named(&f, cx, "b1", "bash", &[]);
+        cx.run_until_parked();
+        omp_writes(&f, "/ws/notes.txt", "alpha\nBETA\ngamma\n").await;
+        cx.run_until_parked();
+        let event = RouterEvent::ToolEnd {
+            tool_call_id: "b1".to_string(),
+            tool_name: "bash".to_string(),
+            result_summary: "exit 1".to_string(),
+            is_error: true,
+            before: Vec::new(),
+        };
+        f.window
+            .update(cx, |panel, _, cx| panel.on_event(event, cx))
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(hunks(&f, cx).len(), 1);
+    }
+
+    /// A buffer the person had unsaved edits in is never overwritten by a
+    /// bash write: it shows STALE with the call, their text kept.
+    #[gpui::test]
+    async fn a_bash_write_under_unsaved_edits_is_stale(cx: &mut TestAppContext) {
+        let (f, buffer) = fixture(cx).await;
+        buffer.update(cx, |b, cx| b.edit([(0..0, "USER ")], None, cx));
+        tool_start_named(&f, cx, "b1", "bash", &[]);
+        cx.run_until_parked();
+        omp_writes(&f, "/ws/notes.txt", "alpha\nBETA\ngamma\n").await;
+        cx.run_until_parked();
+        tool_end_named(&f, cx, "b1", "bash", Vec::new());
+        let reason = f
+            .window
+            .update(cx, |panel, _, _| {
+                panel.review.files()[0].stale_import().map(str::to_string)
+            })
+            .unwrap();
+        assert!(
+            reason.as_ref().is_some_and(|r| r.contains("b1")),
+            "{reason:?}"
+        );
+        assert_eq!(
+            buffer.read_with(cx, |b, _| b.text()),
+            "USER alpha\nbeta\ngamma\n"
+        );
+    }
+
+    /// A file not open has no text from before the call: it is listed as
+    /// changed by that call, not reviewable as hunks (owner, ADR-0055).
+    #[gpui::test]
+    async fn a_bash_write_to_a_file_not_open_is_listed(cx: &mut TestAppContext) {
+        let (f, _buffer) = fixture(cx).await;
+        tool_start_named(&f, cx, "b1", "bash", &[]);
+        cx.run_until_parked();
+        omp_writes(&f, "/ws/other.txt", "ONE\ntwo\n").await;
+        cx.run_until_parked();
+        tool_end_named(&f, cx, "b1", "bash", Vec::new());
+        assert!(hunks(&f, cx).is_empty());
+        let listed = unreviewable(&f, cx);
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].0, PathBuf::from("ws/other.txt"));
+        assert!(listed[0].1.contains("bash call b1"), "{listed:?}");
+    }
+
+    /// Another mutating call writing the same file while a bash call runs:
+    /// which call made which change is unknown, so neither imports it and
+    /// the file is shown as such (ADR-0055 decision 6).
+    #[gpui::test]
+    async fn an_edit_overlapping_a_bash_call_imports_nothing_for_the_file(cx: &mut TestAppContext) {
+        let (f, _buffer) = fixture(cx).await;
+        tool_start_named(&f, cx, "b1", "bash", &[]);
+        tool_start(&f, cx, "e1", &["notes.txt"]);
+        cx.run_until_parked();
+        omp_writes(&f, "/ws/notes.txt", "alpha\nBETA\ngamma\n").await;
+        cx.run_until_parked();
+        tool_end(&f, cx, "e1");
+        tool_end_named(&f, cx, "b1", "bash", Vec::new());
+        assert!(hunks(&f, cx).is_empty(), "{:?}", hunks(&f, cx));
+        let listed = unreviewable(&f, cx);
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert!(
+            listed[0].1.contains("b1") && listed[0].1.contains("e1"),
+            "{listed:?}"
+        );
     }
 
     /// The person opens the file and types between the tool's start and its

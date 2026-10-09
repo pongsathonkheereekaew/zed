@@ -46,6 +46,11 @@ impl Mark {
         self.disk_at_start = Some(text);
     }
 
+    /// The file's disk text when the tool started, as far as cedian knows.
+    pub fn disk_text_at_start(&self) -> String {
+        self.disk_at_start()
+    }
+
     /// OMP's own text from before the call replaces a disk read that may
     /// have run after the write. A mark with no read (a clean buffer) keeps
     /// its start text, which is the disk text.

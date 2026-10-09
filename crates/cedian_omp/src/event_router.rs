@@ -86,11 +86,39 @@ pub enum RouterEvent {
     /// A dialog or UI notice from OMP: approvals and `ask` wait for an
     /// answer (`crate::dialog`); the rest are fire-and-forget.
     UiRequest(ExtensionUiRequest),
+    /// One of OMP's notices for the person (ADR-0057 decision 3).
+    Toast(Toast),
     /// Forward-compat: recognized frame, unmodeled kind — never fatal.
     Unknown { frame_type: String },
     /// OMP's output closed without cedian shutting it down: the process
     /// crashed or was killed. Nothing follows; a restart is needed.
     Disconnected,
+}
+
+/// How loud a toast is; OMP's `NotifyType`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToastLevel {
+    Info,
+    Warning,
+    Error,
+}
+
+impl From<omp_rpc::wire::NotifyType> for ToastLevel {
+    fn from(t: omp_rpc::wire::NotifyType) -> Self {
+        match t {
+            omp_rpc::wire::NotifyType::Info => Self::Info,
+            omp_rpc::wire::NotifyType::Warning => Self::Warning,
+            omp_rpc::wire::NotifyType::Error => Self::Error,
+        }
+    }
+}
+
+/// A notice from OMP: `notice`, `notify`, `extension_error`,
+/// `config_warnings_changed` or `ttsr_triggered`, as one line of text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Toast {
+    pub level: ToastLevel,
+    pub text: String,
 }
 
 /// Streaming delta kinds (coarse — Phase 2 panel refines rendering).
@@ -326,7 +354,20 @@ fn classify_notification(frame: &RpcNotification) -> RouterEvent {
             status: result.status.into(),
         },
         RpcNotification::SessionSettled(_) => RouterEvent::Settled,
+        RpcNotification::ExtensionUiRequest(ExtensionUiRequest::Notify(notify)) => {
+            RouterEvent::Toast(Toast {
+                level: notify.notify_type.map_or(ToastLevel::Info, Into::into),
+                text: notify.message.clone(),
+            })
+        }
         RpcNotification::ExtensionUiRequest(request) => RouterEvent::UiRequest(request.clone()),
+        RpcNotification::ExtensionError(e) => RouterEvent::Toast(Toast {
+            level: ToastLevel::Error,
+            text: format!(
+                "extension {} failed on {}: {}",
+                e.extension_path, e.event, e.error
+            ),
+        }),
         RpcNotification::SubagentLifecycle(event) => {
             let p = &event.payload;
             RouterEvent::SubagentLifecycle {
@@ -481,6 +522,30 @@ fn classify_agent_event(event: &RpcAgentEvent) -> RouterEvent {
             is_error: end.is_error.unwrap_or(false),
             before: texts_before(end.result.as_ref()),
         },
+        RpcAgentEvent::Notice(notice) => RouterEvent::Toast(Toast {
+            level: notice.level.into(),
+            text: match &notice.source {
+                Some(source) => format!("{source}: {}", notice.message),
+                None => notice.message.clone(),
+            },
+        }),
+        // The event carries no warnings; OMP lists them in its own UI.
+        RpcAgentEvent::ConfigWarningsChanged(_) => RouterEvent::Toast(Toast {
+            level: ToastLevel::Warning,
+            text: "OMP's config warnings changed (retry fallback chains); run omp to see them"
+                .to_string(),
+        }),
+        RpcAgentEvent::TtsrTriggered(event) => {
+            let names: Vec<&str> = event
+                .rules
+                .iter()
+                .filter_map(|rule| rule.get("name").and_then(|n| n.as_str()))
+                .collect();
+            RouterEvent::Toast(Toast {
+                level: ToastLevel::Info,
+                text: format!("OMP rule triggered mid-stream: {}", names.join(", ")),
+            })
+        }
         RpcAgentEvent::QueueUpdate(queue) => RouterEvent::Queue {
             steering: queue.steering.clone(),
             follow_up: queue.follow_up.clone(),

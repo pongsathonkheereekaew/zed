@@ -1,0 +1,25 @@
+{"dir": "out", "frame": {"maxFrameBytes": 1048576, "maxReassembledFrameBytes": 67108864, "protocolVersion": 1, "supportedProtocolVersions": [1, 2], "type": "ready"}}
+{"dir": "in", "frame": {"id": "req_1", "protocolVersion": 2, "type": "negotiate_protocol"}}
+{"dir": "out", "frame": {"command": "negotiate_protocol", "data": {"protocolVersion": 2}, "id": "req_1", "success": true, "type": "response"}}
+{"dir": "in", "frame": {"enabled": true, "id": "req_2", "type": "set_ask_dialog"}}
+{"dir": "out", "frame": {"command": "set_ask_dialog", "data": {"enabled": true}, "id": "req_2", "success": true, "type": "response"}}
+{"dir": "in", "frame": {"id": "req_tools_1", "tools": [{"name": "cedian_workflow_update"}, {"name": "cedian_complete"}, {"name": "cedian_review_request"}, {"name": "cedian_worktree_request"}], "type": "set_host_tools"}}
+{"dir": "out", "frame": {"command": "set_host_tools", "data": {"toolNames": ["cedian_workflow_update", "cedian_complete", "cedian_review_request", "cedian_worktree_request"]}, "id": "req_tools_1", "success": true, "type": "response"}}
+{"dir": "in", "frame": {"id": "req_uris_1", "schemes": [{"immutable": false, "scheme": "cedian", "writable": false}], "type": "set_host_uri_schemes"}}
+{"dir": "out", "frame": {"command": "set_host_uri_schemes", "data": {"schemes": ["cedian"]}, "id": "req_uris_1", "success": true, "type": "response"}}
+{"dir": "in", "frame": {"id": "req_sub_1", "level": "progress", "type": "set_subagent_subscription"}}
+{"dir": "out", "frame": {"command": "set_subagent_subscription", "data": {"level": "progress"}, "id": "req_sub_1", "success": true, "type": "response"}}
+{"dir": "in", "frame": {"id": "req_3", "type": "get_state"}}
+{"dir": "out", "frame": {"command": "get_state", "id": "req_3", "success": true, "type": "response", "data": {"sessionId": "01a113c8-6171-72ca-9b6b-1c696dd443e1", "sessionFile": "${CEDIAN_SESSION_DIR}/2026-10-07T00-34-21-681Z_01a113c8-6171-72ca-9b6b-1c696dd443e1.jsonl"}}}
+{"dir": "in", "frame": {"id": "req_5", "sessionDir": "${CEDIAN_SESSION_DIR}", "type": "open_session"}}
+{"dir": "out", "frame": {"command": "open_session", "data": {"cancelled": false, "resumed": false, "sessionFile": "${CEDIAN_SESSION_DIR}/2026-10-07T00-34-21-681Z_01a113c8-6171-72ca-9b6b-1c696dd443e1.jsonl", "sessionId": "01a113c8-6171-72ca-9b6b-1c696dd443e1"}, "id": "req_5", "success": true, "type": "response"}}
+{"dir":"in","frame":{"id":"req_6","message":"hello","type":"prompt"}}
+{"dir":"out","frame":{"command":"prompt","id":"req_6","success":true,"type":"response"}}
+{"dir":"out","frame":{"type":"agent_start"}}
+{"dir":"out","frame":{"level":"warning","message":"Context is 90% full","source":"compaction","type":"notice"}}
+{"dir":"out","frame":{"error":"TypeError: x is undefined","event":"tool_call","extensionPath":"/ext/lint.ts","type":"extension_error"}}
+{"dir":"out","frame":{"id":"n-1","message":"Lint extension loaded","method":"notify","notifyType":"info","type":"extension_ui_request"}}
+{"dir":"out","frame":{"type":"config_warnings_changed"}}
+{"dir":"out","frame":{"rules":[{"name":"no-console","path":"/rules/no-console.md"}],"type":"ttsr_triggered"}}
+{"dir":"out","frame":{"agentInvoked":true,"id":"req_6","sessionSettled":true,"status":"completed","type":"prompt_result"}}
+{"dir":"out","frame":{"type":"session_settled"}}

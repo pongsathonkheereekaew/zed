@@ -193,6 +193,7 @@ impl Thread {
                 });
             }
             RouterEvent::UiRequest(_)
+            | RouterEvent::Toast(_)
             | RouterEvent::Unknown { .. }
             | RouterEvent::SubagentLifecycle { .. }
             | RouterEvent::SubagentProgress { .. } => {

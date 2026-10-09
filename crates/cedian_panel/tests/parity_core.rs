@@ -1,0 +1,174 @@
+//! S9 U11 (ADR-0057 decision 3): the parity core in the app. The real
+//! panel, OMP played by fake-omp replaying `parity_core.jsonl` through the
+//! real spawn profile; frames shaped as OMP 18.6.1 sends them (`wire.rs`).
+//!
+//! 1. One toast surface: `notice`, `extension_error`, the `notify` UI
+//!    request, `config_warnings_changed` and `ttsr_triggered` each show as
+//!    a toast with its level; Dismiss removes one.
+//!
+//! Harness off: invoked with `--mode` (or `config`) this binary is fake-omp.
+
+use cedian_panel::{CedianPanel, Connection, ToastLevel, Turn};
+use gpui::{TestAppContext, VisualTestContext, WindowHandle};
+use project::Project;
+use settings::SettingsStore;
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+const FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/parity_core.jsonl"
+);
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("--mode") => std::process::exit(cedian_fake_omp::run(&args)),
+        Some("--version") => std::process::exit(cedian_fake_omp::version()),
+        Some("config") => std::process::exit(cedian_fake_omp::config_get(&args)),
+        _ => {}
+    }
+    let root = std::env::temp_dir().join(format!("cedian-u11-core-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("ws")).unwrap();
+    std::fs::write(root.join("cedian.toml"), "schema = 1\n").unwrap();
+    let root = root.canonicalize().unwrap();
+    // SAFETY: single-threaded here; nothing else reads the environment yet.
+    unsafe {
+        std::env::set_var("CEDIAN_CONFIG", root.join("cedian.toml"));
+        std::env::set_var("CEDIAN_STATE_DIR", root.join("state"));
+        std::env::set_var("HOME", root.join("home"));
+        std::env::set_var("CEDIAN_OMP_BINARY", std::env::current_exe().unwrap());
+    }
+    print!("test parity_core ... ");
+    gpui::run_test_once(
+        0,
+        Box::new(move |dispatcher| {
+            let exec = std::sync::Arc::new(dispatcher.clone());
+            let mut cx = TestAppContext::build(dispatcher.clone(), Some("parity_core"));
+            gpui::ForegroundExecutor::new(exec).block_test(scenario(&mut cx, &root));
+            cx.run_until_parked();
+            cx.update(|cx| cx.quit());
+            cx.run_until_parked();
+            dispatcher.drain_tasks();
+            let _ = std::fs::remove_dir_all(&root);
+        }),
+    );
+    println!("ok");
+}
+
+async fn scenario(cx: &mut TestAppContext, root: &Path) {
+    cx.executor().allow_parking();
+    cx.update(|cx| {
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        theme_settings::init(theme::LoadThemes::JustBase, cx);
+        editor::init(cx);
+    });
+    let ws = root.join("ws");
+    let state = cedian_shell::state::dir(&ws).unwrap();
+    cedian_fake_omp::install_replay(&state.join("omp"), Path::new(FIXTURE)).unwrap();
+    let project = Project::test(fs::RealFs::new(None, cx.executor()), [ws.as_path()], cx).await;
+    let window = cx.add_window(|window, cx| CedianPanel::new(project.clone(), window, cx));
+    let mut vcx = VisualTestContext::from_window(window.into(), cx);
+    wait(cx, &window, "OMP ready", |p| {
+        matches!(p.connection(), Connection::Ready { .. })
+    });
+
+    // 1. Every OMP notice kind is a toast, with its level.
+    submit(cx, &window, "hello");
+    wait(cx, &window, "the turn's end", |p| {
+        p.turn() == &Turn::Idle && p.toasts().len() == 5
+    });
+    let toasts = window.update(cx, |p, _, _| p.toasts().to_vec()).unwrap();
+    let expect = [
+        (ToastLevel::Warning, "compaction: Context is 90% full"),
+        (ToastLevel::Error, "/ext/lint.ts"),
+        (ToastLevel::Info, "Lint extension loaded"),
+        (ToastLevel::Warning, "config warnings changed"),
+        (ToastLevel::Info, "no-console"),
+    ];
+    for ((level, text), toast) in expect.iter().zip(&toasts) {
+        assert_eq!(toast.level, *level, "{toast:?}");
+        assert!(toast.text.contains(text), "{toast:?} names {text:?}");
+    }
+    assert!(
+        toasts[1].text.contains("TypeError: x is undefined")
+            && toasts[1].text.contains("tool_call")
+    );
+    assert!(
+        rendered(&mut vcx, "cedian-toast-0").is_some(),
+        "toasts render"
+    );
+    click(&mut vcx, "cedian-toast-0-dismiss");
+    wait(cx, &window, "one toast dismissed", |p| {
+        p.toasts().len() == 4
+    });
+    assert_connected(cx, &window);
+}
+
+fn submit(cx: &mut TestAppContext, window: &WindowHandle<CedianPanel>, text: &str) {
+    window
+        .update(cx, |panel, window, cx| {
+            panel.set_prompt(text, window, cx);
+            panel.submit(window, cx);
+        })
+        .unwrap();
+}
+
+fn click(vcx: &mut VisualTestContext, selector: &'static str) {
+    let bounds = rendered(vcx, selector).unwrap_or_else(|| panic!("{selector} is not on screen"));
+    vcx.simulate_click(bounds.center(), gpui::Modifiers::none());
+}
+
+fn rendered(
+    vcx: &mut VisualTestContext,
+    selector: &'static str,
+) -> Option<gpui::Bounds<gpui::Pixels>> {
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    vcx.debug_bounds(selector)
+}
+
+fn assert_connected(cx: &mut TestAppContext, window: &WindowHandle<CedianPanel>) {
+    let connection = window.update(cx, |p, _, _| p.connection().clone()).unwrap();
+    assert!(
+        matches!(connection, Connection::Ready { .. }),
+        "fake-omp still replaying (no divergence): {connection:?}"
+    );
+}
+
+/// Pump the test executor while real OS threads (OMP) make progress.
+fn wait(
+    cx: &mut TestAppContext,
+    window: &WindowHandle<CedianPanel>,
+    what: &str,
+    done: impl Fn(&CedianPanel) -> bool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        cx.run_until_parked();
+        let (finished, state) = window
+            .update(cx, |p, _, _| {
+                (
+                    done(p),
+                    format!(
+                        "{:?} · {:?} · {:?} · {:?}",
+                        p.connection(),
+                        p.turn(),
+                        p.notice(),
+                        p.toasts()
+                    ),
+                )
+            })
+            .unwrap();
+        if finished {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {what}: {state}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}

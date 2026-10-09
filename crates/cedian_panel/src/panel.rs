@@ -334,6 +334,8 @@ pub struct CedianPanel {
     /// The last thing the person should know that is not on a dialog: a
     /// refused prompt, a failed turn, a dialog cedian closed.
     notice: Option<String>,
+    /// OMP's notices, oldest first, until dismissed (ADR-0057 decision 3).
+    toasts: Vec<cedian_omp::Toast>,
     /// The OMP the panel runs is not the pinned one (ADR-0057 decision 4).
     omp_warning: Option<String>,
     /// The correction ledger's last failed write: one line, however many
@@ -391,6 +393,9 @@ pub struct CedianPanel {
     /// The inline edit the review's current turn is running, with its turn.
     edit_turn: Option<(u32, InlineEdit)>,
 }
+
+/// The toasts kept: older ones fall off.
+const MAX_TOASTS: usize = 8;
 
 /// How long a quitting app waits for Chromium to close itself (flushing its
 /// cookies) before killing it. The quit hook blocks the main thread.
@@ -454,6 +459,7 @@ impl CedianPanel {
             link: None,
             connection: Connection::NotStarted,
             omp_warning: None,
+            toasts: Vec::new(),
             calls: HashMap::default(),
             review: TaskReview::new(TASK_ID),
             watched: HashSet::default(),
@@ -514,6 +520,10 @@ impl CedianPanel {
             })
         });
         self.workspace = Some(workspace);
+    }
+
+    pub fn toasts(&self) -> &[cedian_omp::Toast] {
+        &self.toasts
     }
 
     pub fn omp_warning(&self) -> Option<&str> {
@@ -1701,6 +1711,11 @@ impl CedianPanel {
                     settings.update(cx, |settings, cx| settings.reload(cx));
                 }
             }
+            LinkEvent::Event(RouterEvent::Toast(toast)) => {
+                self.toasts.push(toast);
+                let excess = self.toasts.len().saturating_sub(MAX_TOASTS);
+                self.toasts.drain(..excess);
+            }
             LinkEvent::Event(event) => return self.on_event(event, cx),
         }
         cx.notify();
@@ -2333,6 +2348,44 @@ impl CedianPanel {
         }
         self.refresh_workflow(cx);
         cx.notify();
+    }
+
+    /// OMP's notices, one row each with Dismiss.
+    fn render_toasts(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        self.toasts
+            .iter()
+            .enumerate()
+            .map(|(i, toast)| {
+                let color = match toast.level {
+                    cedian_omp::ToastLevel::Info => Color::Muted,
+                    cedian_omp::ToastLevel::Warning => Color::Warning,
+                    cedian_omp::ToastLevel::Error => Color::Error,
+                };
+                h_flex()
+                    .debug_selector(move || format!("cedian-toast-{i}"))
+                    .gap_2()
+                    .child(
+                        Label::new(toast.text.clone())
+                            .size(LabelSize::Small)
+                            .color(color),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(move || format!("cedian-toast-{i}-dismiss"))
+                            .child(
+                                Button::new(("cedian-toast-dismiss", i), "Dismiss").on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        if i < this.toasts.len() {
+                                            this.toasts.remove(i);
+                                        }
+                                        cx.notify();
+                                    }),
+                                ),
+                            ),
+                    )
+                    .into_any_element()
+            })
+            .collect()
     }
 
     fn render_workflow(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -3602,6 +3655,7 @@ impl Render for CedianPanel {
             .children(workflow)
             .children(browser)
             .children(dialogs)
+            .children(self.render_toasts(cx))
             .when_some(self.omp_warning.clone(), |panel, warning| {
                 panel.child(
                     div()

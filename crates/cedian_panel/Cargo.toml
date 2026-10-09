@@ -112,3 +112,7 @@ harness = false
 [[test]]
 name = "inline_edit"
 harness = false
+
+[[test]]
+name = "parity_core"
+harness = false

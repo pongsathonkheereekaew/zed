@@ -60,14 +60,14 @@ The one home for **per-feature OMP coverage** ([ADR-0034](https://github.com/pon
 | `auto_retry_start`, `auto_retry_end`, `retry_fallback_applied`, `retry_fallback_succeeded` | retry / fallback banner | deferred: S9 U11 |
 | `cache_warming_start`, `cache_warming_end` | status line | deferred: S10 |
 | `model_changed`, `thinking_level_changed` | model picker state | deferred: S9 U11 |
-| `config_warnings_changed` | settings warnings | deferred: S9 U11 |
+| `config_warnings_changed` | a warning toast: the event carries no warnings, so it says they changed and that `omp` lists them; one toast row each in the panel, with its level and Dismiss (S9 U11, ADR-0057 decision 3) | native |
 | `advisor_cost_changed`, `advisor_yielded` | usage meter | deferred: S10 |
-| `ttsr_triggered` | thread notice | deferred: S9 U11 |
+| `ttsr_triggered` | an info toast naming the rules OMP injected mid-stream; one toast row each in the panel, with its level and Dismiss (S9 U11, ADR-0057 decision 3) | native |
 | `todo_reminder`, `todo_auto_clear` | Workflow UI todos | deferred: S10 |
 | `goal_updated` | Goal mode | deferred: S10 |
 | `queue_update` | the follow-up chip is OMP's latest `queue_update`; Stop and the review's turn boundaries read it (S9 U8, U10) | native (S9 U8) |
 | `irc_message` | inter-agent message in subagent view | deferred: S10 |
-| `notice` | toast | deferred: S9 U11 |
+| `notice` | a toast at OMP's level, prefixed with its `source`; one toast row each in the panel, with its level and Dismiss (S9 U11, ADR-0057 decision 3) | native |
 
 ## Other server notifications (19)
 
@@ -78,7 +78,7 @@ Frames OMP sends besides the agent events above.
 | `ready`, `rpc_frame_error` | runtime handshake; protocol error banner (fail safe, §5) | internal |
 | `prompt_result`, `session_settled` | turn completion state | native |
 | `extension_ui_request` | carries the UI requests below | native (dialogs S9 U4; the methods are the rows below) |
-| `extension_error` | extension error toast | deferred: S9 U11 |
+| `extension_error` | an error toast naming the extension, the event and the error; one toast row each in the panel, with its level and Dismiss (S9 U11, ADR-0057 decision 3) | native |
 | `available_commands_update` | slash-command palette refresh | deferred: S10 |
 | `subagent_lifecycle`, `subagent_progress` | subagent rows under the `task` tool card that started them (`parentToolCallId`), with status running / completed / failed / aborted (S9 U8) | native |
 | `subagent_event` | not subscribed: level `events` streams every subagent token ([ADR-0050](https://github.com/pongsathonkheereekaew/cedian/blob/main/docs/decisions/0050-workers-are-omp-subagents.md) decision 1); transcripts come from `get_subagent_messages` | unused by decision (ADR-0050) |
@@ -93,7 +93,7 @@ Frames OMP sends besides the agent events above.
 | Request(s) | cedian surface | Status |
 |---|---|---|
 | `select`, `confirm`, `input`, `editor`, `ask`, `cancel` | native dialogs ([§63](https://github.com/pongsathonkheereekaew/cedian/blob/main/docs/ARCHITECTURE.md)): the app panel shows each open dialog (one button per `select` option, Yes/No, a text box, `ask` questions with options and free text, Dismiss on all) and answers it; `audit.jsonl` gets a gate row `answered_by: user`; OMP's `cancel` removes the dialog; a dialog unanswered for 5 minutes, or open at Stop or restart, gets a cancel reply (`timedOut` on expiry) and an `abstain` row by cedian (§63); one that expires while a workflow runs blocks its current phase, shows the escalation with Resume and is a `continue_escalated` correction row, and outside a workflow it is a notice only (§54, S9 U9) | native (S9 U4; headless runs answer fail-closed) |
-| `notify` | toast | deferred: S9 U11 |
+| `notify` | a toast at its `notifyType` (info when absent); one toast row each in the panel, with its level and Dismiss (S9 U11, ADR-0057 decision 3) | native |
 | `setStatus`, `setWidget`, `setTitle` | status line, panel widget, window title | deferred: S10 |
 | `set_editor_text` | composer text | deferred: S10 |
 | `open_url` | open in the app's owned Chromium (ADR-0049); headless browser use is OMP's own | deferred: S10 |

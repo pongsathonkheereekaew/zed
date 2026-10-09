@@ -92,6 +92,37 @@ pub fn current_state(workdir: &Path) -> CurrentState {
     )
 }
 
+/// §54 escalation: `why` went unanswered. A running workflow blocks at
+/// its current phase and the escalation is a `continue_escalated` row;
+/// outside one (the fast lane, ADR-0026) nothing changes. Returns whether
+/// it blocked.
+pub fn escalate(
+    state_dir: &Path,
+    task: &str,
+    turn: Option<u32>,
+    why: &str,
+) -> Result<bool, String> {
+    if !workflow_store::exists(state_dir) {
+        return Ok(false);
+    }
+    let mut state = workflow_store::load(state_dir)?;
+    if !state.escalate() {
+        return Ok(false);
+    }
+    workflow_store::save(state_dir, &state)?;
+    corrections::record(
+        state_dir,
+        task,
+        corrections::CorrectionKind::ContinueEscalated,
+        corrections::Event {
+            turn,
+            excerpt: Some(why.to_string()),
+            ..corrections::Event::default()
+        },
+    )?;
+    Ok(true)
+}
+
 /// Turn boundary (ADR-0036): a refused `cedian_complete` in the turn that
 /// just ended blocks the workflow (or leaves it failed when the agent
 /// failed a phase) and is a `completion_refused` row for `task`'s `turn`.
@@ -124,4 +155,34 @@ pub fn end_turn(
     )?;
     workflow_store::save(state_dir, &state)?;
     Ok(Some((status, missing)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cedian_workflow::{TaskKind, TaskProfile, WorkflowState};
+
+    #[test]
+    fn an_unanswered_dialog_blocks_a_running_workflow_only() {
+        let dir = crate::test_dir::TestDir::new("escalate");
+        assert!(
+            !escalate(&dir, "panel", Some(1), "no answer").unwrap(),
+            "fast lane"
+        );
+        assert!(!workflow_store::exists(&dir));
+        let state = WorkflowState::start(TaskProfile::new("t", TaskKind::BugFix)).unwrap();
+        workflow_store::save(&dir, &state).unwrap();
+        assert!(escalate(&dir, "panel", Some(1), "no answer").unwrap());
+        assert_eq!(
+            workflow_store::load(&dir).unwrap().status,
+            WorkflowStatus::Blocked
+        );
+        assert!(
+            !escalate(&dir, "panel", Some(1), "again").unwrap(),
+            "already blocked"
+        );
+        let rows = corrections::load(&dir).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, corrections::CorrectionKind::ContinueEscalated);
+    }
 }

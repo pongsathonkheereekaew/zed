@@ -15,7 +15,10 @@
 //! 5. Stop with an approval open: OMP gets the dialog's cancel, then the
 //!    abort; the audit an `abstain` by cedian;
 //! 6. an approval nobody answers: after `DIALOG_TIMEOUT` OMP gets a timed-out
-//!    cancel, the audit an `abstain`, the panel a note.
+//!    cancel, the audit an `abstain`, the panel a note; a workflow running
+//!    then is blocked at its phase with the escalation shown and a
+//!    `continue_escalated` row, and Resume sets it running (§54, ADR-0055;
+//!    outside a workflow only the note: `workflow_host`'s unit test).
 //!
 //! fake-omp exits on any frame that differs from the recording (a wrong or
 //! extra answer, a missing image, no abort), which ends the session: every
@@ -280,7 +283,13 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
         [("abstain", "cedian", "Allow tool: bash — Command: sleep 60")]
     );
 
-    // 6. Nobody answers.
+    // 6. Nobody answers, while a workflow runs.
+    let running = cedian_workflow::WorkflowState::start(cedian_workflow::TaskProfile::new(
+        "make",
+        cedian_workflow::TaskKind::BugFix,
+    ))
+    .unwrap();
+    cedian_shell::workflow_store::save(&state, &running).unwrap();
     prompt(cx, &window, "Run make");
     wait(cx, &window, "the approval nobody answers", |p| {
         p.dialog_ids() == ["u4-timeout"]
@@ -301,6 +310,26 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
         decisions(&gates[7..]),
         [("abstain", "cedian", "Allow tool: bash — Command: make")]
     );
+    wait(cx, &window, "the blocked workflow", |p| {
+        p.workflow()
+            .is_some_and(|w| w.status == cedian_workflow::WorkflowStatus::Blocked)
+    });
+    let escalation = rendered(&mut vcx, "cedian-workflow-escalation");
+    assert!(
+        escalation.is_some(),
+        "the escalation shows with the workflow"
+    );
+    let corrections = std::fs::read_to_string(state.join("corrections.jsonl")).unwrap();
+    assert!(
+        corrections.contains("\"continue_escalated\""),
+        "{corrections}"
+    );
+    click(&mut vcx, "cedian-workflow-resume");
+    wait(cx, &window, "the resumed workflow", |p| {
+        p.workflow()
+            .is_some_and(|w| w.status == cedian_workflow::WorkflowStatus::Running)
+    });
+    assert!(rendered(&mut vcx, "cedian-workflow-escalation").is_none());
 }
 
 fn image_and_text(text: &str) -> ClipboardItem {

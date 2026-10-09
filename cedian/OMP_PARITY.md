@@ -91,7 +91,7 @@ Frames OMP sends besides the agent events above.
 
 | Request(s) | cedian surface | Status |
 |---|---|---|
-| `select`, `confirm`, `input`, `editor`, `ask`, `cancel` | native dialogs ([§63](https://github.com/pongsathonkheereekaew/cedian/blob/main/docs/ARCHITECTURE.md)): the app panel shows each open dialog (one button per `select` option, Yes/No, a text box, `ask` questions with options and free text, Dismiss on all) and answers it; `audit.jsonl` gets a gate row `answered_by: user`; OMP's `cancel` removes the dialog; a dialog unanswered for 5 minutes, or open at Stop or restart, gets a cancel reply (`timedOut` on expiry) and an `abstain` row by cedian (§63) | native (S9 U4); headless runs answer fail-closed |
+| `select`, `confirm`, `input`, `editor`, `ask`, `cancel` | native dialogs ([§63](https://github.com/pongsathonkheereekaew/cedian/blob/main/docs/ARCHITECTURE.md)): the app panel shows each open dialog (one button per `select` option, Yes/No, a text box, `ask` questions with options and free text, Dismiss on all) and answers it; `audit.jsonl` gets a gate row `answered_by: user`; OMP's `cancel` removes the dialog; a dialog unanswered for 5 minutes, or open at Stop or restart, gets a cancel reply (`timedOut` on expiry) and an `abstain` row by cedian (§63); one that expires while a workflow runs blocks its current phase, shows the escalation with Resume and is a `continue_escalated` correction row, and outside a workflow it is a notice only (§54, S9 U9) | native (S9 U4); headless runs answer fail-closed |
 | `notify` | toast | planned S9 |
 | `setStatus`, `setWidget`, `setTitle` | status line, panel widget, window title | planned S9 |
 | `set_editor_text` | composer text | planned S9 |

@@ -447,6 +447,17 @@ impl WorkflowState {
         Ok(())
     }
 
+    /// §54/§63: a question the user never answered (a dialog that timed
+    /// out) is an escalation. A running workflow blocks at its current
+    /// phase until [`Self::resume`]; returns whether it blocked.
+    pub fn escalate(&mut self) -> bool {
+        if self.status != WorkflowStatus::Running {
+            return false;
+        }
+        self.block_current_phase();
+        true
+    }
+
     fn block_current_phase(&mut self) {
         self.status = WorkflowStatus::Blocked;
         if let Some(ps) = self

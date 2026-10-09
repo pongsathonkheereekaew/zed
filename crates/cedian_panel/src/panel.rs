@@ -195,6 +195,8 @@ pub struct CedianPanel {
     /// The task's workflow as last read, when one was started.
     workflow: Option<WorkflowView>,
     _workflow_load: Option<Task<()>>,
+    /// The §54 escalation the blocked workflow waits on the person for.
+    escalation: Option<String>,
 }
 
 /// How long a quitting app waits for Chromium to close itself (flushing its
@@ -250,6 +252,7 @@ impl CedianPanel {
             state_dir: None,
             workflow: None,
             _workflow_load: None,
+            escalation: None,
             workspace: None,
             _events: None,
             browser: None,
@@ -1259,6 +1262,28 @@ impl CedianPanel {
         }));
     }
 
+    /// §54: during a workflow, a question nobody answered blocks its
+    /// current phase and waits for the person's Resume.
+    fn escalate(&mut self, why: &str, cx: &mut Context<Self>) {
+        if self.state_dir.is_none() && self.workspace_root(cx).is_none() {
+            return;
+        }
+        let turn = Some(self.review.current_turn());
+        match self
+            .state_dir(cx)
+            .and_then(|dir| cedian_shell::workflow_host::escalate(&dir, TASK_ID, turn, why))
+        {
+            Ok(true) => {
+                self.escalation = Some(format!(
+                    "{why}: the workflow is blocked at its current phase until you resume it"
+                ));
+                self.refresh_workflow(cx);
+            }
+            Ok(false) => {}
+            Err(e) => self.escalation = Some(format!("{why}; the workflow could not block: {e}")),
+        }
+    }
+
     /// The Resume button: the person's answer to a blocked workflow (§54).
     pub fn resume_workflow(&mut self, cx: &mut Context<Self>) {
         let resumed = self.state_dir(cx).and_then(|dir| {
@@ -1266,8 +1291,9 @@ impl CedianPanel {
             state.resume()?;
             cedian_shell::workflow_store::save(&dir, &state)
         });
-        if let Err(e) = resumed {
-            self.notice = Some(format!("the workflow did not resume: {e}"));
+        match resumed {
+            Ok(()) => self.escalation = None,
+            Err(e) => self.notice = Some(format!("the workflow did not resume: {e}")),
         }
         self.refresh_workflow(cx);
         cx.notify();
@@ -1331,6 +1357,13 @@ impl CedianPanel {
                             )
                         }),
                 )
+                .when_some(self.escalation.clone().filter(|_| blocked), |col, why| {
+                    col.child(
+                        div()
+                            .debug_selector(|| "cedian-workflow-escalation".to_string())
+                            .child(line(why, Color::Warning)),
+                    )
+                })
                 .child(line(phases, Color::Muted))
                 .children(gates)
                 .children(view.evidence.iter().map(|e| line(e.clone(), Color::Muted)))
@@ -1417,11 +1450,13 @@ impl CedianPanel {
         };
         match closed {
             Ok(true) => {
-                self.notice = Some(format!(
+                let why = format!(
                     "\"{}\" got no answer in {} minutes; cedian dismissed it",
                     dialog.title().lines().next().unwrap_or_default(),
                     DIALOG_TIMEOUT.as_secs() / 60
-                ))
+                );
+                self.escalate(&why, cx);
+                self.notice = Some(why);
             }
             Ok(false) => {}
             Err(e) => self.audit_failed(e, cx),

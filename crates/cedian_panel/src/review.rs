@@ -16,11 +16,12 @@
 //! the hunks were built. Accept all skips stale hunks (decision 7).
 
 use cedian_review::{HunkKey, HunkStatus, StatusRecord};
+use cedian_shell::corrections::{CorrectionKind, Event as Correction};
 use collections::HashMap;
 use gpui::{App, Entity};
 use language::Buffer;
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use text::{Anchor, ToOffset, TransactionId};
 
 /// Review failures (caller-visible).
@@ -140,6 +141,44 @@ impl std::fmt::Display for ReviewEvent {
                  {overwritten} changed again by a later turn, kept, {accepted} accepted, kept"
             ),
             other => write!(f, "{other:?}"),
+        }
+    }
+}
+
+impl ReviewEvent {
+    /// The ADR-0032 ledger row for this event. A hunk's key is its baseline
+    /// range; its agent text is the excerpt.
+    pub fn correction(&self) -> (CorrectionKind, Correction) {
+        let hunk = |path: &Path, key: &HunkKey, turn: u32| Correction {
+            turn: Some(turn),
+            path: Some(path.display().to_string()),
+            hunk_key: Some(format!("{}+{}", key.before_start, key.before_count)),
+            excerpt: Some(key.after_text.clone()),
+            ..Correction::default()
+        };
+        match self {
+            Self::HunkRejected {
+                path,
+                key,
+                turn,
+                tool_call_id,
+            } => (
+                CorrectionKind::HunkRejected,
+                Correction {
+                    tool_call_id: Some(tool_call_id.clone()).filter(|id| !id.is_empty()),
+                    ..hunk(path, key, *turn)
+                },
+            ),
+            Self::UserEditedAgentHunk { path, key, turn } => {
+                (CorrectionKind::UserEditedAgentHunk, hunk(path, key, *turn))
+            }
+            Self::TurnReverted { turn, .. } => (
+                CorrectionKind::TurnReverted,
+                Correction {
+                    turn: Some(*turn),
+                    ..Correction::default()
+                },
+            ),
         }
     }
 }

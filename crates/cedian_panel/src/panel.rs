@@ -186,6 +186,8 @@ pub struct CedianPanel {
     browser_evidence: Vec<Evidence>,
     /// Answers OMP's `cedian://` reads.
     _context: Option<Task<()>>,
+    /// The workspace's state dir (ADR-0044), once known.
+    state_dir: Option<PathBuf>,
 }
 
 /// How long a quitting app waits for Chromium to close itself (flushing its
@@ -238,6 +240,7 @@ impl CedianPanel {
             images: Vec::new(),
             settings: None,
             show_settings: false,
+            state_dir: None,
             workspace: None,
             _events: None,
             browser: None,
@@ -534,12 +537,39 @@ impl CedianPanel {
 
     fn after_review_change(&mut self, cx: &mut Context<Self>) {
         for event in self.review.drain_events() {
-            log::info!("cedian review: {event:?}");
+            let (kind, row) = event.correction();
+            let task = self.review.task_id().to_string();
+            let recorded = self
+                .state_dir(cx)
+                .and_then(|dir| cedian_shell::corrections::record(&dir, &task, kind, row));
+            if let Err(e) = recorded {
+                let failed = format!("the correction ledger did not record {event}: {e}");
+                self.notice = Some(match self.notice.take() {
+                    Some(notice) => format!("{notice}; {failed}"),
+                    None => failed,
+                });
+            }
         }
         if self.review.stale_count() == 0 {
             self.confirm_accept_all = false;
         }
         cx.notify();
+    }
+
+    /// Where this workspace's ledgers live (ADR-0044).
+    fn state_dir(&mut self, cx: &App) -> Result<PathBuf, String> {
+        if let Some(dir) = &self.state_dir {
+            return Ok(dir.clone());
+        }
+        let root = self.workspace_root(cx).ok_or("no folder is open")?;
+        let dir = cedian_shell::state::dir(&root)?;
+        self.state_dir = Some(dir.clone());
+        Ok(dir)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_state_dir(&mut self, dir: PathBuf) {
+        self.state_dir = Some(dir);
     }
 
     fn workspace_root(&self, cx: &App) -> Option<PathBuf> {
@@ -583,6 +613,7 @@ impl CedianPanel {
                 return;
             }
         };
+        self.state_dir = Some(spec.state_dir.clone());
         if self.browser.is_none() {
             self.open_browser_host(&spec.state_dir, cx);
         }
@@ -2244,6 +2275,10 @@ mod tests {
         let window = cx.add_window(|window, cx| CedianPanel::new(project.clone(), window, cx));
         window
             .update(cx, |panel, _, _| {
+                let state =
+                    std::env::temp_dir().join(format!("cedian-panel-state-{}", std::process::id()));
+                std::fs::create_dir_all(&state).unwrap();
+                panel.set_state_dir(state);
                 panel.review.begin_turn();
             })
             .unwrap();
@@ -2836,6 +2871,64 @@ mod tests {
         f.window
             .update(cx, |panel, _, _| panel.notice().map(str::to_string))
             .unwrap()
+    }
+
+    fn state_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("cedian-panel-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// ADR-0032: each correction the person makes in Review Changes is one
+    /// row in the ledger, however often the review rebuilds.
+    #[gpui::test]
+    async fn review_corrections_are_ledger_rows(cx: &mut TestAppContext) {
+        use cedian_shell::corrections::{self, CorrectionKind};
+        let (f, buffer) = fixture(cx).await;
+        let dir = state_dir("corrections");
+        f.window
+            .update(cx, |panel, _, _| panel.set_state_dir(dir.clone()))
+            .unwrap();
+        tool_start(&f, cx, "c1", &["notes.txt"]);
+        omp_writes(&f, "/ws/notes.txt", "ALPHA\nbeta\nGAMMA\n").await;
+        tool_end(&f, cx, "c1");
+        let mut vcx = VisualTestContext::from_window(f.window.into(), cx);
+        click(&mut vcx, "cedian-review-toggle");
+        click(&mut vcx, "cedian-reject-ws/notes.txt-0");
+        buffer.update(&mut vcx, |b, cx| {
+            let at = b.text().find("GAMMA").unwrap();
+            b.edit([(at..at + 5, "Gamma by hand")], None, cx);
+        });
+        for _ in 0..3 {
+            f.window
+                .update(&mut vcx, |panel, _, cx| panel.toggle_review(cx))
+                .unwrap();
+            vcx.run_until_parked();
+        }
+        settled(&f, &mut vcx);
+        f.window
+            .update(&mut vcx, |panel, _, cx| panel.revert_turn(1, cx))
+            .unwrap();
+        let rows = corrections::load(&dir).unwrap();
+        let kinds: Vec<CorrectionKind> = rows.iter().map(|r| r.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                CorrectionKind::HunkRejected,
+                CorrectionKind::UserEditedAgentHunk,
+                CorrectionKind::TurnReverted
+            ]
+        );
+        let rejected = &rows[0];
+        assert_eq!(rejected.path.as_deref(), Some("ws/notes.txt"));
+        assert_eq!(rejected.tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(rejected.turn, Some(1));
+        assert!(rejected.hunk_key.is_some() && rejected.excerpt_hash.is_some());
+        assert_eq!(rows[1].path.as_deref(), Some("ws/notes.txt"));
+        assert_eq!(rows[2].turn, Some(1));
+        assert!(rows.iter().all(|r| r.task == "panel"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// While a later call is writing the file, a keystroke inside a Pending

@@ -46,3 +46,35 @@
 {"dir":"out","frame":{"command":"get_available_models","id":"req_15","success":true,"type":"response","data":{"models":[{"id":"claude-x","name":"Claude X","api":"x","provider":"anthropic","baseUrl":"https://x","reasoning":true,"input":["text"],"cost":{"input":1,"output":2,"cacheRead":0,"cacheWrite":0},"contextWindow":200000,"maxTokens":8192},{"id":"gpt-y","name":"GPT Y","api":"x","provider":"openai","baseUrl":"https://x","reasoning":true,"input":["text"],"cost":{"input":1,"output":2,"cacheRead":0,"cacheWrite":0},"contextWindow":200000,"maxTokens":8192}]}}}
 {"dir":"in","frame":{"id":"req_16","type":"get_available_thinking_levels"}}
 {"dir":"out","frame":{"command":"get_available_thinking_levels","id":"req_16","success":true,"type":"response","data":{"levels":["off","low","high"]}}}
+{"dir":"in","frame":{"id":"req_17","type":"set_steering_mode","mode":"one-at-a-time"}}
+{"dir":"out","frame":{"command":"set_steering_mode","id":"req_17","success":true,"type":"response"}}
+{"dir":"in","frame":{"id":"req_18","type":"set_follow_up_mode","mode":"all"}}
+{"dir":"out","frame":{"command":"set_follow_up_mode","id":"req_18","success":true,"type":"response"}}
+{"dir":"in","frame":{"id":"req_19","type":"set_interrupt_mode","mode":"wait"}}
+{"dir":"out","frame":{"command":"set_interrupt_mode","id":"req_19","success":true,"type":"response"}}
+{"dir":"in","frame":{"id":"req_20","type":"set_auto_compaction","enabled":false}}
+{"dir":"out","frame":{"command":"set_auto_compaction","id":"req_20","success":true,"type":"response"}}
+{"dir":"in","frame":{"id":"req_21","type":"set_auto_retry","enabled":false}}
+{"dir":"out","frame":{"command":"set_auto_retry","id":"req_21","success":true,"type":"response"}}
+{"dir":"in","frame":{"id":"req_22","type":"compact"}}
+{"dir":"out","frame":{"command":"compact","id":"req_22","success":true,"type":"response","data":{"summary":"long summary","firstKeptEntryId":"e1","tokensBefore":1200,"shortSummary":"short"}}}
+{"dir":"in","frame":{"id":"req_23","type":"prompt","message":"work"}}
+{"dir":"out","frame":{"command":"prompt","id":"req_23","success":true,"type":"response"}}
+{"dir":"out","frame":{"type":"agent_start"}}
+{"dir":"out","frame":{"type":"auto_compaction_start","reason":"threshold","action":"context-full"}}
+{"dir":"out","frame":{"type":"auto_compaction_end","action":"context-full","aborted":false,"willRetry":false,"result":{"summary":"s","firstKeptEntryId":"e2","tokensBefore":90000}}}
+{"dir":"out","frame":{"type":"auto_retry_start","attempt":1,"maxAttempts":3,"delayMs":2000,"errorMessage":"overloaded"}}
+{"dir":"in","frame":{"id":"req_24","type":"abort_retry"}}
+{"dir":"out","frame":{"command":"abort_retry","id":"req_24","success":true,"type":"response"}}
+{"dir":"out","frame":{"type":"auto_retry_end","success":false,"attempt":1,"finalError":"overloaded"}}
+{"dir":"out","frame":{"type":"retry_fallback_applied","from":"anthropic/claude-x","to":"openai/gpt-y","role":"default","reason":"overloaded"}}
+{"dir":"out","frame":{"type":"retry_fallback_succeeded","model":"openai/gpt-y","role":"default"}}
+{"dir":"in","frame":{"id":"req_25","type":"follow_up","message":"later"}}
+{"dir":"out","frame":{"type":"queue_update","steering":[],"followUp":["later"]}}
+{"dir":"out","frame":{"command":"follow_up","id":"req_25","success":true,"type":"response"}}
+{"dir":"in","frame":{"id":"req_26","type":"promote_queued_message","message":"later"}}
+{"dir":"out","frame":{"type":"queue_update","steering":["later"],"followUp":[]}}
+{"dir":"out","frame":{"command":"promote_queued_message","id":"req_26","success":true,"type":"response","data":{"promoted":true}}}
+{"dir":"out","frame":{"type":"queue_update","steering":[],"followUp":[]}}
+{"dir":"out","frame":{"agentInvoked":true,"id":"req_23","sessionSettled":true,"status":"completed","type":"prompt_result"}}
+{"dir":"out","frame":{"type":"session_settled"}}

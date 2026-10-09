@@ -11,6 +11,12 @@
 //!    `set_thinking_level`, Next level `cycle_thinking_level` (replay checks
 //!    each request field by field); `thinking_level_changed` shows OMP's
 //!    level and `model_changed` re-reads the open picker.
+//! 3. Queue modes, compaction and retry: each setting button sends its
+//!    command (checked whole) and is noted in the thread; a turn's
+//!    compaction, retry and fallback events are notes too; Stop retry sends
+//!    `abort_retry`; Steer now on a queued follow-up sends
+//!    `promote_queued_message`, and the follow-up joins the running turn
+//!    with no review turn of its own.
 //!
 //! Harness off: invoked with `--mode` (or `config`) this binary is fake-omp.
 
@@ -137,6 +143,75 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
         |p| p.picker().model.as_deref() == Some("openai/gpt-y") && level(p) == Some("medium"),
     );
     assert!(rendered(&mut vcx, "cedian-model-anthropic/claude-x").is_some());
+
+    // 3. Queue modes, compaction and retry.
+    for (button, note) in [
+        ("cedian-steering-one", "steering mode: one-at-a-time"),
+        ("cedian-follow-up-all", "follow-up mode: all"),
+        ("cedian-interrupt-wait", "interrupt mode: wait"),
+        ("cedian-auto-compaction-off", "auto-compaction off"),
+        ("cedian-auto-retry-off", "auto-retry off"),
+        ("cedian-compact", "compacted 1200 tokens: short"),
+    ] {
+        click(&mut vcx, button);
+        wait(cx, &window, note, |p| {
+            p.session_notes().last().map(String::as_str) == Some(note)
+        });
+    }
+    let turn = window
+        .update(cx, |p, _, _| p.review().current_turn())
+        .unwrap();
+    submit(cx, &window, "work");
+    wait(cx, &window, "OMP retrying", |p| p.retrying());
+    assert!(
+        rendered(&mut vcx, "cedian-session-note-6").is_some(),
+        "notes render"
+    );
+    click(&mut vcx, "cedian-abort-retry");
+    wait(cx, &window, "the fallback", |p| {
+        !p.retrying()
+            && p.session_notes()
+                .last()
+                .is_some_and(|n| n == "default answered on fallback openai/gpt-y")
+    });
+    submit(cx, &window, "later");
+    wait(cx, &window, "the queued follow-up", |p| {
+        p.queued_follow_ups() == ["later"]
+    });
+    click(&mut vcx, "cedian-promote-0");
+    wait(cx, &window, "the turn's end", |p| p.turn() == &Turn::Idle);
+    let (notes, queued, notice) = window
+        .update(cx, |p, _, _| {
+            (
+                p.session_notes().to_vec(),
+                p.queued_follow_ups().len(),
+                p.notice().map(str::to_string),
+            )
+        })
+        .unwrap();
+    for note in [
+        "compacting (threshold, context-full)",
+        "compacted 90000 tokens",
+        "retry 1/3 in 2000 ms: overloaded",
+        "retry gave up after 1: overloaded",
+        "default falls back from anthropic/claude-x to openai/gpt-y: overloaded",
+        "steering now: later",
+    ] {
+        assert!(notes.iter().any(|n| n == note), "{note:?} in {notes:?}");
+    }
+    assert_eq!(queued, 0);
+    let after = window
+        .update(cx, |p, _, _| p.review().current_turn())
+        .unwrap();
+    assert_eq!(
+        after,
+        turn + 1,
+        "one review turn for the prompt and its steer"
+    );
+    assert_eq!(
+        notice, None,
+        "the promoted follow-up opened no turn of its own"
+    );
     assert_connected(cx, &window);
 }
 

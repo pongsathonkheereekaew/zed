@@ -20,10 +20,12 @@ use cedian_shell::{Policy, RunKind};
 use collections::HashMap;
 use futures::channel::mpsc::UnboundedSender;
 use omp_rpc::{
-    CycleModelCommand, CycleThinkingLevelCommand, ExtensionUiRequest, ExtensionUiResponse,
-    GetAvailableModelsCommand, GetAvailableThinkingLevelsCommand, GetStateCommand, HostTool,
-    HostUri, ImageContent, ModelInfo, RpcAgentEvent, SetModelCommand, SetThinkingLevelCommand,
-    ThinkingLevel,
+    AbortRetryCommand, CompactCommand, CycleModelCommand, CycleThinkingLevelCommand,
+    ExtensionUiRequest, ExtensionUiResponse, GetAvailableModelsCommand,
+    GetAvailableThinkingLevelsCommand, GetStateCommand, HostTool, HostUri, ImageContent,
+    InterruptMode, ModelInfo, PromoteQueuedMessageCommand, QueueMode, RpcAgentEvent,
+    SetAutoCompactionCommand, SetAutoRetryCommand, SetFollowUpModeCommand, SetInterruptModeCommand,
+    SetModelCommand, SetSteeringModeCommand, SetThinkingLevelCommand, ThinkingLevel,
 };
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
@@ -76,6 +78,13 @@ pub enum LinkEvent {
     Picker(Result<PickerState, String>),
     /// OMP's answer to a model or thinking-level change.
     PickerChanged(Result<PickerChange, String>),
+    /// OMP's answer to a session setting: what it now is, for the thread.
+    Setting(Result<String, String>),
+    /// OMP's answer to promoting the queued follow-up `text` to a steer.
+    Promoted {
+        text: String,
+        result: Result<bool, String>,
+    },
     /// OMP's answer to a Steer on subagent `id`.
     SubagentSteered {
         id: String,
@@ -105,6 +114,60 @@ pub struct PickerState {
 pub struct PickerChange {
     pub model: Option<String>,
     pub thinking: Option<ThinkingLevel>,
+}
+
+/// A setting of the live session the panel changes (ADR-0057 decision 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionSetting {
+    SteeringMode(QueueMode),
+    FollowUpMode(QueueMode),
+    InterruptMode(InterruptMode),
+    AutoCompaction(bool),
+    AutoRetry(bool),
+    Compact,
+    AbortRetry,
+}
+
+impl SessionSetting {
+    fn apply(self, control: &RuntimeControl) -> Result<String, OmpError> {
+        let on = |b: bool| if b { "on" } else { "off" };
+        Ok(match self {
+            Self::SteeringMode(mode) => {
+                control.call(&SetSteeringModeCommand { mode })?;
+                format!("steering mode: {}", mode.as_str())
+            }
+            Self::FollowUpMode(mode) => {
+                control.call(&SetFollowUpModeCommand { mode })?;
+                format!("follow-up mode: {}", mode.as_str())
+            }
+            Self::InterruptMode(mode) => {
+                control.call(&SetInterruptModeCommand { mode })?;
+                format!("interrupt mode: {}", mode.as_str())
+            }
+            Self::AutoCompaction(enabled) => {
+                control.call(&SetAutoCompactionCommand { enabled })?;
+                format!("auto-compaction {}", on(enabled))
+            }
+            Self::AutoRetry(enabled) => {
+                control.call(&SetAutoRetryCommand { enabled })?;
+                format!("auto-retry {}", on(enabled))
+            }
+            Self::Compact => {
+                let result = control.call(&CompactCommand {
+                    custom_instructions: None,
+                })?;
+                format!(
+                    "compacted {} tokens: {}",
+                    result.tokens_before,
+                    result.short_summary.unwrap_or(result.summary)
+                )
+            }
+            Self::AbortRetry => {
+                control.call(&AbortRetryCommand {})?;
+                "retry stopped".to_string()
+            }
+        })
+    }
 }
 
 /// `provider/id`, how the picker names a model.
@@ -986,6 +1049,52 @@ impl OmpLink {
                         .ok()
                 }),
             })
+        });
+    }
+
+    /// Change a setting of the live session off the UI thread.
+    pub fn set(&self, setting: SessionSetting) {
+        self.off_thread(
+            LinkEvent::Setting(Err(NOT_RUNNING.to_string())),
+            move |control| LinkEvent::Setting(setting.apply(&control).map_err(|e| e.to_string())),
+        );
+    }
+
+    /// Move the queued follow-up `text` to the steering queue, so it runs
+    /// in the current turn. Stop's take-back then looks for it there.
+    pub fn promote(&self, text: String) {
+        let gate = Arc::clone(&self.gate);
+        let Some(control) = gate.control.lock().clone() else {
+            let _ = gate.events.unbounded_send(LinkEvent::Promoted {
+                text,
+                result: Err(NOT_RUNNING.to_string()),
+            });
+            return;
+        };
+        std::thread::spawn(move || {
+            let result = {
+                let _sending = gate.sending.lock();
+                let result = control
+                    .call(&PromoteQueuedMessageCommand {
+                        message: text.clone(),
+                    })
+                    .map(|r| r.promoted)
+                    .map_err(|e| e.to_string());
+                if result == Ok(true) {
+                    let mut queue = gate.queue.lock();
+                    if let Some(entry) = queue
+                        .accepted
+                        .iter_mut()
+                        .find(|(t, steer)| *t == text && !*steer)
+                    {
+                        entry.1 = true;
+                    }
+                }
+                result
+            };
+            let _ = gate
+                .events
+                .unbounded_send(LinkEvent::Promoted { text, result });
         });
     }
 

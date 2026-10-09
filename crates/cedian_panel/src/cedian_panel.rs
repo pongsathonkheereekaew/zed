@@ -12,6 +12,7 @@ pub mod review;
 pub mod workflow_view;
 
 pub use cedian_omp::{Toast, ToastLevel};
+pub use omp_link::SessionSetting;
 pub use omp_settings::OmpSettings;
 pub use panel::{
     BROWSER_GATE, CedianPanel, Connection, DIALOG_TIMEOUT, InlineEdit, ModelPicker, RevertTurn,

@@ -86,6 +86,12 @@ pub enum RouterEvent {
     /// A dialog or UI notice from OMP: approvals and `ask` wait for an
     /// answer (`crate::dialog`); the rest are fire-and-forget.
     UiRequest(ExtensionUiRequest),
+    /// Compaction or auto-retry, for the thread; `retrying` is set by the
+    /// retry events (`Some(true)` while OMP waits to retry).
+    RunNote {
+        text: String,
+        retrying: Option<bool>,
+    },
     /// OMP's model changed; the event names none, `get_state` does.
     ModelChanged,
     /// OMP's effective thinking level changed.
@@ -525,6 +531,55 @@ fn classify_agent_event(event: &RpcAgentEvent) -> RouterEvent {
             result_summary: summarize_result(&end.tool_name, end.result.as_ref()),
             is_error: end.is_error.unwrap_or(false),
             before: texts_before(end.result.as_ref()),
+        },
+        RpcAgentEvent::AutoCompactionStart(e) => RouterEvent::RunNote {
+            text: format!("compacting ({}, {})", e.reason.as_str(), e.action.as_str()),
+            retrying: None,
+        },
+        RpcAgentEvent::AutoCompactionEnd(e) => RouterEvent::RunNote {
+            text: if e.aborted {
+                "compaction aborted".to_string()
+            } else if let Some(error) = &e.error_message {
+                format!("compaction failed: {error}")
+            } else if e.skipped == Some(true) {
+                "compaction skipped".to_string()
+            } else {
+                let tokens = e.result.as_ref().map_or(0, |r| r.tokens_before);
+                format!("compacted {tokens} tokens")
+            },
+            retrying: None,
+        },
+        RpcAgentEvent::AutoRetryStart(e) => RouterEvent::RunNote {
+            text: format!(
+                "retry {}/{} in {} ms: {}",
+                e.attempt, e.max_attempts, e.delay_ms, e.error_message
+            ),
+            retrying: Some(true),
+        },
+        RpcAgentEvent::AutoRetryEnd(e) => RouterEvent::RunNote {
+            text: match (&e.final_error, e.success) {
+                (_, true) => format!("retry {} succeeded", e.attempt),
+                (Some(error), false) => format!("retry gave up after {}: {error}", e.attempt),
+                (None, false) => format!("retry gave up after {}", e.attempt),
+            },
+            retrying: Some(false),
+        },
+        RpcAgentEvent::RetryFallbackApplied(e) => RouterEvent::RunNote {
+            text: format!(
+                "{} falls back from {} to {}{}",
+                e.role,
+                e.from,
+                e.to,
+                e.reason
+                    .as_ref()
+                    .map(|r| format!(": {r}"))
+                    .unwrap_or_default()
+            ),
+            retrying: None,
+        },
+        RpcAgentEvent::RetryFallbackSucceeded(e) => RouterEvent::RunNote {
+            text: format!("{} answered on fallback {}", e.role, e.model),
+            retrying: None,
         },
         RpcAgentEvent::ModelChanged(_) => RouterEvent::ModelChanged,
         RpcAgentEvent::ThinkingLevelChanged(event) => {

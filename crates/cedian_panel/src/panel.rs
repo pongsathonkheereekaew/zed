@@ -334,6 +334,13 @@ pub struct CedianPanel {
     /// The last thing the person should know that is not on a dialog: a
     /// refused prompt, a failed turn, a dialog cedian closed.
     notice: Option<String>,
+    /// Compaction, retry and session-setting notes, oldest first, shown in
+    /// the thread (ADR-0057 decision 3).
+    session_notes: Vec<String>,
+    /// OMP waits to retry a failed request: Stop retry is offered.
+    retrying: bool,
+    /// Follow-ups sent to OMP to steer the running turn, until it answers.
+    promoting: Vec<QueuedFollowUp>,
     /// The model and thinking-level picker (ADR-0057 decision 3).
     picker: ModelPicker,
     /// OMP's notices, oldest first, until dismissed (ADR-0057 decision 3).
@@ -477,6 +484,9 @@ impl CedianPanel {
             omp_warning: None,
             toasts: Vec::new(),
             picker: ModelPicker::default(),
+            session_notes: Vec::new(),
+            retrying: false,
+            promoting: Vec::new(),
             calls: HashMap::default(),
             review: TaskReview::new(TASK_ID),
             watched: HashSet::default(),
@@ -537,6 +547,48 @@ impl CedianPanel {
             })
         });
         self.workspace = Some(workspace);
+    }
+
+    pub fn session_notes(&self) -> &[String] {
+        &self.session_notes
+    }
+
+    pub fn retrying(&self) -> bool {
+        self.retrying
+    }
+
+    /// The follow-ups the panel queued that are still waiting, oldest first.
+    pub fn queued_follow_ups(&self) -> Vec<&str> {
+        self.follow_ups.iter().map(|q| q.message.as_str()).collect()
+    }
+
+    /// Change a setting of the live session.
+    pub fn set_session(
+        &mut self,
+        setting: crate::omp_link::SessionSetting,
+        cx: &mut Context<Self>,
+    ) {
+        match &self.link {
+            Some(link) => link.set(setting),
+            None => self.notice = Some("OMP is not running".to_string()),
+        }
+        cx.notify();
+    }
+
+    /// "Steer now" on queued follow-up `index`: OMP moves it to the steering
+    /// queue, so it joins the running turn and has no review turn of its
+    /// own. An inline edit keeps its own turn, so it is not offered.
+    pub fn promote_follow_up(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(link) = &self.link else {
+            return;
+        };
+        if self.follow_ups.get(index).is_none_or(|q| q.edit.is_some()) {
+            return;
+        }
+        let queued = self.follow_ups.remove(index);
+        link.promote(queued.message.clone());
+        self.promoting.push(queued);
+        cx.notify();
     }
 
     pub fn picker(&self) -> &ModelPicker {
@@ -1553,6 +1605,8 @@ impl CedianPanel {
             self.take_back(queued, window, cx);
         }
         self.follow_ups.clear();
+        self.promoting.clear();
+        self.retrying = false;
         self.edit_turn = None;
         self.unblock_instruction();
     }
@@ -1742,6 +1796,32 @@ impl CedianPanel {
                 if let Some(settings) = &self.settings {
                     settings.update(cx, |settings, cx| settings.reload(cx));
                 }
+            }
+            LinkEvent::Setting(result) => self.session_notes.push(match result {
+                Ok(note) => note,
+                Err(e) => format!("OMP refused the setting: {e}"),
+            }),
+            LinkEvent::Promoted { text, result } => {
+                let found = self.promoting.iter().position(|q| q.message == text);
+                let queued = found.map(|i| self.promoting.remove(i));
+                match result {
+                    Ok(true) => self.session_notes.push(format!("steering now: {text}")),
+                    refused => {
+                        let why = refused.err().unwrap_or_else(|| "not queued".to_string());
+                        if let Some(queued) = queued
+                            && matches!(self.turn, Turn::Queued | Turn::Streaming)
+                        {
+                            self.follow_ups.push(queued);
+                        }
+                        self.add_notice(format!("OMP did not steer with {text:?} now: {why}"));
+                    }
+                }
+            }
+            LinkEvent::Event(RouterEvent::RunNote { text, retrying }) => {
+                if let Some(retrying) = retrying {
+                    self.retrying = retrying;
+                }
+                self.session_notes.push(text);
             }
             LinkEvent::Picker(Ok(state)) => {
                 self.picker.models = state.models;
@@ -2407,6 +2487,112 @@ impl CedianPanel {
         }
         self.refresh_workflow(cx);
         cx.notify();
+    }
+
+    /// Compaction and retry notes, Stop retry, Steer now on each queued
+    /// follow-up, and the session's queue, compaction and retry settings
+    /// while the picker is open.
+    fn render_session(&self, cx: &mut Context<Self>) -> AnyElement {
+        use crate::omp_link::SessionSetting as S;
+        use omp_rpc::{InterruptMode, QueueMode};
+        let setting = |id: &'static str, label: &'static str, setting: S| {
+            div().debug_selector(move || id.to_string()).child(
+                Button::new(id, label)
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_session(setting, cx))),
+            )
+        };
+        let notes = self.session_notes.iter().enumerate().map(|(i, note)| {
+            div()
+                .debug_selector(move || format!("cedian-session-note-{i}"))
+                .child(
+                    Label::new(note.clone())
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+        });
+        let chips = self
+            .follow_ups
+            .iter()
+            .enumerate()
+            .filter(|(_, q)| q.edit.is_none())
+            .map(|(i, q)| {
+                h_flex()
+                    .gap_1()
+                    .child(Label::new(format!("queued: {}", q.message)).size(LabelSize::Small))
+                    .child(
+                        div()
+                            .debug_selector(move || format!("cedian-promote-{i}"))
+                            .child(Button::new(("cedian-promote", i), "Steer now").on_click(
+                                cx.listener(move |this, _, _, cx| this.promote_follow_up(i, cx)),
+                            )),
+                    )
+            });
+        v_flex()
+            .gap_1()
+            .children(notes)
+            .children(chips)
+            .when(self.retrying, |el| {
+                el.child(setting("cedian-abort-retry", "Stop retry", S::AbortRetry))
+            })
+            .when(self.picker.open, |el| {
+                el.child(
+                    h_flex()
+                        .flex_wrap()
+                        .gap_1()
+                        .child(setting(
+                            "cedian-steering-all",
+                            "Steer: all",
+                            S::SteeringMode(QueueMode::All),
+                        ))
+                        .child(setting(
+                            "cedian-steering-one",
+                            "Steer: one at a time",
+                            S::SteeringMode(QueueMode::OneAtATime),
+                        ))
+                        .child(setting(
+                            "cedian-follow-up-all",
+                            "Follow-up: all",
+                            S::FollowUpMode(QueueMode::All),
+                        ))
+                        .child(setting(
+                            "cedian-follow-up-one",
+                            "Follow-up: one at a time",
+                            S::FollowUpMode(QueueMode::OneAtATime),
+                        ))
+                        .child(setting(
+                            "cedian-interrupt-immediate",
+                            "Interrupt: immediate",
+                            S::InterruptMode(InterruptMode::Immediate),
+                        ))
+                        .child(setting(
+                            "cedian-interrupt-wait",
+                            "Interrupt: wait",
+                            S::InterruptMode(InterruptMode::Wait),
+                        ))
+                        .child(setting("cedian-compact", "Compact now", S::Compact))
+                        .child(setting(
+                            "cedian-auto-compaction-off",
+                            "Auto-compact off",
+                            S::AutoCompaction(false),
+                        ))
+                        .child(setting(
+                            "cedian-auto-compaction-on",
+                            "Auto-compact on",
+                            S::AutoCompaction(true),
+                        ))
+                        .child(setting(
+                            "cedian-auto-retry-off",
+                            "Auto-retry off",
+                            S::AutoRetry(false),
+                        ))
+                        .child(setting(
+                            "cedian-auto-retry-on",
+                            "Auto-retry on",
+                            S::AutoRetry(true),
+                        )),
+                )
+            })
+            .into_any_element()
     }
 
     fn render_picker(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -3800,6 +3986,7 @@ impl Render for CedianPanel {
             .children(browser)
             .children(dialogs)
             .child(self.render_picker(cx))
+            .child(self.render_session(cx))
             .children(self.render_toasts(cx))
             .when_some(self.omp_warning.clone(), |panel, warning| {
                 panel.child(

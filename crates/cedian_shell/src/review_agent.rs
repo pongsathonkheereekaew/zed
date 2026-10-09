@@ -471,7 +471,7 @@ pub fn review_request_tool(
     settings: crate::Settings,
     read_task: std::sync::Arc<dyn Fn() -> Result<ReviewTask, String> + Send + Sync>,
     task_diffs: TaskDiffs,
-    implementer: std::sync::Arc<cedian_omp::EventRouter>,
+    implementer: std::sync::Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     channel: std::sync::Arc<cedian_workflow::WorkflowChannel>,
 ) -> HostTool {
     let params = json!({
@@ -493,7 +493,7 @@ pub fn review_request_tool(
         move |args, ctx| {
             let focus = args.get("focus").and_then(Value::as_str).unwrap_or("");
             let requester = Requester {
-                implementer_models: implementer.answered_models(),
+                implementer_models: implementer(),
                 tool_call_id: Some(ctx.tool_call_id().to_string()),
                 channel: Some(&channel),
             };

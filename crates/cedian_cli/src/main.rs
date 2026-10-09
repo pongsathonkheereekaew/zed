@@ -274,7 +274,10 @@ fn host_tools(
             read_review_task(&root)
         }),
         task_diff_reader(workdir),
-        rt.router(),
+        {
+            let router = rt.router();
+            std::sync::Arc::new(move || router.answered_models())
+        },
         std::sync::Arc::clone(&channel),
     ));
     let class_root = workdir.to_path_buf();

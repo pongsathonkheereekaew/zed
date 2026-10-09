@@ -169,12 +169,15 @@ pub fn open_blockers(
             .filter(|(_, state)| *state == "open blocker")
             .map(|(f, _)| {
                 format!(
-                    "review: blocker {} on {} hunk {} is open: {} (fix the hunk, or a person runs                      `cedian review dismiss {} <reason>`)",
-                    f.id, f.finding.path, f.hunk, f.finding.message, f.id
+                    "review: blocker {} on {} hunk {} is open: {} (fix the hunk, or a person \
+                     dismisses it with a reason in Review Changes)",
+                    f.id, f.finding.path, f.hunk, f.finding.message
                 )
             })
             .collect(),
-        Err(e) => vec![format!("review: findings unreadable, so blockers cannot be checked ({e})")],
+        Err(e) => vec![format!(
+            "review: findings unreadable, so blockers cannot be checked ({e})"
+        )],
     }
 }
 

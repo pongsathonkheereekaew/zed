@@ -1130,6 +1130,45 @@ impl TaskReview {
         Ok(event)
     }
 
+    /// The task as a reviewer reads it (ADR-0055): each reviewed file's
+    /// hunks over its buffer text now, keyed `/<worktree-relative path>`
+    /// as the reviewer names files, with the baseline text.
+    pub fn review_task(&self, cx: &App) -> cedian_shell::review_agent::ReviewTask {
+        let mut task = cedian_shell::review_agent::ReviewTask::default();
+        for file in &self.files {
+            let buffer = file.buffer.read(cx);
+            let Some(key) = review_key(buffer) else {
+                continue;
+            };
+            task.diffs.push(cedian_review::FileDiff {
+                path: key.clone(),
+                hunks: file
+                    .hunks
+                    .iter()
+                    .map(|h| cedian_review::Hunk {
+                        before_start: h.key.before_start,
+                        before_count: h.key.before_count,
+                        after_start: h.rows.start as usize,
+                        after_count: h.new_text.lines().count(),
+                    })
+                    .collect(),
+                statuses: file.hunks.iter().map(|h| h.status).collect(),
+                snapshot: buffer.text(),
+            });
+            task.baseline
+                .insert(PathBuf::from(key), file.baseline.text());
+        }
+        task
+    }
+
+    /// The last turn whose agent wrote the file under review key `key`.
+    pub fn last_turn_touching(&self, key: &str, cx: &App) -> Option<u32> {
+        self.files
+            .iter()
+            .find(|f| review_key(f.buffer.read(cx)).as_deref() == Some(key))
+            .and_then(|f| f.agent_txns.last().map(|t| t.turn))
+    }
+
     /// Resolutions to persist.
     pub fn status_records(&self, cx: &App) -> Vec<StatusRecord> {
         let mut out: Vec<StatusRecord> = self
@@ -1185,6 +1224,13 @@ fn restore(
         b.finalize_last_transaction();
         txn
     })
+}
+
+/// A reviewed file as the reviewer and the findings store name it.
+pub fn review_key(buffer: &Buffer) -> Option<String> {
+    buffer
+        .file()
+        .map(|f| format!("/{}", f.path().as_unix_str()))
 }
 
 fn path_of(buffer: &Buffer, cx: &App) -> PathBuf {

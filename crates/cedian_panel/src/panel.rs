@@ -21,14 +21,14 @@ use crate::browser::BrowserHost;
 use crate::context;
 use crate::dialogs::OpenDialog;
 use crate::import::{self, ImportOutcome, Mark};
-use crate::omp_link::{AnswerError, LaunchSpec, LinkEvent, OmpLink, Prompt};
+use crate::omp_link::{AnswerError, LaunchSpec, LinkEvent, OmpLink, Prompt, ReviewReader};
 use crate::omp_settings::OmpSettings;
 use crate::review::{ReviewError, TaskReview};
 use crate::workflow_view::WorkflowView;
 use cedian_agent::{Thread, ThreadEvent};
 use cedian_agent_ui::{SubagentRow, SubagentTree, ToolCard};
 use cedian_omp::{RouterEvent, SubagentStatus, TextBefore, UserAnswer};
-use cedian_review::{HunkKey, HunkStatus};
+use cedian_review::{AttachedFinding, FindingSeverity, HunkKey, HunkStatus};
 use cedian_workflow::{
     CurrentState, Evidence, EvidenceKind, Gate, GateResult, Outcome, Provenance, WorkflowChannel,
     WorkflowStatus,
@@ -106,6 +106,9 @@ struct CallMarks {
 const BASH_TOOL: &str = "bash";
 /// OMP's browser tool: the page at its end is gate evidence (ADR-0055).
 const BROWSER_TOOL: &str = "browser";
+
+/// How long the reviewer waits for the app to read the task's review.
+const REVIEW_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long a dialog waits on the person before cedian closes it (§63,
 /// ADR-0013).
@@ -221,6 +224,17 @@ pub struct CedianPanel {
     /// The §54 escalation the blocked workflow waits on the person for.
     escalation: Option<String>,
     _worktree_changes: Option<Subscription>,
+    /// The reviewer's reader of the task's review: it crosses to this
+    /// thread and back (ADR-0055).
+    review_reader: ReviewReader,
+    _review_reads: Task<()>,
+    /// The reviewer's findings as last read from the state dir.
+    findings: Vec<AttachedFinding>,
+    /// The finding whose Dismiss is open, with its reason box.
+    dismissing: Option<(String, Entity<Editor>)>,
+    /// The runtime's router once OMP runs: the models that implemented.
+    router: Option<Arc<std::sync::OnceLock<Arc<cedian_omp::EventRouter>>>>,
+    _review_run: Option<Task<()>>,
 }
 
 /// How long a quitting app waits for Chromium to close itself (flushing its
@@ -250,6 +264,29 @@ impl CedianPanel {
             let mut editor = Editor::single_line(window, cx);
             editor.set_placeholder_text("Ask OMP…", window, cx);
             editor
+        });
+        let (reads, mut read_rx) =
+            mpsc::unbounded::<std::sync::mpsc::Sender<cedian_shell::review_agent::ReviewTask>>();
+        let review_reader: ReviewReader = Arc::new(move || {
+            let (reply, answer) = std::sync::mpsc::channel();
+            reads
+                .unbounded_send(reply)
+                .map_err(|_| "the cedian panel is closed".to_string())?;
+            answer
+                .recv_timeout(REVIEW_READ_TIMEOUT)
+                .map_err(|_| "no answer from the app for the task's review".to_string())
+        });
+        let _review_reads = cx.spawn(async move |this, cx| {
+            while let Some(reply) = read_rx.next().await {
+                let Ok(task) = this.update(cx, |this, cx| {
+                    this.review.rebuild(cx);
+                    this.after_review_change(cx);
+                    this.review.review_task(cx)
+                }) else {
+                    break;
+                };
+                let _ = reply.send(task);
+            }
         });
         let mut this = Self {
             focus_handle: cx.focus_handle(),
@@ -287,6 +324,12 @@ impl CedianPanel {
             browser_evidence: Vec::new(),
             _context: None,
             _worktree_changes: None,
+            review_reader,
+            _review_reads,
+            findings: Vec::new(),
+            dismissing: None,
+            router: None,
+            _review_run: None,
         };
         this._worktree_changes = Some(cx.subscribe(&this.project, |this, project, event, cx| {
             if let project::Event::WorktreeUpdatedEntries(worktree, changes) = event {
@@ -584,6 +627,138 @@ impl CedianPanel {
         self.report_review(result, cx);
     }
 
+    /// The open Dismiss reason box.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn dismiss_input(&self) -> Option<Entity<Editor>> {
+        self.dismissing.as_ref().map(|(_, input)| input.clone())
+    }
+
+    /// The reviewer's findings as last read.
+    pub fn findings(&self) -> &[AttachedFinding] {
+        &self.findings
+    }
+
+    /// Read the findings the reviewer reported into the state dir.
+    fn load_findings(&mut self, cx: &mut Context<Self>) {
+        let loaded = self
+            .state_dir(cx)
+            .and_then(|dir| cedian_shell::review_findings::load(&dir));
+        match loaded {
+            Ok(store) => self.findings = store.findings,
+            Err(e) => self.notice = Some(format!("review findings: {e}")),
+        }
+        cx.notify();
+    }
+
+    /// A person asks for a review of the task now (ADR-0055): the same
+    /// reviewer OMP's `cedian_review_request` runs, its evidence not
+    /// attributed to any call.
+    pub fn request_review(&mut self, focus: String, cx: &mut Context<Self>) {
+        let (Some(root), Some(channel)) = (self.workspace_root(cx), self.workflow_channel.clone())
+        else {
+            self.notice = Some("start OMP before asking for a review".to_string());
+            cx.notify();
+            return;
+        };
+        let state_dir = match self.state_dir(cx) {
+            Ok(dir) => dir,
+            Err(e) => {
+                self.notice = Some(e);
+                cx.notify();
+                return;
+            }
+        };
+        let read = Arc::clone(&self.review_reader);
+        let models = self
+            .router
+            .as_ref()
+            .and_then(|cell| cell.get())
+            .map(|router| router.answered_models())
+            .unwrap_or_default();
+        // Its own thread: the review blocks for minutes, and its reads of
+        // the task cross back to this thread.
+        let (done, run) = futures::channel::oneshot::channel();
+        std::thread::spawn(move || {
+            let review = || {
+                let settings = cedian_shell::resolve_settings(&root).map_err(|e| e.to_string())?;
+                let task = read()?;
+                let diffs: cedian_shell::review_findings::TaskDiffs =
+                    Arc::new(move || read().map(|task| task.diffs));
+                cedian_shell::review_agent::run_review(
+                    &crate::omp_link::review_place(&root, &state_dir),
+                    &settings,
+                    &focus,
+                    task,
+                    diffs,
+                    cedian_shell::review_agent::Requester {
+                        implementer_models: models,
+                        tool_call_id: None,
+                        channel: Some(&channel),
+                    },
+                )
+            };
+            let _ = done.send(review());
+        });
+        self.notice = Some("review running…".to_string());
+        self._review_run = Some(cx.spawn(async move |this, cx| {
+            let reply = run
+                .await
+                .unwrap_or_else(|_| Err("the review thread ended".to_string()));
+            this.update(cx, |this, cx| {
+                this.notice = Some(match reply {
+                    Ok(reply) => reply,
+                    Err(e) => format!("review failed: {e}"),
+                });
+                this.load_findings(cx);
+                this.refresh_workflow(cx);
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// The Dismiss button of a finding: a reason box opens.
+    pub fn start_dismiss(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let input = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Why dismiss this finding?", window, cx);
+            editor
+        });
+        self.dismissing = Some((id.to_string(), input));
+        cx.notify();
+    }
+
+    /// Dismiss the open finding with the reason typed; an empty reason is
+    /// refused (ADR-0041). Audited, and a `finding_dismissed` row.
+    pub fn confirm_dismiss(&mut self, cx: &mut Context<Self>) {
+        let Some((id, input)) = self.dismissing.clone() else {
+            return;
+        };
+        let reason = input.read(cx).text(cx);
+        match self.dismiss_finding(&id, &reason, cx) {
+            Ok(done) => {
+                self.dismissing = None;
+                self.notice = Some(done);
+            }
+            Err(e) => self.notice = Some(e),
+        }
+        self.load_findings(cx);
+        self.refresh_workflow(cx);
+    }
+
+    fn dismiss_finding(
+        &mut self,
+        id: &str,
+        reason: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<String, String> {
+        let dir = self.state_dir(cx)?;
+        let review = &self.review;
+        cedian_shell::review_findings::dismiss(&dir, review.task_id(), id, reason, |path| {
+            Ok(review.last_turn_touching(path, cx))
+        })
+    }
+
     fn report_review(&mut self, result: Result<(), ReviewError>, cx: &mut Context<Self>) {
         if let Err(e) = result {
             self.notice = Some(e.to_string());
@@ -676,6 +851,9 @@ impl CedianPanel {
             spec.browser.set(Arc::clone(browser)).ok();
         }
         self.workflow_channel = Some(Arc::clone(&spec.workflow));
+        spec.review.set(Arc::clone(&self.review_reader)).ok();
+        self.router = Some(Arc::clone(&spec.router));
+        self.load_findings(cx);
         let (read_tx, read_rx) = mpsc::unbounded::<context::Read>();
         spec.uris.push(context::scheme(read_tx));
         let this = cx.entity().downgrade();
@@ -2234,6 +2412,57 @@ impl CedianPanel {
         self.after_review_change(cx);
     }
 
+    /// One finding on its hunk: severity, message, and Dismiss with a
+    /// reason, or the reason it was dismissed for.
+    fn render_finding(&self, finding: &AttachedFinding, cx: &mut Context<Self>) -> AnyElement {
+        let id = finding.id.clone();
+        let selector = format!("cedian-finding-{id}");
+        let severity = match finding.finding.severity {
+            FindingSeverity::Blocker => ("blocker", Color::Error),
+            FindingSeverity::Suggestion => ("suggestion", Color::Warning),
+            FindingSeverity::Info => ("info", Color::Muted),
+        };
+        let mut row = v_flex().debug_selector(move || selector).child(
+            Label::new(format!("{id} {}: {}", severity.0, finding.finding.message))
+                .size(LabelSize::Small)
+                .color(severity.1),
+        );
+        if let Some(reason) = &finding.dismissed {
+            return row
+                .child(
+                    Label::new(format!("dismissed: {reason}"))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .into_any_element();
+        }
+        match &self.dismissing {
+            Some((open, input)) if *open == id => {
+                let confirm = format!("cedian-dismiss-confirm-{id}");
+                row =
+                    row.child(
+                        h_flex()
+                            .gap_1()
+                            .child(div().flex_1().child(input.clone()))
+                            .child(div().debug_selector(|| confirm.clone()).child(
+                                Button::new(ElementId::Name(confirm.into()), "Dismiss").on_click(
+                                    cx.listener(|this, _, _, cx| this.confirm_dismiss(cx)),
+                                ),
+                            )),
+                    );
+            }
+            _ => {
+                let open = format!("cedian-dismiss-{id}");
+                row = row.child(div().debug_selector(|| open.clone()).child(
+                    Button::new(ElementId::Name(open.into()), "Dismiss…").on_click(
+                        cx.listener(move |this, _, window, cx| this.start_dismiss(&id, window, cx)),
+                    ),
+                ));
+            }
+        }
+        row.into_any_element()
+    }
+
     fn render_review(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let turn = self.review.current_turn();
         let mut body = v_flex()
@@ -2246,6 +2475,17 @@ impl CedianPanel {
                 h_flex()
                     .gap_2()
                     .child(Label::new("Review changes"))
+                    .child(
+                        div()
+                            .debug_selector(|| "cedian-review-request".to_string())
+                            .child(
+                                Button::new("cedian-review-request", "Ask for review").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.request_review(String::new(), cx)
+                                    }),
+                                ),
+                            ),
+                    )
                     .child(
                         div()
                             .debug_selector(|| "cedian-accept-all".to_string())
@@ -2313,6 +2553,7 @@ impl CedianPanel {
             .map(|file| {
                 (
                     self.review.path(file, cx),
+                    crate::review::review_key(file.buffer().read(cx)),
                     file.stale_import().map(str::to_string),
                     file.hunks().to_vec(),
                 )
@@ -2334,7 +2575,7 @@ impl CedianPanel {
                     ),
             );
         }
-        for (path, stale_import, hunks) in files {
+        for (path, key, stale_import, hunks) in files {
             let name = path.display().to_string();
             let mut section = v_flex()
                 .gap_1()
@@ -2395,6 +2636,11 @@ impl CedianPanel {
                     ));
                 }
                 card = card.child(buttons);
+                for finding in self.findings.iter().filter(|f| {
+                    Some(&f.finding.path) == key.as_ref() && f.hunk_text == hunk.key.after_text
+                }) {
+                    card = card.child(self.render_finding(finding, cx));
+                }
                 section = section.child(card);
             }
             body = body.child(section);

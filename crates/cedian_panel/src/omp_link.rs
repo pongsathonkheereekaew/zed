@@ -124,7 +124,14 @@ pub struct LaunchSpec {
     pub browser: Arc<OnceLock<Arc<crate::browser::BrowserHost>>>,
     /// The task's workflow channel, which the tools above call.
     pub workflow: Arc<cedian_workflow::WorkflowChannel>,
+    /// The panel's reader of the task's review once it is set: the
+    /// reviewer reads its diffs from Zed's buffers (ADR-0055).
+    pub review: Arc<OnceLock<ReviewReader>>,
 }
+
+/// Reads the task's review on the app thread. Never call it there.
+pub type ReviewReader =
+    Arc<dyn Fn() -> Result<cedian_shell::review_agent::ReviewTask, String> + Send + Sync>;
 
 impl LaunchSpec {
     /// Resolve settings, policy and paths for `workdir`. The app registers
@@ -156,10 +163,36 @@ impl LaunchSpec {
                     .map(|s| s.seq)
             },
         );
+        let review: Arc<OnceLock<ReviewReader>> = Arc::default();
+        let reader = Arc::clone(&review);
+        let read_task: ReviewReader =
+            Arc::new(move || (reader.get().ok_or("the task's review is not open")?)());
+        let read = Arc::clone(&read_task);
+        let diffs: cedian_shell::review_findings::TaskDiffs =
+            Arc::new(move || read().map(|task| task.diffs));
+        let (blockers_dir, blocker_diffs) = (state_dir.clone(), Arc::clone(&diffs));
+        channel.set_blockers(move || {
+            cedian_shell::review_findings::open_blockers(&blockers_dir, || blocker_diffs())
+        });
         let mut tools = channel.host_tools();
+        let models = Arc::clone(&router);
+        tools.push(cedian_shell::review_agent::review_request_tool(
+            review_place(workdir, &state_dir),
+            settings.clone(),
+            read_task,
+            diffs,
+            Arc::new(move || {
+                models
+                    .get()
+                    .map(|router| router.answered_models())
+                    .unwrap_or_default()
+            }),
+            Arc::clone(&channel),
+        ));
         let mut names = vec![
             cedian_workflow::WORKFLOW_UPDATE_TOOL,
             cedian_workflow::COMPLETE_TOOL,
+            cedian_shell::review_agent::REVIEW_REQUEST_TOOL,
         ];
         if cedian_shell::launch::registers_worktree_request(&settings) {
             tools.push(cedian_worker::worktree_request_tool(
@@ -192,7 +225,18 @@ impl LaunchSpec {
             router,
             browser,
             workflow: channel,
+            review,
         })
+    }
+}
+
+/// Where the app's reviewer runs: its run dir and the role it reads sit
+/// in the workspace's state dir, outside what the implementer writes.
+pub fn review_place(workdir: &Path, state_dir: &Path) -> cedian_shell::review_agent::ReviewPlace {
+    cedian_shell::review_agent::ReviewPlace {
+        workdir: workdir.to_path_buf(),
+        state_dir: state_dir.to_path_buf(),
+        session_dir: state_dir.to_path_buf(),
     }
 }
 
@@ -1639,6 +1683,7 @@ mod tests {
                 |_, _| None,
                 cedian_workflow::CurrentState::default,
             ),
+            review: Arc::default(),
         };
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         let link = OmpLink::start(spec(), tx, None);

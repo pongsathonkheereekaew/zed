@@ -104,3 +104,7 @@ harness = false
 [[test]]
 name = "workflow"
 harness = false
+
+[[test]]
+name = "review"
+harness = false

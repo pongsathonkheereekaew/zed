@@ -106,9 +106,33 @@ pub struct InlineEdit {
     /// The selection, anchored so it follows later edits.
     pub range: std::ops::Range<text::Anchor>,
     pub instruction: String,
+    /// The selection's end, kept before text inserted there: lines added
+    /// right after the selection are outside it.
+    end_before: text::Anchor,
 }
 
 impl InlineEdit {
+    pub fn new(
+        path: String,
+        buffer: Entity<Buffer>,
+        selection: std::ops::Range<language::Point>,
+        cx: &App,
+    ) -> Self {
+        let (range, end_before) = buffer.read_with(cx, |b, _| {
+            (
+                b.anchor_before(selection.start)..b.anchor_after(selection.end),
+                b.anchor_before(selection.end),
+            )
+        });
+        Self {
+            path,
+            buffer,
+            range,
+            instruction: String::new(),
+            end_before,
+        }
+    }
+
     /// 1-based first and last line of the selection.
     pub fn lines(&self, cx: &App) -> (u32, u32) {
         use text::ToPoint as _;
@@ -137,6 +161,16 @@ impl InlineEdit {
         )
     }
 
+    /// `hunk` only adds lines right after the selection, which the
+    /// selection's right-biased end would otherwise take in.
+    fn added_after(&self, hunk: &crate::review::ReviewHunk, cx: &App) -> bool {
+        use text::ToOffset as _;
+        let buffer = self.buffer.read(cx);
+        let start = self.range.start.to_offset(buffer);
+        let end_before = self.end_before.to_offset(buffer);
+        hunk.old.is_empty() && end_before > start && hunk.new.start >= end_before
+    }
+
     /// How the review names the turn.
     pub fn label(&self, cx: &App) -> String {
         let (first, last) = self.lines(cx);
@@ -144,9 +178,11 @@ impl InlineEdit {
     }
 }
 
-struct QueuedEdit {
-    edit: InlineEdit,
+/// A follow-up the panel queued, until OMP runs it: each is its own turn.
+struct QueuedFollowUp {
     message: String,
+    /// An inline edit's follow-up: its turn is an edit turn.
+    edit: Option<InlineEdit>,
     /// OMP's queue has listed it.
     in_queue: bool,
 }
@@ -180,9 +216,6 @@ const BASH_TOOL: &str = "bash";
 /// OMP's browser tool: the page at its end is gate evidence (ADR-0055).
 const BROWSER_TOOL: &str = "browser";
 
-/// One finding's block in one editor (ADR-0055 decision 4): never a
-/// diagnostic, which would reach OMP's prompt through the U6 context.
-#[derive(Clone)]
 /// cedian's instruction block in an editor (ADR-0056 decision 2): the
 /// selection it edits and the line the person types the instruction in.
 struct InstructionBlock {
@@ -190,8 +223,13 @@ struct InstructionBlock {
     block: CustomBlockId,
     input: Entity<Editor>,
     edit: InlineEdit,
+    /// The message sent as a follow-up: the block stays until OMP queues it.
+    pending: Option<String>,
 }
 
+/// One finding's block in one editor (ADR-0055 decision 4): never a
+/// diagnostic, which would reach OMP's prompt through the U6 context.
+#[derive(Clone)]
 struct FindingBlock {
     editor: WeakEntity<Editor>,
     block: CustomBlockId,
@@ -337,8 +375,8 @@ pub struct CedianPanel {
     /// The blocks open findings put under their hunk in open editors.
     finding_blocks: Vec<FindingBlock>,
     instruction: Option<InstructionBlock>,
-    /// Inline edits sent as follow-ups, oldest first, until OMP runs them.
-    queued_edits: Vec<QueuedEdit>,
+    /// Follow-ups sent from the panel, oldest first, until OMP runs them.
+    follow_ups: Vec<QueuedFollowUp>,
     /// The inline edit the review's current turn is running, with its turn.
     edit_turn: Option<(u32, InlineEdit)>,
 }
@@ -439,7 +477,7 @@ impl CedianPanel {
             launch_settings: None,
             _workspace_items: None,
             finding_blocks: Vec::new(),
-            queued_edits: Vec::new(),
+            follow_ups: Vec::new(),
             instruction: None,
             edit_turn: None,
         };
@@ -1107,11 +1145,11 @@ impl CedianPanel {
     /// Start (or restart) OMP for the open folder.
     fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let previous = self.link.take();
+        self.notice = None;
         self.forget_old_omp(window, cx);
         self.dialogs.clear();
         self.release_in_flight(cx);
         self.set_turn(Turn::Idle);
-        self.notice = None;
         let Some(root) = self.workspace_root(cx) else {
             self.connection = Connection::Stopped("open a folder first".to_string());
             return;
@@ -1444,7 +1482,7 @@ impl CedianPanel {
     }
 
     /// The old OMP's subagents and queue die with it: their rows go, and
-    /// what was queued goes back to the composer.
+    /// what was queued goes back (`take_back`).
     fn forget_old_omp(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.forget_subagents();
         let queued = self.queued();
@@ -1453,8 +1491,49 @@ impl CedianPanel {
                 steering: Vec::new(),
                 follow_up: Vec::new(),
             });
-            self.restore_to_composer(queued, window, cx);
+            self.take_back(queued, window, cx);
         }
+        self.follow_ups.clear();
+        self.edit_turn = None;
+    }
+
+    /// Queued messages that did not run: a chat message goes back to the
+    /// composer; an inline edit is named in the notice with its
+    /// instruction, since resent from the composer it would be a plain turn.
+    fn take_back(&mut self, texts: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let mut composer = Vec::new();
+        let mut edits = Vec::new();
+        for text in texts {
+            let found = self.follow_ups.iter().rposition(|q| q.message == text);
+            match found.map(|i| self.follow_ups.remove(i)) {
+                Some(QueuedFollowUp {
+                    edit: Some(edit), ..
+                }) => edits.push(format!(
+                    "{} (instruction: {})",
+                    edit.label(cx),
+                    edit.instruction
+                )),
+                _ => composer.push(text),
+            }
+        }
+        if !composer.is_empty() {
+            self.restore_to_composer(composer, window, cx);
+        }
+        if !edits.is_empty() {
+            self.add_notice(format!(
+                "the queued inline edit did not run: {}; select the lines and \
+                 press ctrl-enter to send it again",
+                edits.join(", ")
+            ));
+        }
+    }
+
+    /// `said` joins the notice shown now.
+    fn add_notice(&mut self, said: String) {
+        self.notice = Some(match self.notice.take() {
+            Some(notice) => format!("{notice}; {said}"),
+            None => said,
+        });
     }
 
     fn forget_subagents(&mut self) {
@@ -1543,17 +1622,16 @@ impl CedianPanel {
                 if self.input.read(cx).text(cx) == text {
                     self.input.update(cx, |editor, cx| editor.clear(window, cx));
                 }
-            }
-            LinkEvent::QueueRefused(e) => {
-                if let Some(i) = self.queued_edits.iter().rposition(|q| !q.in_queue) {
-                    self.queued_edits.remove(i);
+                if self
+                    .instruction
+                    .as_ref()
+                    .is_some_and(|b| b.pending.as_ref() == Some(&text))
+                {
+                    self.dismiss_instruction(window, cx);
                 }
-                self.notice = Some(format!("OMP did not queue it: {e}"))
             }
-            LinkEvent::Restored(texts) => {
-                self.queued_edits.retain(|q| !texts.contains(&q.message));
-                self.restore_to_composer(texts, window, cx)
-            }
+            LinkEvent::QueueRefused { text, reason } => self.queue_refused(text, reason, cx),
+            LinkEvent::Restored(texts) => self.take_back(texts, window, cx),
             LinkEvent::TakeBackNotice(notice) => self.notice = Some(notice),
             LinkEvent::SubagentSteered { id, result } => {
                 let note = match result {
@@ -1614,6 +1692,34 @@ impl CedianPanel {
         } else if notice.is_some() {
             self.notice = notice;
         }
+        self.warn_outside_selection(cx);
+    }
+
+    /// A follow-up with `text` did not reach OMP's queue: it is forgotten,
+    /// and an inline edit's instruction stays in its block (or the notice
+    /// when the block is gone).
+    fn queue_refused(&mut self, text: String, reason: String, cx: &mut Context<Self>) {
+        let found = self
+            .follow_ups
+            .iter()
+            .rposition(|q| !q.in_queue && q.message == text);
+        let edit = found.and_then(|i| self.follow_ups.remove(i).edit);
+        let block = self
+            .instruction
+            .as_mut()
+            .filter(|b| b.pending.as_ref() == Some(&text));
+        self.notice = Some(match (edit, block) {
+            (Some(_), Some(block)) => {
+                block.pending = None;
+                format!("OMP did not queue the inline edit: {reason}; it stays in its block")
+            }
+            (Some(edit), None) => format!(
+                "OMP did not queue the inline edit {}: {reason}; instruction: {}",
+                edit.label(cx),
+                edit.instruction
+            ),
+            (None, _) => format!("OMP did not queue it: {reason}"),
+        });
     }
 
     /// Release every call still waiting for its ToolEnd: it is not coming.
@@ -1638,6 +1744,7 @@ impl CedianPanel {
             self.release(&id, call, cx);
         }
         self.review.end_turn();
+        self.warn_outside_selection(cx);
         self.end_workflow_turn(cx);
         self.set_turn(Turn::Idle);
         self.connection = Connection::Stopped(reason);
@@ -1726,9 +1833,9 @@ impl CedianPanel {
                     return false;
                 };
                 link.queue(message.clone(), false);
-                self.queued_edits.push(QueuedEdit {
-                    edit,
+                self.follow_ups.push(QueuedFollowUp {
                     message,
+                    edit: Some(edit),
                     in_queue: false,
                 });
             }
@@ -1750,6 +1857,18 @@ impl CedianPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(open) = &self.instruction
+            && (open.pending.is_some() || !open.input.read(cx).text(cx).trim().is_empty())
+        {
+            let input = open.input.clone();
+            self.notice = Some(format!(
+                "an inline edit of {} is open: send it or press Escape first",
+                open.edit.path
+            ));
+            input.focus_handle(cx).focus(window, cx);
+            cx.notify();
+            return;
+        }
         self.close_instruction(cx);
         let Some(buffer) = editor.read(cx).buffer().read(cx).as_singleton() else {
             self.notice = Some("inline edit works in a single file's editor".to_string());
@@ -1784,7 +1903,6 @@ impl CedianPanel {
         } else {
             (selected.start, selected.end)
         };
-        let range = buffer.read_with(cx, |b, _| b.anchor_before(start)..b.anchor_after(end));
         let input = cx.new(|cx| {
             let mut input = Editor::single_line(window, cx);
             input.set_placeholder_text("Tell OMP how to edit the selection", window, cx);
@@ -1830,12 +1948,8 @@ impl CedianPanel {
             host: editor.downgrade(),
             block,
             input,
-            edit: InlineEdit {
-                path,
-                buffer,
-                range,
-                instruction: String::new(),
-            },
+            edit: InlineEdit::new(path, buffer, start..end, cx),
+            pending: None,
         });
         cx.notify();
     }
@@ -1847,15 +1961,20 @@ impl CedianPanel {
             return;
         };
         let instruction = block.input.read(cx).text(cx);
-        if instruction.trim().is_empty() {
+        if instruction.trim().is_empty() || block.pending.is_some() {
             return;
         }
         let edit = InlineEdit {
             instruction,
             ..block.edit.clone()
         };
-        if self.inline_edit(edit, window, cx) {
-            self.dismiss_instruction(window, cx);
+        let queued = (self.turn == Turn::Streaming).then(|| edit.message(cx));
+        if !self.inline_edit(edit, window, cx) {
+            return;
+        }
+        match (queued, &mut self.instruction) {
+            (Some(message), Some(block)) => block.pending = Some(message),
+            _ => self.dismiss_instruction(window, cx),
         }
     }
 
@@ -1911,7 +2030,8 @@ impl CedianPanel {
                     continue;
                 }
                 let (start, end) = (hunk.rows.start + 1, hunk.rows.end.max(hunk.rows.start + 1));
-                if file.buffer() != &edit.buffer || start < first || end > last {
+                let same = file.buffer() == &edit.buffer;
+                if !same || start < first || end > last || edit.added_after(hunk, cx) {
                     let path = file.buffer().read(cx).file().map_or_else(
                         || self.review.path(file, cx).display().to_string(),
                         |f| f.path().as_unix_str().to_string(),
@@ -1923,34 +2043,43 @@ impl CedianPanel {
         if outside.is_empty() {
             return;
         }
-        let said = format!(
+        self.add_notice(format!(
             "the inline edit changed outside its selection: {}; review it in Review Changes",
             outside.join(", ")
-        );
-        self.notice = Some(match self.notice.take() {
-            Some(notice) => format!("{notice}; {said}"),
-            None => said,
-        });
+        ));
     }
 
-    /// OMP's queue changed: a queued inline edit that left it started
-    /// running, so its own turn begins in the review.
-    fn observe_queued_edits(&mut self, follow_up: &[String], cx: &mut Context<Self>) {
-        let mut i = 0;
-        while i < self.queued_edits.len() {
-            let queued = &mut self.queued_edits[i];
-            let listed = follow_up.contains(&queued.message);
-            if listed {
+    /// OMP's queue changed: each follow-up of the panel's that left it
+    /// started running, so its own turn begins in the review; several
+    /// leaving at once (OMP's `followUpMode = all`) run as one turn.
+    fn observe_follow_ups(&mut self, follow_up: &[String], cx: &mut Context<Self>) {
+        let mut listed: Vec<&String> = follow_up.iter().collect();
+        let mut drained = Vec::new();
+        // OMP runs the oldest first: of identical texts, the newest stay.
+        for i in (0..self.follow_ups.len()).rev() {
+            let queued = &mut self.follow_ups[i];
+            if let Some(j) = listed.iter().position(|m| **m == queued.message) {
+                listed.swap_remove(j);
                 queued.in_queue = true;
-                i += 1;
             } else if queued.in_queue {
-                let queued = self.queued_edits.remove(i);
-                self.warn_outside_selection(cx);
-                self.review.end_turn();
-                self.begin_edit_turn(queued.edit, cx);
-            } else {
-                i += 1;
+                drained.push(self.follow_ups.remove(i));
             }
+        }
+        if drained.is_empty() {
+            return;
+        }
+        self.warn_outside_selection(cx);
+        self.review.end_turn();
+        if drained.len() > 1 {
+            let turn = self.review.begin_turn();
+            self.add_notice(format!(
+                "OMP ran {} queued messages as one turn (turn {turn})",
+                drained.len()
+            ));
+        } else if let Some(edit) = drained.pop().and_then(|q| q.edit) {
+            self.begin_edit_turn(edit, cx);
+        } else {
+            self.review.begin_turn();
         }
     }
 
@@ -1973,6 +2102,13 @@ impl CedianPanel {
             cx.notify();
             return;
         };
+        if !steer {
+            self.follow_ups.push(QueuedFollowUp {
+                message: text.clone(),
+                edit: None,
+                in_queue: false,
+            });
+        }
         link.queue(text, steer);
         self.notice = None;
         cx.notify();
@@ -2031,13 +2167,13 @@ impl CedianPanel {
             {
                 self.set_turn(Turn::Streaming)
             }
-            RouterEvent::Queue { follow_up, .. } => self.observe_queued_edits(follow_up, cx),
+            RouterEvent::Queue { follow_up, .. } => self.observe_follow_ups(follow_up, cx),
             RouterEvent::Settled => {
-                self.warn_outside_selection(cx);
                 self.review.end_turn();
                 if let Turn::Failed(reason) = std::mem::replace(&mut self.turn, Turn::Idle) {
                     self.notice = Some(format!("turn failed: {reason}"));
                 }
+                self.warn_outside_selection(cx);
                 self.end_workflow_turn(cx);
                 self.refresh_workflow(cx);
             }
@@ -3062,15 +3198,16 @@ impl CedianPanel {
                             ),
                     )
                     .when(turn > 0 && self.turn == Turn::Idle, |row| {
+                        let label = self.revert_turn_label(turn);
+                        let drawn = format!("cedian-revert-turn-text:{label}");
                         row.child(
                             div()
                                 .debug_selector(|| "cedian-revert-turn".to_string())
-                                .child(
-                                    Button::new("cedian-revert-turn", self.revert_turn_label(turn))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.revert_turn(turn, cx)
-                                        })),
-                                ),
+                                .child(div().debug_selector(move || drawn).child(
+                                    Button::new("cedian-revert-turn", label).on_click(cx.listener(
+                                        move |this, _, _, cx| this.revert_turn(turn, cx),
+                                    )),
+                                )),
                         )
                     }),
             );
@@ -4710,17 +4847,11 @@ mod tests {
         let (f, buffer) = fixture(cx).await;
         f.window
             .update(cx, |panel, _, cx| {
-                let edit = buffer.read_with(cx, |b, _| InlineEdit {
-                    path: "notes.txt".to_string(),
-                    buffer: buffer.clone(),
-                    range: b.anchor_before(language::Point::new(1, 0))
-                        ..b.anchor_after(language::Point::new(2, 0)),
-                    instruction: "shout".to_string(),
-                });
+                let edit = edit_of(&buffer, 1..2, "shout", cx);
                 let message = edit.message(cx);
-                panel.queued_edits.push(QueuedEdit {
-                    edit,
+                panel.follow_ups.push(QueuedFollowUp {
                     message: message.clone(),
+                    edit: Some(edit),
                     in_queue: false,
                 });
                 let queue = |follow_up: Vec<String>| RouterEvent::Queue {
@@ -4732,7 +4863,7 @@ mod tests {
                 panel.on_event(queue(Vec::new()), cx);
                 assert_eq!(panel.review.current_turn(), 2);
                 assert_eq!(panel.review.turn_label(2), Some("notes.txt:2-2 shout"));
-                assert!(panel.queued_edits.is_empty());
+                assert!(panel.follow_ups.is_empty());
             })
             .unwrap();
     }
@@ -4745,13 +4876,7 @@ mod tests {
         f.window
             .update(cx, |panel, _, cx| {
                 panel.review.end_turn();
-                let edit = buffer.read_with(cx, |b, _| InlineEdit {
-                    path: "notes.txt".to_string(),
-                    buffer: buffer.clone(),
-                    range: b.anchor_before(language::Point::new(0, 0))
-                        ..b.anchor_after(language::Point::new(1, 0)),
-                    instruction: "shout".to_string(),
-                });
+                let edit = edit_of(&buffer, 0..1, "shout", cx);
                 panel.begin_edit_turn(edit, cx);
             })
             .unwrap();
@@ -4773,6 +4898,293 @@ mod tests {
         assert_eq!(
             buffer.read_with(cx, |b, _| b.text()),
             "ALPHA\nbeta\nGAMMA\n"
+        );
+    }
+
+    fn edit_of(
+        buffer: &Entity<Buffer>,
+        rows: std::ops::Range<u32>,
+        instruction: &str,
+        cx: &App,
+    ) -> InlineEdit {
+        let selection = language::Point::new(rows.start, 0)..language::Point::new(rows.end, 0);
+        InlineEdit {
+            instruction: instruction.to_string(),
+            ..InlineEdit::new("notes.txt".to_string(), buffer.clone(), selection, cx)
+        }
+    }
+
+    fn queue_of(follow_up: Vec<String>) -> RouterEvent {
+        RouterEvent::Queue {
+            steering: Vec::new(),
+            follow_up,
+        }
+    }
+
+    fn follow_up(message: &str, edit: Option<InlineEdit>) -> QueuedFollowUp {
+        QueuedFollowUp {
+            message: message.to_string(),
+            edit,
+            in_queue: false,
+        }
+    }
+
+    /// U10 fix 1: Restart while an inline edit is queued opens no edit turn
+    /// in the next OMP, and names the edit that did not run.
+    #[gpui::test]
+    async fn restart_with_a_queued_edit_opens_no_phantom_turn(cx: &mut TestAppContext) {
+        let (f, buffer) = fixture(cx).await;
+        f.window
+            .update(cx, |panel, window, cx| {
+                let edit = edit_of(&buffer, 1..2, "shout", cx);
+                let message = edit.message(cx);
+                panel.follow_ups.push(follow_up(&message, Some(edit)));
+                panel.on_event(queue_of(vec![message]), cx);
+                panel.on_link_event(LinkEvent::Event(RouterEvent::Disconnected), window, cx);
+                panel.forget_old_omp(window, cx);
+                panel.on_event(queue_of(Vec::new()), cx);
+                assert_eq!(panel.review.current_turn(), 1, "no phantom turn");
+                assert_eq!(panel.review.turn_label(1), None);
+                assert_eq!(panel.input.read(cx).text(cx), "", "not in the composer");
+                assert_eq!(
+                    panel.notice(),
+                    Some(
+                        "the queued inline edit did not run: notes.txt:2-2 shout \
+                         (instruction: shout); select the lines and press \
+                         ctrl-enter to send it again"
+                    )
+                );
+            })
+            .unwrap();
+    }
+
+    /// U10 fix 2: a chat follow-up OMP drains during an inline edit's turn
+    /// is a turn of its own: not labelled, not warned about, and reverting
+    /// the edit keeps its write.
+    #[gpui::test]
+    async fn a_chat_follow_up_after_an_inline_edit_is_its_own_turn(cx: &mut TestAppContext) {
+        let (f, buffer) = fixture(cx).await;
+        f.window
+            .update(cx, |panel, _, cx| {
+                panel.review.end_turn();
+                let edit = edit_of(&buffer, 0..1, "shout", cx);
+                panel.begin_edit_turn(edit, cx);
+                panel.follow_ups.push(follow_up("and gamma too", None));
+                panel.on_event(queue_of(vec!["and gamma too".to_string()]), cx);
+            })
+            .unwrap();
+        tool_start(&f, cx, "c1", &["notes.txt"]);
+        omp_writes(&f, "/ws/notes.txt", "ALPHA\nbeta\ngamma\n").await;
+        tool_end(&f, cx, "c1");
+        f.window
+            .update(cx, |panel, _, cx| panel.on_event(queue_of(Vec::new()), cx))
+            .unwrap();
+        tool_start(&f, cx, "c2", &["notes.txt"]);
+        omp_writes(&f, "/ws/notes.txt", "ALPHA\nbeta\nGAMMA\n").await;
+        tool_end(&f, cx, "c2");
+        settled(&f, cx);
+        f.window
+            .update(cx, |panel, _, cx| {
+                assert_eq!(panel.review.current_turn(), 3);
+                assert_eq!(panel.review.turn_label(3), None);
+                assert_eq!(panel.notice(), None, "the chat's write is not the edit's");
+                panel.revert_turn(2, cx);
+            })
+            .unwrap();
+        assert_eq!(
+            buffer.read_with(cx, |b, _| b.text()),
+            "alpha\nbeta\nGAMMA\n"
+        );
+    }
+
+    /// U10 fix 2 (`followUpMode = all`): two follow-ups leaving OMP's
+    /// queue at once are one turn, and the notice says so.
+    #[gpui::test]
+    async fn follow_ups_drained_together_are_one_named_turn(cx: &mut TestAppContext) {
+        let (f, buffer) = fixture(cx).await;
+        f.window
+            .update(cx, |panel, _, cx| {
+                let (a, b) = (
+                    edit_of(&buffer, 0..1, "shout", cx),
+                    edit_of(&buffer, 2..3, "whisper", cx),
+                );
+                let (ma, mb) = (a.message(cx), b.message(cx));
+                panel.follow_ups.push(follow_up(&ma, Some(a)));
+                panel.follow_ups.push(follow_up(&mb, Some(b)));
+                panel.on_event(queue_of(vec![ma, mb]), cx);
+                panel.on_event(queue_of(Vec::new()), cx);
+                assert_eq!(panel.review.current_turn(), 2);
+                assert_eq!(panel.review.turn_label(2), None);
+                assert_eq!(
+                    panel.notice(),
+                    Some("OMP ran 2 queued messages as one turn (turn 2)")
+                );
+            })
+            .unwrap();
+    }
+
+    /// U10 fix 3: a refused follow-up forgets that follow-up, not another;
+    /// of identical texts, one leaving the queue is one turn.
+    #[gpui::test]
+    async fn a_refused_follow_up_forgets_only_itself(cx: &mut TestAppContext) {
+        let (f, buffer) = fixture(cx).await;
+        f.window
+            .update(cx, |panel, window, cx| {
+                let edit = edit_of(&buffer, 1..2, "shout", cx);
+                let message = edit.message(cx);
+                panel.follow_ups.push(follow_up("chat", None));
+                panel.follow_ups.push(follow_up(&message, Some(edit)));
+                let refused = LinkEvent::QueueRefused {
+                    text: "chat".to_string(),
+                    reason: "Stop came first; it stays here".to_string(),
+                };
+                panel.on_link_event(refused, window, cx);
+                assert_eq!(panel.follow_ups.len(), 1);
+                assert_eq!(panel.follow_ups[0].message, message);
+                panel.follow_ups.clear();
+                panel.follow_ups.push(follow_up("same", None));
+                panel.follow_ups.push(follow_up("same", None));
+                let same = || "same".to_string();
+                panel.on_event(queue_of(vec![same(), same()]), cx);
+                panel.on_event(queue_of(vec![same()]), cx);
+                assert_eq!(panel.review.current_turn(), 2, "one drained, one turn");
+                assert_eq!(panel.follow_ups.len(), 1);
+                panel.on_event(queue_of(Vec::new()), cx);
+                assert_eq!(panel.review.current_turn(), 3);
+            })
+            .unwrap();
+    }
+
+    /// U10 fixes 5 and 7: the instruction block keeps its text while OMP
+    /// may still refuse it, and a second ctrl-enter does not drop it.
+    #[gpui::test]
+    async fn the_instruction_block_keeps_its_text(cx: &mut TestAppContext) {
+        let (f, buffer) = fixture(cx).await;
+        bind_default_keymap(cx);
+        let (workspace, editor) = open_in_workspace(&f, &buffer, cx);
+        let mut vcx = VisualTestContext::from_window(workspace.into(), cx);
+        editor.update_in(&mut vcx, |editor, window, cx| {
+            editor.change_selections(Default::default(), window, cx, |s| {
+                s.select_ranges([language::Point::new(1, 0)..language::Point::new(1, 4)])
+            });
+        });
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("ctrl-enter");
+        vcx.run_until_parked();
+        vcx.simulate_input("shout");
+        editor.update_in(&mut vcx, |editor, window, cx| {
+            editor.focus_handle(cx).focus(window, cx)
+        });
+        vcx.simulate_keystrokes("ctrl-enter");
+        vcx.run_until_parked();
+        let typed = |vcx: &mut VisualTestContext| {
+            f.window
+                .read_with(vcx, |p, cx| {
+                    p.instruction.as_ref().map(|b| b.input.read(cx).text(cx))
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            typed(&mut vcx).as_deref(),
+            Some("shout"),
+            "second ctrl-enter"
+        );
+        // Sent as a follow-up while a turn runs: OMP refuses it.
+        let message = f
+            .window
+            .update(&mut vcx, |p, _, cx| {
+                let block = p.instruction.as_mut().unwrap();
+                let edit = InlineEdit {
+                    instruction: "shout".to_string(),
+                    ..block.edit.clone()
+                };
+                let message = edit.message(cx);
+                block.pending = Some(message.clone());
+                p.follow_ups.push(follow_up(&message, Some(edit)));
+                message
+            })
+            .unwrap();
+        f.window
+            .update(&mut vcx, |p, window, cx| {
+                let refused = LinkEvent::QueueRefused {
+                    text: message.clone(),
+                    reason: "pipe".to_string(),
+                };
+                p.on_link_event(refused, window, cx);
+            })
+            .unwrap();
+        assert_eq!(
+            typed(&mut vcx).as_deref(),
+            Some("shout"),
+            "refused keeps it"
+        );
+        assert_eq!(
+            notice(&f, &mut vcx).as_deref(),
+            Some("OMP did not queue the inline edit: pipe; it stays in its block")
+        );
+        f.window
+            .update(&mut vcx, |p, window, cx| {
+                p.instruction.as_mut().unwrap().pending = Some(message.clone());
+                p.on_link_event(LinkEvent::Queued(message), window, cx);
+                assert!(!p.instruction_open(), "queued: the block goes");
+            })
+            .unwrap();
+    }
+
+    /// U10 fix 6: Stop's take-back puts a chat follow-up in the composer
+    /// and names a queued inline edit with its instruction.
+    #[gpui::test]
+    async fn stop_takes_back_an_inline_edit_to_the_notice(cx: &mut TestAppContext) {
+        let (f, buffer) = fixture(cx).await;
+        f.window
+            .update(cx, |panel, window, cx| {
+                let edit = edit_of(&buffer, 1..2, "shout", cx);
+                let message = edit.message(cx);
+                panel.follow_ups.push(follow_up(&message, Some(edit)));
+                panel.follow_ups.push(follow_up("chat", None));
+                let restored = LinkEvent::Restored(vec![message, "chat".to_string()]);
+                panel.on_link_event(restored, window, cx);
+                assert_eq!(panel.input.read(cx).text(cx), "chat");
+                assert_eq!(
+                    panel.notice(),
+                    Some(
+                        "the queued inline edit did not run: notes.txt:2-2 shout \
+                         (instruction: shout); select the lines and press \
+                         ctrl-enter to send it again"
+                    )
+                );
+                assert!(panel.follow_ups.is_empty());
+            })
+            .unwrap();
+    }
+
+    /// U10 fix 8: a stopped inline edit is checked when it stops, and lines
+    /// added right after the selection are outside it.
+    #[gpui::test]
+    async fn a_stopped_inline_edit_is_checked_at_once(cx: &mut TestAppContext) {
+        let (f, buffer) = fixture(cx).await;
+        f.window
+            .update(cx, |panel, _, cx| {
+                panel.review.end_turn();
+                let edit = edit_of(&buffer, 0..1, "shout", cx);
+                panel.begin_edit_turn(edit, cx);
+            })
+            .unwrap();
+        tool_start(&f, cx, "c1", &["notes.txt"]);
+        omp_writes(&f, "/ws/notes.txt", "alpha\nNEW\nbeta\ngamma\n").await;
+        tool_end(&f, cx, "c1");
+        f.window
+            .update(cx, |panel, window, cx| {
+                panel.on_link_event(LinkEvent::PromptStopped("pipe".into()), window, cx)
+            })
+            .unwrap();
+        assert_eq!(
+            notice(&f, cx).as_deref(),
+            Some(
+                "turn stopped: pipe; the inline edit changed outside its selection: \
+                 notes.txt:2-2; review it in Review Changes"
+            )
         );
     }
 

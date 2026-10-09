@@ -60,8 +60,9 @@ pub enum LinkEvent {
     AbortFailed(String),
     /// OMP took a mid-turn steer or follow-up with this text.
     Queued(String),
-    /// A mid-turn steer or follow-up did not reach OMP's queue.
-    QueueRefused(String),
+    /// A mid-turn steer or follow-up with this text did not reach OMP's
+    /// queue, and why.
+    QueueRefused { text: String, reason: String },
     /// Stop took these queued messages back out of OMP's queue before the
     /// abort, oldest first, for the composer.
     Restored(Vec<String>),
@@ -827,10 +828,14 @@ impl OmpLink {
     pub fn queue(&self, text: String, steer: bool) {
         let gate = Arc::clone(&self.gate);
         let epoch = gate.epoch();
-        let not_running = LinkEvent::QueueRefused("OMP is not running".to_string());
+        let refused = |text: &String, reason: String| LinkEvent::QueueRefused {
+            text: text.clone(),
+            reason,
+        };
+        let not_running = refused(&text, "OMP is not running".to_string());
         self.off_thread(not_running, move |control| {
             let Some(_sending) = gate.admit(epoch) else {
-                return LinkEvent::QueueRefused("Stop came first; it stays here".to_string());
+                return refused(&text, "Stop came first; it stays here".to_string());
             };
             let sent = if steer {
                 control.steer(&text)
@@ -842,7 +847,7 @@ impl OmpLink {
                     gate.accepted(&text, steer);
                     LinkEvent::Queued(text)
                 }
-                Err(e) => LinkEvent::QueueRefused(e.to_string()),
+                Err(e) => refused(&text, e.to_string()),
             }
         });
     }

@@ -196,10 +196,9 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
     };
     vcx.simulate_click(bounds.center(), gpui::Modifiers::none());
     vcx.run_until_parked();
-    let button = rendered_text(&mut vcx, &window);
-    assert!(
-        button.contains("Revert turn 1: inline edit notes.txt:2-2 make this line uppercase"),
-        "{button}"
+    assert_drawn(
+        &mut vcx,
+        "Revert turn 1: inline edit notes.txt:2-2 make this line uppercase",
     );
     // 2. The prompt turn, then the person's edit over line 4.
     let mut wcx = VisualTestContext::from_window(workspace_window.into(), cx);
@@ -281,19 +280,15 @@ fn bind_default_keymap(cx: &mut TestAppContext) {
     });
 }
 
-/// The Revert turn button's text, with the button on screen.
-fn rendered_text(vcx: &mut VisualTestContext, window: &WindowHandle<CedianPanel>) -> String {
+/// The Revert turn button is drawn with `text`.
+fn assert_drawn(vcx: &mut VisualTestContext, text: &str) {
     vcx.update(|window, _| window.refresh());
     vcx.run_until_parked();
+    let selector = format!("cedian-revert-turn-text:{text}").leak();
     assert!(
-        vcx.debug_bounds("cedian-revert-turn").is_some(),
-        "Revert turn is on screen"
+        vcx.debug_bounds(selector).is_some(),
+        "Revert turn is drawn as {text:?}"
     );
-    window
-        .update(vcx, |p, _, _| {
-            p.revert_turn_label(p.review().current_turn())
-        })
-        .unwrap()
 }
 
 fn assert_connected(cx: &mut TestAppContext, window: &WindowHandle<CedianPanel>) {

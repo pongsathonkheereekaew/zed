@@ -247,6 +247,7 @@ mod tests {
             tool_name: "bash".into(),
             result_summary: String::new(),
             is_error: false,
+            before: Vec::new(),
         };
         let mut log = AuditLog::open(&dir, Approvals::Omp).unwrap();
         log.record(&start).unwrap();

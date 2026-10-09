@@ -349,6 +349,7 @@ mod tests {
             tool_name: "read".to_string(),
             result_summary: "42 lines".to_string(),
             is_error: false,
+            before: Vec::new(),
         });
         assert!(matches!(
             &t.events()[0],
@@ -412,6 +413,7 @@ mod tests {
             tool_name: "bash".to_string(),
             result_summary: "command failed".to_string(),
             is_error: true,
+            before: Vec::new(),
         });
         match &t.events()[0] {
             ThreadEvent::Tool {

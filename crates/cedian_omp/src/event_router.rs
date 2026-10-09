@@ -45,12 +45,15 @@ pub enum RouterEvent {
         args_preview: String,
         paths: Vec<String>,
     },
-    /// Tool execution finished.
+    /// Tool execution finished. `before` is each file's text before the
+    /// call as OMP's result reports it (`edit` results only, by path as
+    /// OMP names it).
     ToolEnd {
         tool_call_id: String,
         tool_name: String,
         result_summary: String,
         is_error: bool,
+        before: Vec<(String, TextBefore)>,
     },
     /// A prompt ticket completed.
     PromptResult {
@@ -379,6 +382,46 @@ fn notification_name(frame: &RpcNotification) -> &'static str {
     }
 }
 
+/// A file's text before an edit call, from OMP 18.6.1's result `details`:
+/// `oldText` is the whole file before the call (OMP diffs it against
+/// `newText` and re-parses it to catch a syntax regression), absent for a
+/// file the call created; once a result's texts pass 32 KiB OMP drops them
+/// and says `snapshotsPruned`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TextBefore {
+    Text(String),
+    NewFile,
+    Pruned,
+}
+
+/// The before-texts in an edit result's `details`: one file's fields, or
+/// a `perFileResults` list of them.
+pub fn texts_before(result: Option<&serde_json::Value>) -> Vec<(String, TextBefore)> {
+    let Some(details) = result.and_then(|r| r.get("details")) else {
+        return Vec::new();
+    };
+    let files: Vec<&serde_json::Value> = match details.get("perFileResults") {
+        Some(serde_json::Value::Array(files)) => files.iter().collect(),
+        _ => vec![details],
+    };
+    files
+        .into_iter()
+        .filter_map(|file| {
+            let path = file.get("path")?.as_str()?.to_string();
+            let before = if file.get("snapshotsPruned").and_then(|v| v.as_bool()) == Some(true) {
+                TextBefore::Pruned
+            } else if let Some(text) = file.get("oldText").and_then(|v| v.as_str()) {
+                TextBefore::Text(text.to_string())
+            } else if file.get("newText").is_some_and(|v| v.is_string()) {
+                TextBefore::NewFile
+            } else {
+                return None;
+            };
+            Some((path, before))
+        })
+        .collect()
+}
+
 /// Pure classifier: session event → router event.
 fn classify_agent_event(event: &RpcAgentEvent) -> RouterEvent {
     match event {
@@ -426,6 +469,7 @@ fn classify_agent_event(event: &RpcAgentEvent) -> RouterEvent {
             tool_name: end.tool_name.clone(),
             result_summary: summarize_result(&end.tool_name, end.result.as_ref()),
             is_error: end.is_error.unwrap_or(false),
+            before: texts_before(end.result.as_ref()),
         },
         RpcAgentEvent::QueueUpdate(queue) => RouterEvent::Queue {
             steering: queue.steering.clone(),
@@ -578,6 +622,29 @@ fn summarize_result(name: &str, result: Option<&serde_json::Value>) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn an_edit_result_names_each_files_text_before_the_call() {
+        use super::TextBefore;
+        use serde_json::json;
+        let one = json!({"details": {"path": "/ws/a.txt", "oldText": "a\n", "newText": "A\n"}});
+        assert_eq!(
+            super::texts_before(Some(&one)),
+            vec![("/ws/a.txt".to_string(), TextBefore::Text("a\n".to_string()))]
+        );
+        let many = json!({"details": {"perFileResults": [
+            {"path": "/ws/new.txt", "newText": "n\n"},
+            {"path": "/ws/big.txt", "snapshotsPruned": true},
+            {"path": "/ws/moved.txt", "diff": "-x"}
+        ]}});
+        assert_eq!(
+            super::texts_before(Some(&many)),
+            vec![
+                ("/ws/new.txt".to_string(), TextBefore::NewFile),
+                ("/ws/big.txt".to_string(), TextBefore::Pruned),
+            ]
+        );
+    }
+
+    #[test]
     fn written_paths_name_every_file_an_edit_tool_touches() {
         use serde_json::json;
         let edit = json!({"input": "[notes.txt#6193]\nPUT 2.=2:\n+BETA\n[src/a.rs#0585]\nPUT 1.=1:\n+x\n[notes.txt#6193]\n"});
@@ -597,6 +664,7 @@ mod tests {
         assert!(super::written_paths("bash", Some(&json!({"command": "rm notes.txt"}))).is_empty());
         assert!(super::written_paths("edit", None).is_empty());
         let device = json!({"path": "xd://cedian_complete", "content": "{}"});
+        assert!(super::texts_before(Some(&json!({"content": []}))).is_empty());
         assert!(
             super::written_paths("write", Some(&device)).is_empty(),
             "a write to an xd:// device is a host tool call, not a file"
@@ -624,6 +692,7 @@ mod tests {
             tool_name: name.into(),
             result_summary: String::new(),
             is_error,
+            before: Vec::new(),
         };
         router.push(start("ok", "bash"));
         router.push(start("bad", "bash"));

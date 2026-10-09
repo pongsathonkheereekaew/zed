@@ -46,6 +46,15 @@ impl Mark {
         self.disk_at_start = Some(text);
     }
 
+    /// OMP's own text from before the call replaces a disk read that may
+    /// have run after the write. A mark with no read (a clean buffer) keeps
+    /// its start text, which is the disk text.
+    pub fn correct_disk_at_start(&mut self, omp_before: &str) {
+        if self.disk_at_start.is_some() {
+            self.disk_at_start = Some(omp_before.to_string());
+        }
+    }
+
     fn disk_at_start(&self) -> String {
         self.disk_at_start
             .clone()

@@ -26,6 +26,7 @@ pub use dialog::{
 pub use errors::OmpError;
 pub use event_router::{
     DeltaKind, EventRouter, FinishedToolCall, LogEntry, PromptStatus, RouterEvent, SubagentStatus,
+    TextBefore, texts_before,
 };
 pub use omp_config::{Layer, OmpConfig, Setting, WriteOutcome};
 pub use runtime::{

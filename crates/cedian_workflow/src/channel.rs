@@ -495,6 +495,54 @@ impl WorkflowChannel {
         }))
     }
 
+    /// The running workflow's gates that name `kind` among the evidence
+    /// they take; empty without one (the fast lane, ADR-0026). A gate that
+    /// takes any kind is not among them: an observation cedian makes on
+    /// its own counts only where a gate asked for its kind.
+    pub fn gates_taking(&self, kind: EvidenceKind) -> Result<Vec<String>, String> {
+        let _guard = store_lock();
+        let Some(state) = self.store.load()? else {
+            return Ok(Vec::new());
+        };
+        if state.status != WorkflowStatus::Running {
+            return Ok(Vec::new());
+        }
+        Ok(state
+            .playbook
+            .gates
+            .iter()
+            .filter(|g| g.predicate.kinds.contains(&kind))
+            .map(|g| g.id.clone())
+            .collect())
+    }
+
+    /// Store an observation cedian made of one of OMP's calls (a browser
+    /// capture at the end of OMP's `browser` call, ADR-0055) under the
+    /// next evidence id, bound to the workspace now unless it carries its
+    /// own code state. `None` without a running workflow.
+    pub fn observe(&self, mut item: Evidence) -> Result<Option<String>, String> {
+        let _guard = store_lock();
+        let Some(mut state) = self.store.load()? else {
+            return Ok(None);
+        };
+        if state.status != WorkflowStatus::Running {
+            return Ok(None);
+        }
+        item.id = format!("e{}", state.evidence.len() + 1);
+        if item.code_state.is_none() {
+            item.code_state = Some((self.current)().bind(&[]));
+        }
+        let id = item.id.clone();
+        state.attach(item).map_err(|e| e.to_string())?;
+        self.store.save(&state)?;
+        Ok(Some(id))
+    }
+
+    /// The state gates are judged against now.
+    pub fn current(&self) -> CurrentState {
+        (self.current)()
+    }
+
     /// Evidence cedian produced itself, such as a review it ran (ADR-0039):
     /// attributed to the host-tool call that asked for it, unattributed
     /// when a person ran it from the CLI. `None` without an active workflow.

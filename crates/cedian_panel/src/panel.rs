@@ -29,7 +29,10 @@ use cedian_agent::{Thread, ThreadEvent};
 use cedian_agent_ui::{SubagentRow, SubagentTree, ToolCard};
 use cedian_omp::{RouterEvent, SubagentStatus, TextBefore, UserAnswer};
 use cedian_review::{HunkKey, HunkStatus};
-use cedian_workflow::{CurrentState, Evidence, Gate, GateResult, Outcome, WorkflowStatus};
+use cedian_workflow::{
+    CurrentState, Evidence, EvidenceKind, Gate, GateResult, Outcome, Provenance, WorkflowChannel,
+    WorkflowStatus,
+};
 use cedian_workspace::{capture_ambient, render_snapshot};
 use collections::{HashMap, HashSet, IndexMap};
 use editor::{Editor, actions::Paste};
@@ -101,6 +104,8 @@ struct CallMarks {
 
 /// The tool whose writes cedian learns only from the files it changed.
 const BASH_TOOL: &str = "bash";
+/// OMP's browser tool: the page at its end is gate evidence (ADR-0055).
+const BROWSER_TOOL: &str = "browser";
 
 /// How long a dialog waits on the person before cedian closes it (§63,
 /// ADR-0013).
@@ -210,6 +215,8 @@ pub struct CedianPanel {
     state_dir: Option<PathBuf>,
     /// The task's workflow as last read, when one was started.
     workflow: Option<WorkflowView>,
+    /// The channel OMP's workflow tools call, once OMP was started.
+    workflow_channel: Option<Arc<WorkflowChannel>>,
     _workflow_load: Option<Task<()>>,
     /// The §54 escalation the blocked workflow waits on the person for.
     escalation: Option<String>,
@@ -270,6 +277,7 @@ impl CedianPanel {
             state_dir: None,
             workflow: None,
             _workflow_load: None,
+            workflow_channel: None,
             escalation: None,
             workspace: None,
             _events: None,
@@ -480,6 +488,18 @@ impl CedianPanel {
         self.link.as_ref().is_some_and(OmpLink::runs_unprompted)
     }
 
+    /// The channel OMP's workflow tools call.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn workflow_channel(&self) -> Option<Arc<WorkflowChannel>> {
+        self.workflow_channel.clone()
+    }
+
+    /// Handle `event` as if OMP's router sent it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn router_event(&mut self, event: RouterEvent, cx: &mut Context<Self>) {
+        self.on_event(event, cx);
+    }
+
     /// Make the link's audit rows fail from now on.
     #[cfg(any(test, feature = "test-support"))]
     pub fn break_audit(&self) {
@@ -652,6 +672,10 @@ impl CedianPanel {
             self.open_browser_host(&spec.state_dir, cx);
         }
         spec.policy.browser_cdp_url = self.browser.as_ref().map(|b| b.url());
+        if let Some(browser) = &self.browser {
+            spec.browser.set(Arc::clone(browser)).ok();
+        }
+        self.workflow_channel = Some(Arc::clone(&spec.workflow));
         let (read_tx, read_rx) = mpsc::unbounded::<context::Read>();
         spec.uris.push(context::scheme(read_tx));
         let this = cx.entity().downgrade();
@@ -793,6 +817,43 @@ impl CedianPanel {
                 cx.notify();
             })
             .ok();
+        })
+        .detach();
+    }
+
+    /// OMP's `browser` call ended: when the running workflow has a gate
+    /// that takes browser evidence (the user's floor asks for one,
+    /// ADR-0055), the page now is captured and stored as that call's
+    /// evidence, bound to its frame. Otherwise nothing is captured.
+    fn observe_browser_call(&mut self, call: String, is_error: bool, cx: &mut Context<Self>) {
+        let (Some(host), Some(channel)) = (self.browser.clone(), self.workflow_channel.clone())
+        else {
+            return;
+        };
+        let task = cx.background_spawn(async move {
+            let gates = channel.gates_taking(EvidenceKind::Browser)?;
+            if gates.is_empty() {
+                return Ok(None);
+            }
+            let gates: Vec<&str> = gates.iter().map(String::as_str).collect();
+            let capture = host.capture()?;
+            let mut item = capture.evidence("", &gates, Outcome::from_ok(!is_error));
+            item.kind = EvidenceKind::Browser;
+            item.provenance = Provenance::Attributed {
+                task_id: TASK_ID.to_string(),
+                tool_call_id: call.clone(),
+            };
+            item.summary = format!("after browser call {call}: {}", item.summary);
+            channel.observe(item)
+        });
+        cx.spawn(async move |this, cx| {
+            if let Err(e) = task.await {
+                this.update(cx, |this, cx| {
+                    this.notice = Some(format!("the browser call's capture failed: {e}"));
+                    cx.notify();
+                })
+                .ok();
+            }
         })
         .detach();
     }
@@ -1195,10 +1256,14 @@ impl CedianPanel {
             } if tool_name == BASH_TOOL => self.mark_for_bash(tool_call_id.clone(), cx),
             RouterEvent::ToolEnd {
                 tool_call_id,
+                tool_name,
                 is_error,
                 before,
                 ..
             } => {
+                if tool_name == BROWSER_TOOL {
+                    self.observe_browser_call(tool_call_id.clone(), *is_error, cx);
+                }
                 let root = self.workspace_root(cx);
                 if let Some(call) = self.calls.get_mut(tool_call_id) {
                     call.ended = Some(*is_error);
@@ -1286,6 +1351,7 @@ impl CedianPanel {
         // A finished workflow's gates no longer change: once shown, it is
         // not hashed again on every turn. `None` keeps the view.
         let shown_finished = self.workflow.as_ref().is_some_and(|v| !live(v.status));
+        let frame_seq = self.current_state().frame_seq;
         let read = cx.background_spawn(async move {
             if !cedian_shell::workflow_store::exists(&dir) {
                 return Ok(Some(None));
@@ -1294,7 +1360,8 @@ impl CedianPanel {
             if shown_finished && !live(state.status) {
                 return Ok(None);
             }
-            let current = cedian_shell::workflow_host::current_state(&root);
+            let mut current = cedian_shell::workflow_host::current_state(&root);
+            current.frame_seq = frame_seq;
             Ok::<_, String>(Some(Some(WorkflowView::new(&state, &current))))
         });
         self._workflow_load = Some(cx.spawn(async move |this, cx| {

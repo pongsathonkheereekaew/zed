@@ -49,7 +49,12 @@ fn main() {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("ws")).unwrap();
     std::fs::create_dir_all(root.join("ws2")).unwrap();
-    std::fs::write(root.join("cedian.toml"), "schema = 1\n").unwrap();
+    std::fs::write(
+        root.join("cedian.toml"),
+        "schema = 1\n[[workflow.floor]]\nkind = \"prototype\"\nmin_risk = \"low\"\n\
+         gates = [{ id = \"ui\", gate_kind = \"visual\", evidence_kinds = [\"browser\"] }]\n",
+    )
+    .unwrap();
     let root = root.canonicalize().unwrap();
     // SAFETY: single-threaded here; nothing else reads the environment yet.
     unsafe {
@@ -1052,6 +1057,8 @@ async fn exit(cx: &mut TestAppContext, root: &Path) {
         both.deciding
     );
 
+    omps_browser_call_is_gate_evidence(cx, &window, &host, &ws, &mut omp);
+
     let ws2 = root.join("ws2");
     cedian_fake_omp::install_replay(
         &cedian_shell::state::dir(&ws2).unwrap().join("omp"),
@@ -1091,6 +1098,94 @@ async fn exit(cx: &mut TestAppContext, root: &Path) {
         );
         assert!(!host.state().running, "before the app exits");
     }
+}
+
+/// U9h (ADR-0055): the end of OMP's `browser` call is a capture, stored as
+/// evidence attributed to that call, for the gate the user's floor asks
+/// for (`ui`, kind `browser`). Outside a workflow nothing is captured. A
+/// navigation after it makes the evidence `stale-frame` and
+/// `cedian_complete` refuses.
+fn omps_browser_call_is_gate_evidence(
+    cx: &mut TestAppContext,
+    window: &WindowHandle<CedianPanel>,
+    host: &BrowserHost,
+    ws: &Path,
+    omp: &mut tungstenite::WebSocket<impl Read + Write>,
+) {
+    let state_dir = cedian_shell::state::dir(ws).unwrap();
+    let browser_end = |id: &str| cedian_omp::RouterEvent::ToolEnd {
+        tool_call_id: id.to_string(),
+        tool_name: "browser".to_string(),
+        result_summary: String::new(),
+        is_error: false,
+        before: Vec::new(),
+    };
+    let seen = host.state().latest.map(|c| c.seq);
+    window
+        .update(cx, |p, _, cx| p.router_event(browser_end("fast-lane"), cx))
+        .unwrap();
+    cx.run_until_parked();
+    std::thread::sleep(Duration::from_millis(200));
+    cx.run_until_parked();
+    assert!(
+        !cedian_shell::workflow_store::exists(&state_dir),
+        "no workflow, nothing stored"
+    );
+    assert_eq!(
+        host.state().latest.map(|c| c.seq),
+        seen,
+        "the fast lane takes no capture"
+    );
+
+    let channel = window
+        .update(cx, |p, _, _| p.workflow_channel())
+        .unwrap()
+        .expect("the panel keeps the workflow channel");
+    let args = |v: Value| v.as_object().unwrap().clone();
+    channel
+        .update(&args(
+            json!({"op": "start", "kind": "prototype", "title": "ui", "risk": "low"}),
+        ))
+        .unwrap();
+    window
+        .update(cx, |p, _, cx| {
+            p.router_event(browser_end("omp-browser-1"), cx)
+        })
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let item = loop {
+        cx.run_until_parked();
+        let state = cedian_shell::workflow_store::load(&state_dir).unwrap();
+        if let Some(item) = state.evidence.values().find(|e| e.for_gates == ["ui"]) {
+            break item.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no evidence for the ui gate from OMP's browser call: {:?}",
+            state.evidence
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        item.provenance,
+        cedian_workflow::Provenance::Attributed {
+            task_id: cedian_panel::TASK_ID.to_string(),
+            tool_call_id: "omp-browser-1".to_string(),
+        }
+    );
+    assert_eq!(item.kind, cedian_workflow::EvidenceKind::Browser);
+    let at = host.state().seq;
+    assert_eq!(item.frame_seq, Some(at), "bound to the frame captured");
+    let state = cedian_shell::workflow_store::load(&state_dir).unwrap();
+    let ui = state.gate_result("ui", &channel.current()).unwrap();
+    assert_eq!(ui.status, GateStatus::Passed, "{}", ui.reason);
+
+    call(omp, "Page.navigate", json!({"url": "https://after.test/"}));
+    wait_until("the navigation", || host.state().seq > at);
+    let stale = item.stale_reason(&channel.current()).unwrap_or_default();
+    assert!(stale.starts_with("stale-frame"), "{stale:?}");
+    let refused = channel.complete(&args(json!({}))).unwrap_err();
+    assert!(refused.contains("ui"), "{refused}");
 }
 
 fn rendered(

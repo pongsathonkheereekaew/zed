@@ -12,4 +12,6 @@ pub mod review;
 pub mod workflow_view;
 
 pub use omp_settings::OmpSettings;
-pub use panel::{BROWSER_GATE, CedianPanel, Connection, DIALOG_TIMEOUT, ToggleFocus, Turn, init};
+pub use panel::{
+    BROWSER_GATE, CedianPanel, Connection, DIALOG_TIMEOUT, TASK_ID, ToggleFocus, Turn, init,
+};

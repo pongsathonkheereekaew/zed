@@ -119,6 +119,11 @@ pub struct LaunchSpec {
     /// The runtime's router once OMP runs: the workflow channel binds
     /// reported evidence to the calls in its log (ADR-0031).
     pub router: Arc<OnceLock<Arc<EventRouter>>>,
+    /// The workspace's browser once the panel opens it: the workflow
+    /// judges captures against its frame now.
+    pub browser: Arc<OnceLock<Arc<crate::browser::BrowserHost>>>,
+    /// The task's workflow channel, which the tools above call.
+    pub workflow: Arc<cedian_workflow::WorkflowChannel>,
 }
 
 impl LaunchSpec {
@@ -134,6 +139,8 @@ impl LaunchSpec {
         let state_dir = cedian_shell::state::dir(workdir)?;
         let router: Arc<OnceLock<Arc<EventRouter>>> = Arc::default();
         let log = Arc::clone(&router);
+        let browser: Arc<OnceLock<Arc<crate::browser::BrowserHost>>> = Arc::default();
+        let frame = Arc::clone(&browser);
         let channel = cedian_shell::workflow_host::channel(
             crate::panel::TASK_ID,
             workdir,
@@ -142,6 +149,11 @@ impl LaunchSpec {
             move |tool, needle| {
                 let calls = log.get()?.finished_tool_calls();
                 cedian_shell::workflow_host::bound_call(&calls, tool, needle)
+            },
+            move || {
+                Some(frame.get()?.state())
+                    .filter(|s| s.running)
+                    .map(|s| s.seq)
             },
         );
         let mut tools = channel.host_tools();
@@ -178,6 +190,8 @@ impl LaunchSpec {
             uris: Vec::new(),
             tools,
             router,
+            browser,
+            workflow: channel,
         })
     }
 }
@@ -1616,6 +1630,15 @@ mod tests {
             uris: Vec::new(),
             tools: Vec::new(),
             router: Arc::default(),
+            browser: Arc::default(),
+            workflow: cedian_workflow::WorkflowChannel::new(
+                "live",
+                Box::new(cedian_shell::workflow_store::DiskWorkflowStore(
+                    root.join("state"),
+                )),
+                |_, _| None,
+                cedian_workflow::CurrentState::default,
+            ),
         };
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         let link = OmpLink::start(spec(), tx, None);

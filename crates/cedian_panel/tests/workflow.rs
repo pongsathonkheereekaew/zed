@@ -9,12 +9,16 @@
 //!    workspace's state dir; evidence naming `from_tool: read` binds to
 //!    the `read` call in the router log;
 //! 2. the turn ends on a refused `cedian_complete`: at `Settled` the
-//!    workflow is blocked and the refusal is a correction row.
+//!    workflow is blocked and the refusal is a correction row;
+//! 3. the panel shows it: the phases with the current one blocked, the
+//!    unmet required `verify` gate with its reason, the evidence with its
+//!    outcome, the refused claims ledger; Resume sets it running again.
 //!
 //! Harness off: invoked with `--mode` (or `config`) this binary is fake-omp.
 
 use cedian_panel::{CedianPanel, Connection, Turn};
-use gpui::{TestAppContext, WindowHandle};
+use cedian_workflow::{GateStatus, WorkflowStatus};
+use gpui::{Modifiers, TestAppContext, VisualTestContext, WindowHandle};
 use project::Project;
 use serde_json::Value;
 use settings::SettingsStore;
@@ -122,6 +126,64 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
         corrections.contains("\"completion_refused\""),
         "the refusal is a correction row: {corrections}"
     );
+
+    // 3. The panel shows the blocked workflow; Resume answers it.
+    wait(cx, &window, "the blocked workflow in the panel", |p| {
+        p.workflow()
+            .is_some_and(|w| w.status == WorkflowStatus::Blocked)
+    });
+    let view = window
+        .update(cx, |p, _, _| p.workflow().cloned())
+        .unwrap()
+        .unwrap();
+    assert!(
+        view.phases
+            .iter()
+            .any(|(id, mark)| id == "reproduce" && *mark == '‖'),
+        "{view:?}"
+    );
+    let verify = view.gates.iter().find(|g| g.id == "verify").unwrap();
+    assert!(
+        verify.required && verify.status != GateStatus::Passed && !verify.reason.is_empty(),
+        "{verify:?}"
+    );
+    assert!(
+        view.evidence[0].starts_with("e1 [reproduce] fail:"),
+        "{:?}",
+        view.evidence
+    );
+    assert!(
+        view.claims
+            .as_deref()
+            .is_some_and(|c| c.starts_with("last completion: refused")),
+        "{:?}",
+        view.claims
+    );
+    let mut vcx = VisualTestContext::from_window(window.into(), cx);
+    assert!(rendered(&mut vcx, "cedian-workflow").is_some());
+    assert!(rendered(&mut vcx, "cedian-workflow-gate-verify").is_some());
+    click(&mut vcx, "cedian-workflow-resume");
+    wait(cx, &window, "the resumed workflow", |p| {
+        p.workflow()
+            .is_some_and(|w| w.status == WorkflowStatus::Running)
+    });
+    let raw = std::fs::read_to_string(state.join("workflow.json")).unwrap();
+    assert!(raw.contains("\"status\": \"running\""), "{raw}");
+    assert!(rendered(&mut vcx, "cedian-workflow-resume").is_none());
+}
+
+fn rendered(
+    vcx: &mut VisualTestContext,
+    selector: &'static str,
+) -> Option<gpui::Bounds<gpui::Pixels>> {
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    vcx.debug_bounds(selector)
+}
+
+fn click(vcx: &mut VisualTestContext, selector: &'static str) {
+    let bounds = rendered(vcx, selector).unwrap_or_else(|| panic!("{selector} is not on screen"));
+    vcx.simulate_click(bounds.center(), Modifiers::none());
 }
 
 fn assert_connected(cx: &mut TestAppContext, window: &WindowHandle<CedianPanel>) {

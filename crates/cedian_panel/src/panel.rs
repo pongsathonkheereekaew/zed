@@ -24,6 +24,7 @@ use crate::import::{self, ImportOutcome, Mark};
 use crate::omp_link::{AnswerError, LaunchSpec, LinkEvent, OmpLink, Prompt};
 use crate::omp_settings::OmpSettings;
 use crate::review::{ReviewError, TaskReview};
+use crate::workflow_view::WorkflowView;
 use cedian_agent::{Thread, ThreadEvent};
 use cedian_agent_ui::{SubagentRow, SubagentTree, ToolCard};
 use cedian_omp::{RouterEvent, SubagentStatus, UserAnswer};
@@ -191,6 +192,9 @@ pub struct CedianPanel {
     _context: Option<Task<()>>,
     /// The workspace's state dir (ADR-0044), once known.
     state_dir: Option<PathBuf>,
+    /// The task's workflow as last read, when one was started.
+    workflow: Option<WorkflowView>,
+    _workflow_load: Option<Task<()>>,
 }
 
 /// How long a quitting app waits for Chromium to close itself (flushing its
@@ -244,6 +248,8 @@ impl CedianPanel {
             settings: None,
             show_settings: false,
             state_dir: None,
+            workflow: None,
+            _workflow_load: None,
             workspace: None,
             _events: None,
             browser: None,
@@ -617,6 +623,7 @@ impl CedianPanel {
             }
         };
         self.state_dir = Some(spec.state_dir.clone());
+        self.refresh_workflow(cx);
         if self.browser.is_none() {
             self.open_browser_host(&spec.state_dir, cx);
         }
@@ -1182,6 +1189,7 @@ impl CedianPanel {
                     self.notice = Some(format!("turn failed: {reason}"));
                 }
                 self.end_workflow_turn(cx);
+                self.refresh_workflow(cx);
             }
             _ => {}
         }
@@ -1217,6 +1225,123 @@ impl CedianPanel {
             Some(notice) => format!("{notice}; {said}"),
             None => said,
         });
+    }
+
+    /// The task's workflow as the panel shows it.
+    pub fn workflow(&self) -> Option<&WorkflowView> {
+        self.workflow.as_ref()
+    }
+
+    /// Read the workflow again, off the UI thread: its gates are evaluated
+    /// against the workspace hashed now (row H).
+    fn refresh_workflow(&mut self, cx: &mut Context<Self>) {
+        let (Ok(dir), Some(root)) = (self.state_dir(cx), self.workspace_root(cx)) else {
+            return;
+        };
+        let read = cx.background_spawn(async move {
+            if !cedian_shell::workflow_store::exists(&dir) {
+                return Ok(None);
+            }
+            let state = cedian_shell::workflow_store::load(&dir)?;
+            let current = cedian_shell::workflow_host::current_state(&root);
+            Ok::<_, String>(Some(WorkflowView::new(&state, &current)))
+        });
+        self._workflow_load = Some(cx.spawn(async move |this, cx| {
+            let view = read.await;
+            this.update(cx, |this, cx| {
+                match view {
+                    Ok(view) => this.workflow = view,
+                    Err(e) => this.notice = Some(format!("the workflow could not be read: {e}")),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// The Resume button: the person's answer to a blocked workflow (§54).
+    pub fn resume_workflow(&mut self, cx: &mut Context<Self>) {
+        let resumed = self.state_dir(cx).and_then(|dir| {
+            let mut state = cedian_shell::workflow_store::load(&dir)?;
+            state.resume()?;
+            cedian_shell::workflow_store::save(&dir, &state)
+        });
+        if let Err(e) = resumed {
+            self.notice = Some(format!("the workflow did not resume: {e}"));
+        }
+        self.refresh_workflow(cx);
+        cx.notify();
+    }
+
+    fn render_workflow(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let view = self.workflow.as_ref()?;
+        let line = |text: String, color: Color| {
+            Label::new(text)
+                .size(LabelSize::Small)
+                .color(color)
+                .into_any_element()
+        };
+        let phases = view
+            .phases
+            .iter()
+            .map(|(id, mark)| format!("{mark} {id}"))
+            .collect::<Vec<_>>()
+            .join("  ");
+        let gates = view.gates.iter().map(|g| {
+            let id = g.id.clone();
+            div()
+                .debug_selector(move || format!("cedian-workflow-gate-{id}"))
+                .child(line(
+                    format!(
+                        "{}{} {:?}: {}",
+                        g.id,
+                        if g.required { " (required)" } else { "" },
+                        g.status,
+                        g.reason
+                    ),
+                    if g.status == cedian_workflow::GateStatus::Passed {
+                        Color::Default
+                    } else {
+                        Color::Warning
+                    },
+                ))
+                .into_any_element()
+        });
+        let blocked = view.status == cedian_workflow::WorkflowStatus::Blocked;
+        Some(
+            v_flex()
+                .debug_selector(|| "cedian-workflow".to_string())
+                .gap_1()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Label::new(format!("Workflow · {} · {:?}", view.title, view.status))
+                                .size(LabelSize::Small),
+                        )
+                        .when(blocked, |row| {
+                            row.child(
+                                div()
+                                    .debug_selector(|| "cedian-workflow-resume".to_string())
+                                    .child(
+                                        Button::new("cedian-workflow-resume", "Resume").on_click(
+                                            cx.listener(|this, _, _, cx| this.resume_workflow(cx)),
+                                        ),
+                                    ),
+                            )
+                        }),
+                )
+                .child(line(phases, Color::Muted))
+                .children(gates)
+                .children(view.evidence.iter().map(|e| line(e.clone(), Color::Muted)))
+                .children(
+                    view.claims
+                        .iter()
+                        .flat_map(|c| c.lines())
+                        .map(|l| line(l.to_string(), Color::Muted)),
+                )
+                .into_any_element(),
+        )
     }
 
     /// The Stop button: close the dialogs OMP waits on and abort the
@@ -1970,6 +2095,7 @@ impl Render for CedianPanel {
         );
         let review = self.show_review.then(|| self.render_review(cx));
         let browser = self.render_browser(cx);
+        let workflow = self.render_workflow(cx);
         v_flex()
             .key_context("CedianPanel")
             .track_focus(&self.focus_handle)
@@ -2036,6 +2162,7 @@ impl Render for CedianPanel {
                         .children(rows),
                 )
             })
+            .children(workflow)
             .children(browser)
             .children(dialogs)
             .when_some(self.notice.clone(), |panel, notice| {

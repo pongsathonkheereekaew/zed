@@ -9,6 +9,7 @@ pub mod omp_link;
 pub mod omp_settings;
 pub mod panel;
 pub mod review;
+pub mod workflow_view;
 
 pub use omp_settings::OmpSettings;
 pub use panel::{BROWSER_GATE, CedianPanel, Connection, DIALOG_TIMEOUT, ToggleFocus, Turn, init};

@@ -634,6 +634,7 @@
   {
     "context": "Workspace",
     "bindings": {
+      "ctrl-alt-shift-z": "cedian_panel::RevertTurn",
       "alt-/": "which_key::ShowPendingBindings",
       // Move focus between the major regions of the window (editor, open
       // panels, status bar). Accessibility navigation; mirrors VS Code's

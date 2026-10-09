@@ -62,7 +62,9 @@ actions!(
     cedian_panel,
     [
         /// Toggle focus on the cedian panel.
-        ToggleFocus
+        ToggleFocus,
+        /// Revert the latest agent turn (ADR-0056).
+        RevertTurn,
     ]
 );
 
@@ -74,6 +76,12 @@ pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
             workspace.toggle_panel_focus::<CedianPanel>(window, cx);
+        });
+        workspace.register_action(|workspace, _: &RevertTurn, _, cx| {
+            // Deferred: the revert reads the workspace to redraw finding blocks.
+            if let Some(panel) = workspace.panel::<CedianPanel>(cx) {
+                cx.defer(move |cx| panel.update(cx, |panel, cx| panel.revert_latest_turn(cx)));
+            }
         });
     })
     .detach();
@@ -655,6 +663,16 @@ impl CedianPanel {
             self.notice = Some(event.to_string());
         });
         self.report_review(result, cx);
+    }
+
+    /// Revert turn from the editor (ADR-0056 decision 7): the latest turn;
+    /// when that is a revert, it is undone.
+    pub fn revert_latest_turn(&mut self, cx: &mut Context<Self>) {
+        match self.review.current_turn() {
+            0 => self.notice = Some("no turn to revert".to_string()),
+            turn => self.revert_turn(turn, cx),
+        }
+        cx.notify();
     }
 
     /// Each open finding as a block under its hunk, with the hunk's rows
@@ -4319,6 +4337,124 @@ mod tests {
                 "turn 1 reverted: 1 hunk(s) put back, 0 STALE kept, \
                  0 changed again by a later turn, kept, 0 accepted, kept"
             )
+        );
+    }
+
+    /// Zed's default keymap for this platform, as the app loads it; the
+    /// actions this test binary does not link fail to load and are skipped.
+    fn bind_default_keymap(cx: &mut TestAppContext) {
+        #[cfg(target_os = "macos")]
+        let keymap = include_str!("../../../assets/keymaps/default-macos.json");
+        #[cfg(target_os = "windows")]
+        let keymap = include_str!("../../../assets/keymaps/default-windows.json");
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let keymap = include_str!("../../../assets/keymaps/default-linux.json");
+        cx.update(|cx| {
+            let bindings = match settings::KeymapFile::load(keymap, cx) {
+                settings::KeymapFileLoadResult::Success { key_bindings, .. } => key_bindings,
+                settings::KeymapFileLoadResult::SomeFailedToLoad { key_bindings, .. } => {
+                    key_bindings
+                }
+                settings::KeymapFileLoadResult::JsonParseFailure { error } => {
+                    panic!("the default keymap parses: {error}")
+                }
+            };
+            cx.bind_keys(bindings);
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    const REVERT_TURN_KEY: &str = "cmd-alt-shift-z";
+    #[cfg(not(target_os = "macos"))]
+    const REVERT_TURN_KEY: &str = "ctrl-alt-shift-z";
+
+    /// The panel docked in a workspace with notes.txt open and focused in
+    /// an editor, as the person works.
+    fn open_in_workspace(
+        f: &Fixture,
+        buffer: &Entity<Buffer>,
+        cx: &mut TestAppContext,
+    ) -> (
+        gpui::WindowHandle<workspace::MultiWorkspace>,
+        Entity<Editor>,
+    ) {
+        cx.update(|cx| super::init(cx));
+        let panel = f.window.root(cx).unwrap();
+        let window = cx.add_window(|window, cx| {
+            workspace::MultiWorkspace::test_new(f.project.clone(), window, cx)
+        });
+        let editor = window
+            .update(cx, |multi, window, cx| {
+                multi.workspace().clone().update(cx, |workspace, cx| {
+                    workspace.add_panel(panel.clone(), window, cx);
+                    let editor = cx.new(|cx| {
+                        Editor::for_buffer(buffer.clone(), Some(f.project.clone()), window, cx)
+                    });
+                    workspace.add_item_to_active_pane(
+                        Box::new(editor.clone()),
+                        None,
+                        true,
+                        window,
+                        cx,
+                    );
+                    editor.focus_handle(cx).focus(window, cx);
+                    editor
+                })
+            })
+            .unwrap();
+        let handle = window
+            .read_with(cx, |multi, _| multi.workspace().downgrade())
+            .unwrap();
+        panel.update(cx, |panel, cx| panel.set_workspace(handle, cx));
+        cx.run_until_parked();
+        (window, editor)
+    }
+
+    /// U10a (ADR-0056 decision 7): revert turn from the editor, by its key
+    /// and the palette's action: the latest turn goes back, a STALE hunk is
+    /// kept, and one undo redoes it.
+    #[gpui::test]
+    async fn revert_turn_from_the_editor_puts_the_latest_turn_back(cx: &mut TestAppContext) {
+        let (f, buffer) = fixture(cx).await;
+        tool_start(&f, cx, "c1", &["notes.txt"]);
+        omp_writes(&f, "/ws/notes.txt", "ALPHA\nbeta\nGAMMA\n").await;
+        tool_end(&f, cx, "c1");
+        settled(&f, cx);
+        buffer.update(cx, |b, cx| b.edit([(11..16, "GAMMA!")], None, cx));
+        bind_default_keymap(cx);
+        let (workspace, _editor) = open_in_workspace(&f, &buffer, cx);
+        let mut vcx = VisualTestContext::from_window(workspace.into(), cx);
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes(REVERT_TURN_KEY);
+        vcx.run_until_parked();
+        assert_eq!(
+            buffer.read_with(&vcx, |b, _| b.text()),
+            "alpha\nbeta\nGAMMA!\n"
+        );
+        assert_eq!(
+            notice(&f, &mut vcx).as_deref(),
+            Some(
+                "turn 1 reverted: 1 hunk(s) put back, 1 STALE kept, \
+                 0 changed again by a later turn, kept, 0 accepted, kept"
+            )
+        );
+        buffer.update(&mut vcx, |b, cx| {
+            b.undo(cx);
+        });
+        assert_eq!(
+            buffer.read_with(&vcx, |b, _| b.text()),
+            "ALPHA\nbeta\nGAMMA!\n"
+        );
+        let palette = vcx.update(|window, cx| {
+            window
+                .available_actions(cx)
+                .iter()
+                .any(|a| a.partial_eq(&RevertTurn))
+        });
+        assert!(
+            palette,
+            "the command palette lists Revert Turn in the editor"
         );
     }
 

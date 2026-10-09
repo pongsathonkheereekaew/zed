@@ -259,11 +259,12 @@ struct TakenBack {
 /// Try to take back each queued message, steers first. Each accepted
 /// message is removed by the text the person typed: OMP 18.6.1 matches that
 /// first, then the content its `queue_update` shows, which differs for a
-/// template or slash command. A listed entry is tried only when no accepted
-/// message covers it: by its text, or, for display text, by count (each
-/// accepted message OMP gave back under a text it does not list is one such
-/// listed entry). After the first error the link is taken as dead: the rest
-/// go back to the composer unanswered, without another timeout.
+/// template or slash command. Every listed entry no accepted message names
+/// by its text is tried too. Each accepted message OMP gave back under a text
+/// it does not list has a display twin among those entries; which one is
+/// unknown, so that many `removed: false` answers are the twins, not messages
+/// taken into a run. After the first error the link is taken as dead: the
+/// rest go back to the composer unanswered, without another timeout.
 fn take_back(
     queue: &Queue,
     mut remove: impl FnMut(&str, bool) -> Result<bool, String>,
@@ -287,14 +288,21 @@ fn take_back(
             }
             plan.push(text.clone());
         }
-        let mut skip = 0;
+        let mut twins = 0;
         for (index, text) in plan.into_iter().enumerate() {
             if out.try_remove(text, steering, &mut remove) && display_only.contains(&index) {
-                skip += 1;
+                twins += 1;
             }
         }
-        for text in listed.into_iter().skip(skip) {
-            out.try_remove(text.clone(), steering, &mut remove);
+        for text in listed {
+            if twins > 0 && out.error.is_none() {
+                match remove(text, steering) {
+                    Ok(false) => twins -= 1,
+                    answer => out.record(text.clone(), answer),
+                }
+            } else {
+                out.try_remove(text.clone(), steering, &mut remove);
+            }
         }
     }
     out
@@ -312,20 +320,20 @@ impl TakenBack {
             self.unanswered.push(text);
             return false;
         }
-        match remove(&text, steering) {
-            Ok(true) => {
-                self.restored.push(text);
-                true
-            }
-            Ok(false) => {
-                self.gone.push(text);
-                false
-            }
+        let answer = remove(&text, steering);
+        let given_back = answer == Ok(true);
+        self.record(text, answer);
+        given_back
+    }
+
+    fn record(&mut self, text: String, answer: Result<bool, String>) {
+        match answer {
+            Ok(true) => self.restored.push(text),
+            Ok(false) => self.gone.push(text),
             Err(e) => {
                 log::warn!("cedian: OMP did not answer taking back a queued message: {e}");
                 self.unanswered.push(text);
                 self.error = Some(e);
-                false
             }
         }
     }
@@ -1330,11 +1338,40 @@ mod tests {
         let (calls, taken) = removes(&gate, |text| Ok(text != "/review shown"));
         assert_eq!(
             calls,
-            [steer("/review typed"), ("later".to_string(), false)],
-            "the typed text first; its listed display text is the same message"
+            [
+                steer("/review typed"),
+                steer("/review shown"),
+                ("later".to_string(), false)
+            ],
+            "the typed text first; the display text after it answers false as its twin"
         );
         assert_eq!(taken.to_composer(), ["/review typed", "later"]);
         assert_eq!(taken.notice(), None, "nothing was taken into a run");
+    }
+
+    #[test]
+    fn a_listed_message_ahead_of_a_display_text_is_still_taken_back() {
+        let gate = Arc::new(bare_gate());
+        gate.accepted("/review typed", true);
+        gate.observe_run(&RouterEvent::Queue {
+            steering: vec!["late".to_string(), "/review shown".to_string()],
+            follow_up: Vec::new(),
+        });
+        let (calls, taken) = removes(&gate, |text| Ok(text != "/review shown"));
+        assert_eq!(
+            calls,
+            [
+                steer("/review typed"),
+                steer("late"),
+                steer("/review shown")
+            ]
+        );
+        assert_eq!(taken.to_composer(), ["/review typed", "late"]);
+        assert_eq!(
+            taken.notice(),
+            None,
+            "the display text was the typed message, not one taken into a run"
+        );
     }
 
     #[test]

@@ -197,13 +197,26 @@ pub struct Requester<'a> {
 }
 
 /// The OMP system-prompt files a workspace carries (ADR-0053): each of
-/// `PROMPT_DIRS` x `PROMPT_FILES` in every directory from `workdir` up to
-/// its repository root, inclusive.
+/// `PROMPT_DIRS` x `PROMPT_FILES` in every directory OMP 18.6.1 reads them
+/// from. OMP walks from the workdir up to the nearest ancestor holding a
+/// `.git` entry (file or directory), else up to $HOME, else to the root.
 pub fn workspace_prompt_files(workdir: &Path) -> Vec<PathBuf> {
+    prompt_files_below(
+        workdir,
+        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+    )
+}
+
+fn prompt_files_below(workdir: &Path, home: Option<&Path>) -> Vec<PathBuf> {
     const PROMPT_DIRS: [&str; 6] = [".omp", ".claude", ".codex", ".gemini", ".agent", ".agents"];
     const PROMPT_FILES: [&str; 3] = ["SYSTEM.md", "SYSTEM_TEMPLATE.md", "APPEND_SYSTEM.md"];
     let workdir = std::fs::canonicalize(workdir).unwrap_or_else(|_| workdir.to_path_buf());
-    let root = repository_root(&workdir).unwrap_or_else(|| workdir.clone());
+    let home = home.map(|h| std::fs::canonicalize(h).unwrap_or_else(|_| h.to_path_buf()));
+    let stop = workdir
+        .ancestors()
+        .find(|dir| dir.join(".git").symlink_metadata().is_ok())
+        .map(Path::to_path_buf)
+        .or(home);
     let mut found = Vec::new();
     for dir in workdir.ancestors() {
         for sub in PROMPT_DIRS {
@@ -214,25 +227,11 @@ pub fn workspace_prompt_files(workdir: &Path) -> Vec<PathBuf> {
                 }
             }
         }
-        if dir == root {
+        if stop.as_deref() == Some(dir) {
             break;
         }
     }
     found
-}
-
-/// `git rev-parse --show-toplevel` from `dir`, canonical; none outside a
-/// repository, where the walk stops at the workdir itself.
-fn repository_root(dir: &Path) -> Option<PathBuf> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())?;
-    let top = String::from_utf8(out.stdout).ok()?;
-    std::fs::canonicalize(top.trim()).ok()
 }
 
 /// ADR-0053: no reviewer runs; the review is inconclusive and audited.
@@ -690,5 +689,41 @@ mod tests {
         assert!(workspace_prompt_files(&repo).is_empty());
         put(&repo.join(".gemini/notes.md"));
         assert!(workspace_prompt_files(&repo).is_empty(), "other names pass");
+    }
+
+    #[test]
+    fn outside_git_a_parents_prompt_file_below_home_is_found() {
+        let home = crate::test_dir::TestDir::new("promptfile-nogit");
+        put(&home.join(".agents/SYSTEM.md"));
+        let ws = home.join("projects/ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        assert_eq!(
+            prompt_files_below(&ws, Some(&home)),
+            [home.join(".agents/SYSTEM.md")]
+        );
+    }
+
+    #[test]
+    fn a_git_file_stops_the_walk_like_a_git_dir() {
+        let home = crate::test_dir::TestDir::new("promptfile-gitfile");
+        put(&home.join(".omp/SYSTEM.md"));
+        let wt = home.join("wt");
+        std::fs::create_dir_all(wt.join("sub")).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: /elsewhere/.git/worktrees/wt\n").unwrap();
+        put(&wt.join(".codex/APPEND_SYSTEM.md"));
+        assert_eq!(
+            prompt_files_below(&wt.join("sub"), Some(&home)),
+            [wt.join(".codex/APPEND_SYSTEM.md")]
+        );
+    }
+
+    #[test]
+    fn outside_git_a_prompt_file_above_home_is_not_found() {
+        let outer = crate::test_dir::TestDir::new("promptfile-abovehome");
+        put(&outer.join(".omp/SYSTEM.md"));
+        let home = outer.join("home");
+        let ws = home.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        assert!(prompt_files_below(&ws, Some(&home)).is_empty());
     }
 }

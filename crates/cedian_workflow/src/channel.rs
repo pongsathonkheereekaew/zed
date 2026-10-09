@@ -24,6 +24,17 @@ use omp_rpc::HostTool;
 use serde_json::{Map, Value, json};
 use std::sync::{Arc, Mutex};
 
+/// Serializes load → mutate → save of `workflow.json` in this process:
+/// the channel's handler threads and the host's own changes (an
+/// escalation, Resume, the turn boundary) take it, so none overwrites
+/// another's update.
+static STORE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Hold while loading, changing and saving a workflow outside the channel.
+pub fn store_lock() -> std::sync::MutexGuard<'static, ()> {
+    STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Host tool: start / evidence / advance.
 pub const WORKFLOW_UPDATE_TOOL: &str = "cedian_workflow_update";
 /// Host tool: `can_complete` check at the completion boundary.
@@ -116,8 +127,6 @@ pub struct WorkflowChannel {
     profiles: Box<dyn ProfileStore>,
     /// Open review blockers (S3), one line each; any refuses completion.
     blockers: Mutex<Box<Blockers>>,
-    /// Serializes load → mutate → save across handler threads.
-    lock: Mutex<()>,
 }
 
 type Blockers = dyn Fn() -> Vec<String> + Send + Sync;
@@ -157,7 +166,6 @@ impl WorkflowChannel {
             floor,
             profiles,
             blockers: Mutex::new(Box::new(Vec::new)),
-            lock: Mutex::new(()),
         })
     }
 
@@ -168,7 +176,7 @@ impl WorkflowChannel {
 
     /// `cedian_workflow_update`: `op` is `start`, `evidence` or `advance`.
     pub fn update(&self, args: &Map<String, Value>) -> Result<String, String> {
-        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = store_lock();
         let op = str_arg(args, "op")?;
         match op {
             "start" => {
@@ -371,7 +379,7 @@ impl WorkflowChannel {
     /// Unmet required gates → error with what is missing; each counts one
     /// continue, and at `MAX_CONTINUE` the workflow is `blocked`.
     pub fn complete(&self, args: &Map<String, Value>) -> Result<String, String> {
-        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = store_lock();
         let Some(mut state) = self.store.load()? else {
             return Ok("no cedian workflow is active; nothing to check".to_string());
         };
@@ -497,7 +505,7 @@ impl WorkflowChannel {
         summary: &str,
         tool_call_id: Option<&str>,
     ) -> Result<Option<String>, String> {
-        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = store_lock();
         let Some(mut state) = self.store.load()? else {
             return Ok(None);
         };

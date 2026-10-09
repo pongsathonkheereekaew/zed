@@ -102,6 +102,7 @@ pub fn escalate(
     turn: Option<u32>,
     why: &str,
 ) -> Result<bool, String> {
+    let _guard = cedian_workflow::store_lock();
     if !workflow_store::exists(state_dir) {
         return Ok(false);
     }
@@ -123,6 +124,14 @@ pub fn escalate(
     Ok(true)
 }
 
+/// The person's Resume of a blocked workflow (§54).
+pub fn resume(state_dir: &Path) -> Result<(), String> {
+    let _guard = cedian_workflow::store_lock();
+    let mut state = workflow_store::load(state_dir)?;
+    state.resume()?;
+    workflow_store::save(state_dir, &state)
+}
+
 /// Turn boundary (ADR-0036): a refused `cedian_complete` in the turn that
 /// just ended blocks the workflow (or leaves it failed when the agent
 /// failed a phase) and is a `completion_refused` row for `task`'s `turn`.
@@ -133,6 +142,7 @@ pub fn end_turn(
     task: &str,
     turn: Option<u32>,
 ) -> Result<Option<(WorkflowStatus, Vec<String>)>, String> {
+    let _guard = cedian_workflow::store_lock();
     if !workflow_store::exists(state_dir) {
         return Ok(None);
     }
@@ -184,5 +194,28 @@ mod tests {
         let rows = corrections::load(&dir).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].kind, corrections::CorrectionKind::ContinueEscalated);
+    }
+
+    /// An escalation waits for a channel update in flight instead of
+    /// overwriting it.
+    #[test]
+    fn an_escalation_waits_for_the_workflow_lock() {
+        let dir = crate::test_dir::TestDir::new("escalate-lock");
+        let state = WorkflowState::start(TaskProfile::new("t", TaskKind::BugFix)).unwrap();
+        workflow_store::save(&dir, &state).unwrap();
+        let path = dir.to_path_buf();
+        let held = cedian_workflow::store_lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let escalating = std::thread::spawn(move || {
+            tx.send(escalate(&path, "panel", Some(1), "no answer")).ok();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "escalate ran while the lock was held"
+        );
+        drop(held);
+        assert!(rx.recv().unwrap().unwrap());
+        escalating.join().unwrap();
     }
 }

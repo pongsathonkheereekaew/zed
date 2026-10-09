@@ -100,6 +100,9 @@ pub fn record(
         .map_err(|e| format!("corrections.jsonl: {e}"))?;
     let rows = parse(&text)?;
     let hash = event.excerpt.as_deref().map(excerpt_hash);
+    // A backstop only: the review reports a stale hunk once per key
+    // (`reported_stale`), which is the real dedupe; a later keystroke in
+    // the hunk changes the excerpt, so this check alone would not stop it.
     if kind == CorrectionKind::UserEditedAgentHunk
         && rows.iter().any(|r| {
             r.kind == kind

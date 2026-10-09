@@ -392,6 +392,9 @@ pub enum TextBefore {
     Text(String),
     NewFile,
     Pruned,
+    /// A move: OMP's `oldText` is the source's text, so neither the source
+    /// nor the destination has a baseline of its own.
+    Moved,
 }
 
 /// The before-texts in an edit result's `details`: one file's fields, or
@@ -407,7 +410,13 @@ pub fn texts_before(result: Option<&serde_json::Value>) -> Vec<(String, TextBefo
     files
         .into_iter()
         .filter_map(|file| {
-            let path = file.get("path")?.as_str()?.to_string();
+            let path = file.get("path").and_then(|p| p.as_str())?.to_string();
+            if let Some(source) = file.get("sourcePath").and_then(|p| p.as_str()) {
+                return Some(vec![
+                    (path, TextBefore::Moved),
+                    (source.to_string(), TextBefore::Moved),
+                ]);
+            }
             let before = if file.get("snapshotsPruned").and_then(|v| v.as_bool()) == Some(true) {
                 TextBefore::Pruned
             } else if let Some(text) = file.get("oldText").and_then(|v| v.as_str()) {
@@ -417,8 +426,9 @@ pub fn texts_before(result: Option<&serde_json::Value>) -> Vec<(String, TextBefo
             } else {
                 return None;
             };
-            Some((path, before))
+            Some(vec![(path, before)])
         })
+        .flatten()
         .collect()
 }
 
@@ -488,7 +498,7 @@ fn classify_agent_event(event: &RpcAgentEvent) -> RouterEvent {
 /// a `read` or `write` calls.
 pub fn written_paths(name: &str, args: Option<&serde_json::Value>) -> Vec<String> {
     let mut paths = edit_targets(name, args);
-    paths.retain(|p| !p.contains("://"));
+    paths.retain(|p| !p.starts_with("xd://"));
     paths
 }
 
@@ -668,6 +678,29 @@ mod tests {
         assert!(
             super::written_paths("write", Some(&device)).is_empty(),
             "a write to an xd:// device is a host tool call, not a file"
+        );
+        let file_uri = json!({"path": "file:///ws/a.txt", "content": "x"});
+        assert_eq!(
+            super::written_paths("write", Some(&file_uri)),
+            vec!["file:///ws/a.txt".to_string()],
+            "only xd:// is a device"
+        );
+    }
+
+    /// A move's `oldText` is its source's text: neither path has a
+    /// before-text of its own.
+    #[test]
+    fn a_moved_file_has_no_text_before_of_its_own() {
+        use super::TextBefore;
+        use serde_json::json;
+        let moved = json!({"details": {"path": "/ws/b.txt", "move": "/ws/b.txt",
+            "sourcePath": "/ws/a.txt", "oldText": "a\n", "newText": "a\n"}});
+        assert_eq!(
+            super::texts_before(Some(&moved)),
+            vec![
+                ("/ws/b.txt".to_string(), TextBefore::Moved),
+                ("/ws/a.txt".to_string(), TextBefore::Moved),
+            ]
         );
     }
 

@@ -264,6 +264,11 @@ pub struct FileReview {
     /// import, or are judged by one, so a display rebuild classifies none
     /// of them.
     importing: collections::HashSet<String>,
+    /// The `bash` calls among `importing`. A command names no file, so
+    /// it marks every open buffer; it does not refuse review actions: one
+    /// that lands after an Accept or Reject meets a buffer the review just
+    /// changed and imports as STALE, never over it (ADR-0006).
+    bash_calls: collections::HashSet<String>,
     /// Set when OMP wrote the disk while the buffer had unsaved edits, so
     /// nothing was imported (decision 5).
     stale_import: Option<String>,
@@ -294,6 +299,7 @@ impl FileReview {
             agent_txns: Vec::new(),
             user_edits: Vec::new(),
             importing: collections::HashSet::default(),
+            bash_calls: collections::HashSet::default(),
             stale_import: None,
             resolved: HashMap::default(),
             rejected: collections::HashSet::default(),
@@ -324,6 +330,13 @@ impl FileReview {
     /// A tool call is writing this file.
     pub fn importing(&self) -> bool {
         !self.importing.is_empty()
+    }
+
+    /// A call that names this file is writing it: review actions wait.
+    fn writing(&self) -> bool {
+        self.importing
+            .iter()
+            .any(|id| !self.bash_calls.contains(id))
     }
 
     fn fold_user_edits(&mut self, buffer: &Buffer) {
@@ -715,6 +728,34 @@ impl TaskReview {
         }
     }
 
+    /// [`Self::observe`] for a `bash` call.
+    pub fn observe_bash(&mut self, buffer: &Entity<Buffer>, tool_call_id: &str, cx: &App) {
+        self.observe(buffer, tool_call_id, cx);
+        if let Some(i) = self.file_index(buffer) {
+            self.files[i].bash_calls.insert(tool_call_id.to_string());
+        }
+    }
+
+    /// The call wrote the file but its change is no one's to review (two
+    /// calls overlapped, or a move): once no call is writing it, a clean
+    /// buffer's change since is Zed's reload of that write, not the
+    /// person's edit; a dirty buffer was not reloaded, so its edits are.
+    pub fn import_unattributed(&mut self, buffer: &Entity<Buffer>, tool_call_id: &str, cx: &App) {
+        if let Some(i) = self.file_index(buffer) {
+            let file = &mut self.files[i];
+            file.importing.remove(tool_call_id);
+            if !file.importing() {
+                let b = buffer.read(cx);
+                if b.is_dirty() {
+                    file.fold_user_edits(b);
+                } else {
+                    file.last_seen = b.version();
+                }
+            }
+            self.rebuild(cx);
+        }
+    }
+
     /// The tool call that [`Self::observe`]d this buffer imported nothing
     /// (or failed, or never ended): once no call is writing the file,
     /// whatever changed since is the user's.
@@ -882,7 +923,7 @@ impl TaskReview {
     ) -> Result<TransactionId, ReviewError> {
         let i = self.file_by_path(path, cx)?;
         let file = &mut self.files[i];
-        if file.importing() {
+        if file.writing() {
             return Err(ReviewError::Importing {
                 path: path.to_path_buf(),
             });
@@ -966,7 +1007,7 @@ impl TaskReview {
         cx: &App,
         touched: impl Fn(&FileReview) -> bool,
     ) -> Result<(), ReviewError> {
-        match self.files.iter().find(|f| f.importing() && touched(f)) {
+        match self.files.iter().find(|f| f.writing() && touched(f)) {
             Some(file) => Err(ReviewError::Importing {
                 path: path_of(file.buffer.read(cx), cx),
             }),

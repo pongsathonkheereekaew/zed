@@ -46,9 +46,9 @@ impl Mark {
         self.disk_at_start = Some(text);
     }
 
-    /// The file's disk text when the tool started, as far as cedian knows.
-    pub fn disk_text_at_start(&self) -> String {
-        self.disk_at_start()
+    /// Whether the disk text was read at the start: the buffer was dirty.
+    pub fn read_disk(&self) -> bool {
+        self.disk_at_start.is_some()
     }
 
     /// OMP's own text from before the call replaces a disk read that may
@@ -56,11 +56,14 @@ impl Mark {
     /// its start text, which is the disk text.
     pub fn correct_disk_at_start(&mut self, omp_before: &str) {
         if self.disk_at_start.is_some() {
-            self.disk_at_start = Some(omp_before.to_string());
+            let mut text = omp_before.to_string();
+            text::LineEnding::normalize(&mut text);
+            self.disk_at_start = Some(text);
         }
     }
 
-    fn disk_at_start(&self) -> String {
+    /// The file's disk text when the tool started, as far as cedian knows.
+    pub(crate) fn disk_at_start(&self) -> String {
         self.disk_at_start
             .clone()
             .unwrap_or_else(|| self.start.text())

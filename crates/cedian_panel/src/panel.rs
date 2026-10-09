@@ -29,7 +29,7 @@ use cedian_agent::{Thread, ThreadEvent};
 use cedian_agent_ui::{SubagentRow, SubagentTree, ToolCard};
 use cedian_omp::{RouterEvent, SubagentStatus, TextBefore, UserAnswer};
 use cedian_review::{HunkKey, HunkStatus};
-use cedian_workflow::{CurrentState, Evidence, Gate, GateResult, Outcome};
+use cedian_workflow::{CurrentState, Evidence, Gate, GateResult, Outcome, WorkflowStatus};
 use cedian_workspace::{capture_ambient, render_snapshot};
 use collections::{HashMap, HashSet, IndexMap};
 use editor::{Editor, actions::Paste};
@@ -184,6 +184,9 @@ pub struct CedianPanel {
     /// The last thing the person should know that is not on a dialog: a
     /// refused prompt, a failed turn, a dialog cedian closed.
     notice: Option<String>,
+    /// The correction ledger's last failed write: one line, however many
+    /// rows failed, so a ledger that keeps failing does not grow the notice.
+    ledger_error: Option<String>,
     /// OMP's dialogs waiting on the person, by request id, oldest first.
     dialogs: IndexMap<String, OpenDialog>,
     /// Images pasted into the composer, sent with the next prompt.
@@ -259,6 +262,7 @@ impl CedianPanel {
             confirm_accept_all: false,
             turn: Turn::Idle,
             notice: None,
+            ledger_error: None,
             dialogs: IndexMap::default(),
             images: Vec::new(),
             settings: None,
@@ -575,11 +579,8 @@ impl CedianPanel {
                 .state_dir(cx)
                 .and_then(|dir| cedian_shell::corrections::record(&dir, &task, kind, row));
             if let Err(e) = recorded {
-                let failed = format!("the correction ledger did not record {event}: {e}");
-                self.notice = Some(match self.notice.take() {
-                    Some(notice) => format!("{notice}; {failed}"),
-                    None => failed,
-                });
+                self.ledger_error =
+                    Some(format!("the correction ledger did not record {event}: {e}"));
             }
         }
         if self.review.stale_count() == 0 {
@@ -1106,6 +1107,7 @@ impl CedianPanel {
             self.release(&id, call, cx);
         }
         self.review.end_turn();
+        self.end_workflow_turn(cx);
         self.set_turn(Turn::Idle);
         self.connection = Connection::Stopped(reason);
     }
@@ -1280,19 +1282,27 @@ impl CedianPanel {
         let (Ok(dir), Some(root)) = (self.state_dir(cx), self.workspace_root(cx)) else {
             return;
         };
+        let live = |status| matches!(status, WorkflowStatus::Running | WorkflowStatus::Blocked);
+        // A finished workflow's gates no longer change: once shown, it is
+        // not hashed again on every turn. `None` keeps the view.
+        let shown_finished = self.workflow.as_ref().is_some_and(|v| !live(v.status));
         let read = cx.background_spawn(async move {
             if !cedian_shell::workflow_store::exists(&dir) {
-                return Ok(None);
+                return Ok(Some(None));
             }
             let state = cedian_shell::workflow_store::load(&dir)?;
+            if shown_finished && !live(state.status) {
+                return Ok(None);
+            }
             let current = cedian_shell::workflow_host::current_state(&root);
-            Ok::<_, String>(Some(WorkflowView::new(&state, &current)))
+            Ok::<_, String>(Some(Some(WorkflowView::new(&state, &current))))
         });
         self._workflow_load = Some(cx.spawn(async move |this, cx| {
             let view = read.await;
             this.update(cx, |this, cx| {
                 match view {
-                    Ok(view) => this.workflow = view,
+                    Ok(Some(view)) => this.workflow = view,
+                    Ok(None) => {}
                     Err(e) => this.notice = Some(format!("the workflow could not be read: {e}")),
                 }
                 cx.notify();
@@ -1325,11 +1335,9 @@ impl CedianPanel {
 
     /// The Resume button: the person's answer to a blocked workflow (§54).
     pub fn resume_workflow(&mut self, cx: &mut Context<Self>) {
-        let resumed = self.state_dir(cx).and_then(|dir| {
-            let mut state = cedian_shell::workflow_store::load(&dir)?;
-            state.resume()?;
-            cedian_shell::workflow_store::save(&dir, &state)
-        });
+        let resumed = self
+            .state_dir(cx)
+            .and_then(|dir| cedian_shell::workflow_host::resume(&dir));
         match resumed {
             Ok(()) => self.escalation = None,
             Err(e) => self.notice = Some(format!("the workflow did not resume: {e}")),
@@ -1688,10 +1696,7 @@ impl CedianPanel {
             .filter_map(|b| b.read(cx).file()?.as_local().map(|f| f.abs_path(cx)))
             .filter(|path| path.starts_with(&root))
             .collect();
-        self.mark_files(tool_call_id.clone(), open, cx);
-        if let Some(call) = self.calls.get_mut(&tool_call_id) {
-            call.bash = Some(Vec::new());
-        }
+        self.mark_files(tool_call_id, open, true, cx);
     }
 
     /// Files the worktree saw change: a running `bash` call's, when not open.
@@ -1713,8 +1718,16 @@ impl CedianPanel {
             return;
         };
         let worktree = worktree.read(cx);
+        // The initial scan's `Loaded` is no change; a directory or an
+        // ignored path is no file to review. A removed file has no entry.
         let changed: Vec<(PathBuf, PathBuf)> = changes
             .iter()
+            .filter(|(rel, _, change)| {
+                *change != worktree::PathChange::Loaded
+                    && worktree
+                        .entry_for_path(rel)
+                        .is_none_or(|e| e.is_file() && !e.is_ignored)
+            })
             .map(|(rel, _, _)| (worktree.absolutize(rel), worktree.full_path(rel)))
             .collect();
         for call in self.calls.values_mut() {
@@ -1746,10 +1759,16 @@ impl CedianPanel {
                 }
             })
             .collect();
-        self.mark_files(tool_call_id, named, cx);
+        self.mark_files(tool_call_id, named, false, cx);
     }
 
-    fn mark_files(&mut self, tool_call_id: String, named: Vec<PathBuf>, cx: &mut Context<Self>) {
+    fn mark_files(
+        &mut self,
+        tool_call_id: String,
+        named: Vec<PathBuf>,
+        bash: bool,
+        cx: &mut Context<Self>,
+    ) {
         let buffers: Vec<(Entity<Buffer>, PathBuf)> = self
             .project
             .read(cx)
@@ -1773,7 +1792,11 @@ impl CedianPanel {
             .into_iter()
             .enumerate()
             .map(|(i, (b, path))| {
-                self.review.observe(&b, &tool_call_id, cx);
+                if bash {
+                    self.review.observe_bash(&b, &tool_call_id, cx);
+                } else {
+                    self.review.observe(&b, &tool_call_id, cx);
+                }
                 let mark = b.update(cx, |b, cx| import::begin(b, cx));
                 if b.read(cx).is_dirty() {
                     dirty.push((i, path));
@@ -1789,7 +1812,7 @@ impl CedianPanel {
                 reading: to_open.len() + dirty.len(),
                 ended: None,
                 before: Vec::new(),
-                bash: None,
+                bash: bash.then(Vec::new),
                 overlapped: Vec::new(),
             },
         );
@@ -1880,8 +1903,9 @@ impl CedianPanel {
                     self.review.could_not_review(
                         shown.clone(),
                         format!(
-                            "changed by bash call {tool_call_id}; it was not open, so cedian has \
-                             no text from before the call to review it against"
+                            "changed while bash call {tool_call_id} ran (it or another process \
+                             wrote it); it was not open, so cedian has no text from before the \
+                             call to review it against"
                         ),
                     );
                 }
@@ -1914,7 +1938,7 @@ impl CedianPanel {
                     None => None,
                 };
                 this.update(cx, |this, cx| {
-                    let mut start = mark.disk_text_at_start();
+                    let mut start = mark.disk_at_start();
                     text::LineEnding::normalize(&mut start);
                     if disk.is_none_or(|mut d| {
                         text::LineEnding::normalize(&mut d);
@@ -1922,8 +1946,10 @@ impl CedianPanel {
                     }) {
                         let path = file.map(|f| f.full_path(cx)).unwrap_or_default();
                         this.review.could_not_review(path, reason);
+                        this.review.import_unattributed(&buffer, &id, cx);
+                    } else {
+                        this.review.import_done(&buffer, &id, cx);
                     }
-                    this.review.import_done(&buffer, &id, cx);
                     this.after_review_change(cx);
                 })
                 .ok();
@@ -1937,24 +1963,90 @@ impl CedianPanel {
             let mut held: Vec<(Entity<Buffer>, String)> = Vec::new();
             // Opened files whose before-text is cedian's own read, which may
             // have run after OMP's write: why OMP gave none.
-            let mut unsure: Vec<(Entity<Buffer>, &'static str)> = Vec::new();
+            // Open buffers too: a dirty one's read, or a clean one Zed
+            // reloaded before the mark. Each is listed if it imports
+            // nothing, never silently Unchanged.
+            let mut unsure: Vec<(Entity<Buffer>, String)> = Vec::new();
             let omp_before =
                 |path: &Path| call.before.iter().find(|(p, _)| p == path).map(|(_, t)| t);
-            let mut marks = call.marks;
-            for (buffer, mark) in &mut marks {
+            let id = tool_call_id.as_str();
+            let lost_read = |why: &str| {
+                format!(
+                    "OMP's call {id} may have written it before cedian read it, and no text \
+                     from before the call is left ({why}); nothing was imported"
+                )
+            };
+            let moved = format!(
+                "OMP's call {id} moved it, and OMP's text from before the call is the move's \
+                 source, so cedian has no baseline for this path; nothing was imported"
+            );
+            let mut marks = Vec::new();
+            for (buffer, mut mark) in call.marks {
                 let path = buffer.read_with(cx, |b, cx| {
                     b.file().and_then(|f| f.as_local()).map(|f| f.abs_path(cx))
                 });
-                if let Some(TextBefore::Text(text)) = path.as_deref().and_then(omp_before) {
-                    mark.correct_disk_at_start(text);
+                let why = match path.as_deref().and_then(omp_before) {
+                    Some(TextBefore::Moved) => {
+                        this.update(cx, |this, cx| {
+                            let path = buffer.read(cx).file().map(|f| f.full_path(cx));
+                            this.review
+                                .could_not_review(path.unwrap_or_default(), moved.clone());
+                            this.review.import_unattributed(&buffer, id, cx);
+                        })
+                        .ok();
+                        continue;
+                    }
+                    Some(TextBefore::Text(text)) => {
+                        let mut text = text.clone();
+                        text::LineEnding::normalize(&mut text);
+                        let start = mark.start().text();
+                        if mark.read_disk() {
+                            mark.correct_disk_at_start(&text);
+                            None
+                        } else {
+                            (text != start).then(|| {
+                                format!(
+                                    "OMP's call {id} wrote it before cedian marked it (Zed had \
+                                     already reloaded it); nothing was imported"
+                                )
+                            })
+                        }
+                    }
+                    _ if call.bash.is_some() => None,
+                    Some(TextBefore::Pruned) => Some(lost_read("OMP dropped it past 32 KiB")),
+                    _ => Some(lost_read("OMP's result reports none")),
+                };
+                if let Some(mut why) = why {
+                    if mark.read_disk() {
+                        why.push_str(
+                            ". It was open with your unsaved edits, which are kept: the file \
+                             on disk may have changed under them, and saving them overwrites it",
+                        );
+                    }
+                    unsure.push((buffer.clone(), why));
                 }
+                marks.push((buffer, mark));
             }
             for (path, read) in call.unopened {
                 let (before, why) = match omp_before(&path) {
-                    Some(TextBefore::Text(text)) => (Some(text.clone()), None),
+                    Some(TextBefore::Moved) => {
+                        this.update(cx, |this, cx| {
+                            let shown = this.shown_path(&path, cx);
+                            this.review.could_not_review(shown, moved.clone());
+                        })
+                        .ok();
+                        continue;
+                    }
+                    Some(TextBefore::Text(text)) => {
+                        let mut text = text.clone();
+                        text::LineEnding::normalize(&mut text);
+                        (Some(text), None)
+                    }
                     Some(TextBefore::NewFile) => (Some(String::new()), None),
-                    Some(TextBefore::Pruned) => (read, Some("OMP dropped it past 32 KiB")),
-                    None => (read, Some("OMP's result reports none")),
+                    Some(TextBefore::Pruned) => {
+                        (read, Some(lost_read("OMP dropped it past 32 KiB")))
+                    }
+                    None => (read, Some(lost_read("OMP's result reports none"))),
                 };
                 let opened = project
                     .update(cx, |p, cx| p.open_local_buffer(path.clone(), cx))
@@ -2017,14 +2109,7 @@ impl CedianPanel {
                                 );
                             } else if let Some((_, why)) = unsure.iter().find(|(b, _)| *b == buffer)
                             {
-                                this.review.could_not_review(
-                                    path(),
-                                    format!(
-                                        "OMP's call {tool_call_id} may have written it before \
-                                         cedian read it, and no text from before the call is \
-                                         left ({why}); nothing was imported"
-                                    ),
-                                );
+                                this.review.could_not_review(path(), why.clone());
                             }
                             this.review.import_done(&buffer, &tool_call_id, cx);
                         }
@@ -2047,18 +2132,30 @@ impl CedianPanel {
         .detach();
     }
 
+    /// `abs` as the review shows paths: under its worktree's name.
+    fn shown_path(&self, abs: &Path, cx: &App) -> PathBuf {
+        match self.project.read(cx).find_worktree(abs, cx) {
+            Some((worktree, rel)) => worktree.read(cx).full_path(&rel),
+            None => abs.to_path_buf(),
+        }
+    }
+
     /// An outcome may have just created the file's review; the calls still
     /// in flight that marked the buffer are writing it, and the review
     /// only learns of a call at its observe, so they are told again.
     fn still_writing(&mut self, buffer: &Entity<Buffer>, cx: &mut Context<Self>) {
-        let ids: Vec<String> = self
+        let ids: Vec<(String, bool)> = self
             .calls
             .iter()
             .filter(|(_, c)| c.marks.iter().any(|(b, _)| b == buffer))
-            .map(|(id, _)| id.clone())
+            .map(|(id, c)| (id.clone(), c.bash.is_some()))
             .collect();
-        for id in ids {
-            self.review.observe(buffer, &id, cx);
+        for (id, bash) in ids {
+            if bash {
+                self.review.observe_bash(buffer, &id, cx);
+            } else {
+                self.review.observe(buffer, &id, cx);
+            }
         }
     }
 
@@ -2420,6 +2517,13 @@ impl Render for CedianPanel {
             .children(workflow)
             .children(browser)
             .children(dialogs)
+            .when_some(self.ledger_error.clone(), |panel, error| {
+                panel.child(
+                    div()
+                        .debug_selector(|| "cedian-ledger-error".to_string())
+                        .child(Label::new(error).size(LabelSize::Small).color(Color::Error)),
+                )
+            })
             .when_some(self.notice.clone(), |panel, notice| {
                 panel.child(
                     div().debug_selector(|| "cedian-notice".to_string()).child(
@@ -3102,6 +3206,257 @@ mod tests {
             listed[0].1.contains("b1") && listed[0].1.contains("e1"),
             "{listed:?}"
         );
+    }
+
+    /// An open buffer with unsaved edits, a write that beat cedian's disk
+    /// read, and no text from OMP (`write` reports none): the file is listed
+    /// as changed on disk under the person's edits, never Unchanged, and
+    /// their text is kept.
+    async fn dirty_raced_without_old_text(
+        cx: &mut TestAppContext,
+        before: Vec<(String, cedian_omp::TextBefore)>,
+    ) {
+        let (f, buffer) = fixture(cx).await;
+        buffer.update(cx, |b, cx| b.edit([(0..0, "USER ")], None, cx));
+        omp_writes(&f, "/ws/notes.txt", "alpha\nBETA\ngamma\n").await;
+        tool_start(&f, cx, "e1", &["notes.txt"]);
+        cx.run_until_parked();
+        tool_end_with(&f, cx, "e1", before);
+        assert!(hunks(&f, cx).is_empty());
+        let listed = unreviewable(&f, cx);
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert!(
+            listed[0].1.contains("e1") && listed[0].1.contains("unsaved"),
+            "{listed:?}"
+        );
+        assert_eq!(
+            buffer.read_with(cx, |b, _| b.text()),
+            "USER alpha\nbeta\ngamma\n"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_raced_write_under_unsaved_edits_with_no_old_text_is_listed(cx: &mut TestAppContext) {
+        dirty_raced_without_old_text(cx, Vec::new()).await;
+    }
+
+    #[gpui::test]
+    async fn a_raced_write_under_unsaved_edits_with_pruned_old_text_is_listed(
+        cx: &mut TestAppContext,
+    ) {
+        let pruned = cedian_omp::TextBefore::Pruned;
+        dirty_raced_without_old_text(cx, vec![("/ws/notes.txt".to_string(), pruned)]).await;
+    }
+
+    /// Zed's watcher reloaded a clean open buffer before cedian marked it:
+    /// OMP's `oldText` shows the mark is after the write, so the file is
+    /// never silently Unchanged.
+    #[gpui::test]
+    async fn a_clean_buffer_reloaded_before_the_mark_is_not_unchanged(cx: &mut TestAppContext) {
+        let (f, buffer) = fixture(cx).await;
+        omp_writes(&f, "/ws/notes.txt", "alpha\nBETA\ngamma\n").await;
+        cx.run_until_parked();
+        assert_eq!(
+            buffer.read_with(cx, |b, _| b.text()),
+            "alpha\nBETA\ngamma\n"
+        );
+        tool_start(&f, cx, "e1", &["notes.txt"]);
+        cx.run_until_parked();
+        let before = cedian_omp::TextBefore::Text(ORIGINAL.to_string());
+        tool_end_with(&f, cx, "e1", vec![("/ws/notes.txt".to_string(), before)]);
+        let got = hunks(&f, cx);
+        let listed = unreviewable(&f, cx);
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert!(
+            listed[0].1.contains("before cedian marked it"),
+            "{listed:?}"
+        );
+    }
+
+    /// A CRLF `oldText` is the same text as the LF disk text: a call that
+    /// left the file alone is no STALE under the person's unsaved edits.
+    #[gpui::test]
+    async fn a_crlf_old_text_is_normalized(cx: &mut TestAppContext) {
+        let (f, buffer) = fixture(cx).await;
+        buffer.update(cx, |b, cx| b.edit([(0..0, "USER ")], None, cx));
+        tool_start(&f, cx, "c1", &["notes.txt"]);
+        cx.run_until_parked();
+        let before = cedian_omp::TextBefore::Text(ORIGINAL.replace('\n', "\r\n"));
+        tool_end_with(&f, cx, "c1", vec![("/ws/notes.txt".to_string(), before)]);
+        let stale = f
+            .window
+            .update(cx, |panel, _, _| {
+                panel
+                    .review
+                    .files()
+                    .iter()
+                    .find_map(|f| f.stale_import().map(str::to_string))
+            })
+            .unwrap();
+        assert_eq!(stale, None);
+        assert!(unreviewable(&f, cx).is_empty());
+    }
+
+    /// A move's before-text is its source's: it is never imported from it.
+    #[gpui::test]
+    async fn a_moved_file_is_not_reviewable(cx: &mut TestAppContext) {
+        let (f, _buffer) = fixture(cx).await;
+        tool_start(&f, cx, "c1", &["other.txt"]);
+        cx.run_until_parked();
+        omp_writes(&f, "/ws/other.txt", "ONE\ntwo\n").await;
+        let moved = cedian_omp::TextBefore::Moved;
+        tool_end_with(&f, cx, "c1", vec![("/ws/other.txt".to_string(), moved)]);
+        assert!(hunks(&f, cx).is_empty(), "{:?}", hunks(&f, cx));
+        let listed = unreviewable(&f, cx);
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert!(listed[0].1.contains("moved"), "{listed:?}");
+    }
+
+    async fn agent_hunk(f: &Fixture, cx: &mut TestAppContext, id: &str, text: &str) {
+        tool_start(f, cx, id, &["notes.txt"]);
+        cx.run_until_parked();
+        omp_writes(f, "/ws/notes.txt", text).await;
+        tool_end(f, cx, id);
+    }
+
+    /// The overlap path imports nothing, and the watcher's reload of the
+    /// agents' write is no edit of the person's: an earlier hunk does not
+    /// go STALE and no `user_edited_agent_hunk` row is written.
+    #[gpui::test]
+    async fn an_overlap_does_not_credit_the_agents_write_to_the_person(cx: &mut TestAppContext) {
+        let (f, _buffer) = fixture(cx).await;
+        agent_hunk(&f, cx, "e0", "alpha\nBETA\ngamma\n").await;
+        f.window
+            .update(cx, |panel, _, _| panel.review.drain_events())
+            .unwrap();
+        tool_start_named(&f, cx, "b1", "bash", &[]);
+        tool_start(&f, cx, "e1", &["notes.txt"]);
+        cx.run_until_parked();
+        omp_writes(&f, "/ws/notes.txt", "alpha\nBETA2\ngamma\n").await;
+        cx.run_until_parked();
+        tool_end(&f, cx, "e1");
+        tool_end_named(&f, cx, "b1", "bash", Vec::new());
+        let got = hunks(&f, cx);
+        assert!(
+            got.iter()
+                .all(|(_, status, _)| *status != HunkStatus::Stale),
+            "{got:?}"
+        );
+        let events = f
+            .window
+            .update(cx, |panel, _, _| panel.review.drain_events())
+            .unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, crate::review::ReviewEvent::UserEditedAgentHunk { .. })),
+            "{events:?}"
+        );
+        assert_eq!(unreviewable(&f, cx).len(), 1);
+    }
+
+    /// Only files are listed, never a directory, an ignored path or the
+    /// worktree's initial scan; and the call is named as the time, not the
+    /// writer.
+    #[gpui::test]
+    async fn bash_lists_only_files_that_changed_while_it_ran(cx: &mut TestAppContext) {
+        let (f, _buffer) = fixture(cx).await;
+        omp_writes(&f, "/ws/.gitignore", "target/\n").await;
+        f.fs.create_dir(std::path::Path::new("/ws/target"))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        tool_start_named(&f, cx, "b1", "bash", &[]);
+        cx.run_until_parked();
+        f.fs.create_dir(std::path::Path::new("/ws/sub"))
+            .await
+            .unwrap();
+        omp_writes(&f, "/ws/sub/new.txt", "n\n").await;
+        omp_writes(&f, "/ws/target/out.txt", "o\n").await;
+        cx.run_until_parked();
+        tool_end_named(&f, cx, "b1", "bash", Vec::new());
+        let listed = unreviewable(&f, cx);
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].0, PathBuf::from("ws/sub/new.txt"));
+        assert!(listed[0].1.contains("while bash call b1 ran"), "{listed:?}");
+    }
+
+    /// A running bash call does not freeze the review: a hunk can still be
+    /// rejected, and Accept all still runs.
+    #[gpui::test]
+    async fn a_running_bash_call_does_not_block_review_actions(cx: &mut TestAppContext) {
+        let (f, _buffer) = fixture(cx).await;
+        agent_hunk(&f, cx, "e0", "alpha\nBETA\ngamma\nDELTA\n").await;
+        tool_start_named(&f, cx, "b1", "bash", &[]);
+        cx.run_until_parked();
+        let refused = f
+            .window
+            .update(cx, |panel, _, cx| {
+                panel.review.rebuild(cx);
+                let path = PathBuf::from("ws/notes.txt");
+                let key = panel.review.files()[0].hunks()[0].key.clone();
+                let reject = panel.review.reject(&path, &key, cx).err();
+                let all = panel.review.accept_all(false, cx).err();
+                (reject, all)
+            })
+            .unwrap();
+        assert!(refused.0.is_none() && refused.1.is_none(), "{refused:?}");
+    }
+
+    /// OMP dies after a refused `cedian_complete` and before the turn
+    /// settles: stopping still ends the workflow's turn, so the refusal
+    /// blocks it now, in this turn.
+    #[gpui::test]
+    async fn stopping_ends_the_workflow_turn(cx: &mut TestAppContext) {
+        let (f, _buffer) = fixture(cx).await;
+        let dir = std::env::temp_dir().join(format!("cedian-panel-stop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = cedian_workflow::WorkflowState::start(cedian_workflow::TaskProfile::new(
+            "t",
+            cedian_workflow::TaskKind::BugFix,
+        ))
+        .unwrap();
+        state.last_completion = Some(cedian_workflow::CompletionAttempt {
+            claims: Vec::new(),
+            accepted: false,
+            missing: vec!["verify".to_string()],
+            turn_ended: false,
+        });
+        cedian_shell::workflow_store::save(&dir, &state).unwrap();
+        f.window
+            .update(cx, |panel, _, cx| {
+                panel.set_state_dir(dir.clone());
+                panel.stop("OMP exited".to_string(), cx);
+            })
+            .unwrap();
+        let status = cedian_shell::workflow_store::load(&dir).unwrap().status;
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(status, cedian_workflow::WorkflowStatus::Blocked);
+    }
+
+    /// The correction ledger failing again and again says so once.
+    #[gpui::test]
+    async fn a_failing_ledger_is_one_notice(cx: &mut TestAppContext) {
+        let (f, _buffer) = fixture(cx).await;
+        agent_hunk(&f, cx, "e0", "alpha\nBETA\ngamma\nDELTA\n").await;
+        let notice = f
+            .window
+            .update(cx, |panel, _, cx| {
+                let file = std::env::temp_dir()
+                    .join(format!("cedian-panel-not-a-dir-{}", std::process::id()));
+                std::fs::write(&file, "").unwrap();
+                panel.set_state_dir(file);
+                panel.review.rebuild(cx);
+                let path = PathBuf::from("ws/notes.txt");
+                for _ in 0..2 {
+                    let key = panel.review.files()[0].hunks()[0].key.clone();
+                    panel.reject_hunk(&path, &key, cx);
+                }
+                format!("{:?} {:?}", panel.notice(), panel.ledger_error)
+            })
+            .unwrap();
+        assert_eq!(notice.matches("did not record").count(), 1, "{notice}");
     }
 
     /// The person opens the file and types between the tool's start and its

@@ -39,6 +39,22 @@ pub const REPLAY_FILE: &str = "fake-omp.replay.jsonl";
 /// Exit code when the host diverges from the fixture.
 pub const EXIT_DIVERGED: i32 = 3;
 
+/// `omp --version`: fake-omp answers as the pinned OMP, so a hermetic lane
+/// that points `CEDIAN_OMP_BINARY` at it is chosen over an unpinned `omp`
+/// on PATH (ADR-0057 decision 4).
+pub fn version() -> i32 {
+    let pin: serde_json::Value =
+        serde_json::from_str(include_str!("../../../vendor/omp-revision.json"))
+            .expect("vendor/omp-revision.json is JSON");
+    println!(
+        "omp/{}",
+        pin["spikeVerified"]["ompVersion"]
+            .as_str()
+            .unwrap_or_default()
+    );
+    0
+}
+
 /// Entry point: `args` excludes the program name. Returns the exit code.
 pub fn run(args: &[String]) -> i32 {
     // Without `--session-dir` (`Sessions::OmpDefault`) OMP picks its own

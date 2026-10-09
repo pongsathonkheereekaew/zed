@@ -317,7 +317,7 @@ pub fn run_review(
     layout
         .reset()
         .map_err(|e| format!("reviewer run dir: {e}"))?;
-    let binary = std::fs::canonicalize(crate::launch::omp_binary()?)
+    let binary = std::fs::canonicalize(crate::launch::omp_binary()?.binary)
         .map_err(|e| format!("omp binary: {e}"))?;
     let (exec_allow, mut notes) = resolve_allow_list(
         &settings.reviewer_allow_list,
@@ -364,7 +364,7 @@ pub fn run_review(
     let mut policy = SpawnPolicy {
         approvals: Approvals::Reviewer,
         bash_patterns: allow_patterns(&settings.reviewer_allow_list),
-        config_allows: crate::launch::config_allows(&crate::launch::omp_binary()?, workdir)?,
+        config_allows: crate::launch::config_allows(&crate::launch::omp_binary()?.binary, workdir)?,
         model,
         sandbox: Some(layout.clone()),
         ..SpawnPolicy::default()

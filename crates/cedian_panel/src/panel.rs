@@ -334,6 +334,8 @@ pub struct CedianPanel {
     /// The last thing the person should know that is not on a dialog: a
     /// refused prompt, a failed turn, a dialog cedian closed.
     notice: Option<String>,
+    /// The OMP the panel runs is not the pinned one (ADR-0057 decision 4).
+    omp_warning: Option<String>,
     /// The correction ledger's last failed write: one line, however many
     /// rows failed, so a ledger that keeps failing does not grow the notice.
     ledger_error: Option<String>,
@@ -451,6 +453,7 @@ impl CedianPanel {
             subagent_notes: HashMap::default(),
             link: None,
             connection: Connection::NotStarted,
+            omp_warning: None,
             calls: HashMap::default(),
             review: TaskReview::new(TASK_ID),
             watched: HashSet::default(),
@@ -511,6 +514,10 @@ impl CedianPanel {
             })
         });
         self.workspace = Some(workspace);
+    }
+
+    pub fn omp_warning(&self) -> Option<&str> {
+        self.omp_warning.as_deref()
     }
 
     pub fn connection(&self) -> &Connection {
@@ -1171,6 +1178,7 @@ impl CedianPanel {
                 return;
             }
         };
+        self.omp_warning = spec.omp_warning.clone();
         self.state_dir = Some(spec.state_dir.clone());
         self.refresh_workflow(cx);
         if self.browser.is_none() {
@@ -3594,6 +3602,17 @@ impl Render for CedianPanel {
             .children(workflow)
             .children(browser)
             .children(dialogs)
+            .when_some(self.omp_warning.clone(), |panel, warning| {
+                panel.child(
+                    div()
+                        .debug_selector(|| "cedian-omp-version".to_string())
+                        .child(
+                            Label::new(warning)
+                                .size(LabelSize::Small)
+                                .color(Color::Warning),
+                        ),
+                )
+            })
             .when_some(self.ledger_error.clone(), |panel, error| {
                 panel.child(
                     div()

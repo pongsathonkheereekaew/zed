@@ -521,15 +521,45 @@ pub fn omp_config_get(
     key: &str,
     timeout: std::time::Duration,
 ) -> Result<Value, OmpError> {
-    use std::io::Read as _;
     check_path("binary_path", binary)?;
     if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '.') {
         return Err(OmpError::InvalidSpawnProfile(format!(
             "bad config key {key:?}"
         )));
     }
+    let out = run_captured(binary, cwd, &["config", "get", key, "--json"], timeout)?;
+    let parsed: Value = serde_json::from_str(&out)
+        .map_err(|e| OmpError::Spawn(format!("omp config get {key}: {e}")))?;
+    parsed
+        .get("value")
+        .cloned()
+        .ok_or_else(|| OmpError::Spawn(format!("omp config get {key}: no value")))
+}
+
+/// The version `binary --version` prints (`omp/18.6.1` → `18.6.1`).
+pub fn omp_version(binary: &Path, timeout: std::time::Duration) -> Result<String, OmpError> {
+    check_path("binary_path", binary)?;
+    let out = run_captured(binary, &std::env::temp_dir(), &["--version"], timeout)?;
+    let first = out.split_whitespace().next().unwrap_or_default();
+    let version = first.rsplit('/').next().unwrap_or_default();
+    if version.is_empty() {
+        return Err(OmpError::Spawn(format!("omp --version printed {out:?}")));
+    }
+    Ok(version.to_string())
+}
+
+/// Run `binary args` in `cwd` with the scrubbed env; its stdout, or an
+/// error when it fails or outlives `timeout`.
+fn run_captured(
+    binary: &Path,
+    cwd: &Path,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> Result<String, OmpError> {
+    use std::io::Read as _;
+    let what = args.join(" ");
     let mut child = std::process::Command::new(binary)
-        .args(["config", "get", key, "--json"])
+        .args(args)
         .current_dir(cwd)
         .env_clear()
         .envs(scrub_env(std::env::vars()))
@@ -537,8 +567,8 @@ pub fn omp_config_get(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .map_err(|e| OmpError::Spawn(format!("omp config get: {e}")))?;
-    // Drain stdout while waiting: a record larger than the pipe buffer
+        .map_err(|e| OmpError::Spawn(format!("omp {what}: {e}")))?;
+    // Drain stdout while waiting: output larger than the pipe buffer
     // would otherwise block the child until the timeout.
     let reader = child.stdout.take().map(|mut stdout| {
         std::thread::spawn(move || {
@@ -559,7 +589,7 @@ pub fn omp_config_get(
             let _ = child.kill();
             let _ = child.wait();
             return Err(OmpError::Timeout {
-                command: format!("config get {key}"),
+                command: what,
                 after: Some(timeout),
             });
         }
@@ -567,14 +597,9 @@ pub fn omp_config_get(
     };
     let out = reader.and_then(|r| r.join().ok()).unwrap_or_default();
     if !status.success() {
-        return Err(OmpError::Spawn(format!("omp config get {key}: {status}")));
+        return Err(OmpError::Spawn(format!("omp {what}: {status}")));
     }
-    let parsed: Value = serde_json::from_str(&out)
-        .map_err(|e| OmpError::Spawn(format!("omp config get {key}: {e}")))?;
-    parsed
-        .get("value")
-        .cloned()
-        .ok_or_else(|| OmpError::Spawn(format!("omp config get {key}: no value")))
+    Ok(out)
 }
 
 /// Resolve a bare binary name against `PATH` to an absolute path (dev lane).

@@ -32,6 +32,8 @@ impl Root {
             .env("CEDIAN_SESSION_DIR", self.0.join("sessions"))
             .env("CEDIAN_STATE_DIR", self.0.join("state"))
             .env("CEDIAN_OMP_BINARY", "/nonexistent/omp")
+            .env("HOME", self.0.join("home"))
+            .env("PATH", "/usr/bin:/bin")
             .output()
             .unwrap()
     }

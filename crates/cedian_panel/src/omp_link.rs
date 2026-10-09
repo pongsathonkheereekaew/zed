@@ -104,6 +104,8 @@ pub struct Prompt {
 /// Everything one launch needs, resolved before any process starts.
 pub struct LaunchSpec {
     pub binary: PathBuf,
+    /// Set when `binary` is not the pinned OMP (ADR-0057 decision 4).
+    pub omp_warning: Option<String>,
     pub workdir: PathBuf,
     /// The workspace's state dir: the spawn overlay (`omp/`) and the audit log.
     pub state_dir: PathBuf,
@@ -144,7 +146,8 @@ impl LaunchSpec {
     /// dialog); the panel adds its `cedian://` scheme.
     pub fn resolve(workdir: &Path) -> Result<Self, String> {
         let settings = cedian_shell::resolve_settings(workdir).map_err(|e| e.to_string())?;
-        let binary = cedian_shell::launch::omp_binary()?;
+        let omp = cedian_shell::launch::omp_binary()?;
+        let binary = omp.binary;
         let choice = settings.policy_for(workdir, RunKind::Interactive);
         let state_dir = cedian_shell::state::dir(workdir)?;
         let router: Arc<OnceLock<Arc<EventRouter>>> = Arc::default();
@@ -217,6 +220,7 @@ impl LaunchSpec {
         };
         Ok(Self {
             binary,
+            omp_warning: omp.warning,
             workdir: workdir.to_path_buf(),
             state_dir,
             sessions: Sessions::OmpDefault,
@@ -1672,7 +1676,8 @@ mod tests {
         std::fs::create_dir_all(root.join("ws")).unwrap();
         let root = root.canonicalize().unwrap();
         let spec = || LaunchSpec {
-            binary: cedian_shell::launch::omp_binary().unwrap(),
+            binary: cedian_shell::launch::omp_binary().unwrap().binary,
+            omp_warning: None,
             workdir: root.join("ws"),
             state_dir: root.join("state"),
             sessions: Sessions::OmpDefault,

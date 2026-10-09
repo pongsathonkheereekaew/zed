@@ -42,6 +42,7 @@ fn main() {
     }
     match args.first().map(String::as_str) {
         Some("--mode") => std::process::exit(cedian_fake_omp::run(&args)),
+        Some("--version") => std::process::exit(cedian_fake_omp::version()),
         Some("config") => std::process::exit(cedian_fake_omp::config_get(&args)),
         _ => {}
     }

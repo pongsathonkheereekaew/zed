@@ -335,9 +335,9 @@ fn omp_policy_badge(workdir: &Path) -> String {
     )
 }
 
-/// The `omp` binary a spawn will run (`CEDIAN_OMP_BINARY`, else `PATH`).
+/// The `omp` binary a spawn will run (ADR-0057 decision 4).
 fn omp_binary_path() -> Result<PathBuf, String> {
-    cedian_shell::launch::omp_binary()
+    cedian_shell::launch::omp_binary().map(|choice| choice.binary)
 }
 
 /// Spawn the runtime with workspace host tools + cedian:// wired.
@@ -347,12 +347,11 @@ fn spawn(
     settings: &cedian_shell::Settings,
     host: &std::sync::Arc<HostTools>,
 ) -> Result<OmpRuntime, String> {
-    // `CEDIAN_OMP_BINARY` (absolute) points the harness at another binary —
-    // the hermetic replay lane uses it for fake-omp (§86, P2).
-    let binary = match std::env::var("CEDIAN_OMP_BINARY") {
-        Ok(path) => OmpBinary::Bundled(PathBuf::from(path)),
-        Err(_) => OmpBinary::Path("omp".to_string()),
-    };
+    let omp = cedian_shell::launch::omp_binary()?;
+    if let Some(warning) = &omp.warning {
+        println!("warning: {warning}");
+    }
+    let binary = OmpBinary::Bundled(omp.binary.clone());
     // Every spawn here has a person at the terminal; reviewers and
     // automations will pass `RunKind::Unattended` (ADR-0035 decision 5).
     let choice = settings.policy_for(workdir, cedian_shell::RunKind::Interactive);
@@ -371,7 +370,7 @@ fn spawn(
     let mut policy =
         cedian_shell::launch::spawn_policy(settings, choice.policy, &host_tool_names(settings));
     if choice.policy == cedian_shell::Policy::Cedian {
-        policy.config_allows = cedian_shell::launch::config_allows(&omp_binary_path()?, workdir)?;
+        policy.config_allows = cedian_shell::launch::config_allows(&omp.binary, workdir)?;
     }
     let rt = OmpRuntime::spawn(RuntimeConfig {
         binary,

@@ -27,6 +27,9 @@ fn main() {
     if args.first().map(String::as_str) == Some("--mode") {
         std::process::exit(cedian_fake_omp::run(&args));
     }
+    if args.first().map(String::as_str) == Some("--version") {
+        std::process::exit(cedian_fake_omp::version());
+    }
     if args.first().map(String::as_str) == Some("config") {
         std::process::exit(cedian_fake_omp::config_get(&args));
     }

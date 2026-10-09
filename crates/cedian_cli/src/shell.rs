@@ -216,7 +216,7 @@ impl InlineEdit {
             .filter(|(a, b)| *a >= 1 && a <= b)
             .ok_or(EDIT_USAGE)?;
         let key = PathBuf::from(format!("/{}", path.trim_start_matches('/')));
-        let local = crate::workspace_files::local_path(workdir, &key)
+        let local = cedian_shell::workspace_files::local_path(workdir, &key)
             .ok_or_else(|| format!("path outside the workspace: {path}"))?;
         let text = std::fs::read_to_string(&local).map_err(|e| format!("{path}: {e}"))?;
         let lines: Vec<&str> = text.split_inclusive('\n').collect();

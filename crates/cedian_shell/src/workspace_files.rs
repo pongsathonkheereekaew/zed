@@ -1,4 +1,5 @@
-//! Workspace file scan for the CLI harness: text files ↔ buffer keys.
+//! Workspace file scan: text files ↔ buffer keys for the CLI harness, and
+//! every file the code state hashes (row H).
 //!
 //! Buffer keys are absolute `/{rel}` paths (e.g. `/src/main.rs`); local paths
 //! are `workdir + rel`. Binary/ignored files are skipped by extension + size.

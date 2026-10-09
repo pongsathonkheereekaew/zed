@@ -31,13 +31,13 @@ mod state;
 #[cfg(test)]
 mod test_dir;
 mod timing;
-mod verify_store;
-mod workspace_files;
 
 use cedian_agent_ui::Panel;
 use cedian_omp::{OmpBinary, OmpRuntime, RuntimeConfig};
 use cedian_review::FileDiff;
-use cedian_shell::{corrections, review_agent, review_findings, workflow_store};
+use cedian_shell::{
+    corrections, review_agent, review_findings, workflow_host, workflow_store, workspace_files,
+};
 use cedian_workspace::{HostTools, WorkspaceHost};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -193,14 +193,12 @@ fn workflow_channel(
     settings: &cedian_shell::Settings,
     resolve: impl Fn(&str, &str) -> Option<cedian_workflow::BoundCall> + Send + Sync + 'static,
 ) -> Result<std::sync::Arc<cedian_workflow::WorkflowChannel>, String> {
-    let root = workdir.to_path_buf();
-    Ok(cedian_workflow::WorkflowChannel::with_policy(
-        "cli",
-        Box::new(workflow_store::DiskWorkflowStore(state::dir(workdir)?)),
+    Ok(workflow_host::channel(
+        session::CLI_TASK,
+        workdir,
+        &state::dir(workdir)?,
+        settings,
         resolve,
-        move || current_state(&root),
-        settings.floor.clone(),
-        Box::new(verify_store::DiskProfileStore(workdir.to_path_buf())),
     ))
 }
 
@@ -208,31 +206,14 @@ fn workflow_channel(
 /// blocks the workflow (or leaves it failed when the agent failed a phase);
 /// say so with the missing gates.
 fn end_workflow_turn(workdir: &Path) -> Result<(), String> {
-    let state_dir = state::dir(workdir)?;
-    if !workflow_store::exists(&state_dir) {
-        return Ok(());
-    }
-    let mut state = workflow_store::load(&state_dir)?;
-    let Some((status, missing)) = state.end_turn() else {
-        if state.last_completion.is_some() {
-            workflow_store::save(&state_dir, &state)?;
-        }
-        return Ok(());
-    };
     let next_turn = session::load(workdir)?
         .map(|s| s.turns.len() as u32 + 1)
         .unwrap_or(1);
-    corrections::record(
-        &state_dir,
-        session::CLI_TASK,
-        corrections::CorrectionKind::CompletionRefused,
-        corrections::Event {
-            turn: Some(next_turn),
-            excerpt: Some(missing.join("\n")),
-            ..corrections::Event::default()
-        },
-    )?;
-    workflow_store::save(&state_dir, &state)?;
+    let Some((status, missing)) =
+        workflow_host::end_turn(&state::dir(workdir)?, session::CLI_TASK, Some(next_turn))?
+    else {
+        return Ok(());
+    };
     let (word, next) = if status == cedian_workflow::WorkflowStatus::Failed {
         ("FAILED", "start a new workflow to retry")
     } else {
@@ -246,37 +227,9 @@ fn end_workflow_turn(workdir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// The workspace hashed now (ADR-0024; headless code state, row H). Files
-/// over the buffer cap are hashed by size and mtime, not read.
+/// The workspace hashed now (ADR-0024; headless code state, row H).
 fn current_state(workdir: &Path) -> cedian_workflow::CurrentState {
-    let files: Vec<(String, Vec<u8>)> = workspace_files::scan_code_state_files(workdir)
-        .into_iter()
-        .filter_map(|path| {
-            let rel = path
-                .strip_prefix(workdir)
-                .ok()?
-                .to_string_lossy()
-                .into_owned();
-            let meta = std::fs::metadata(&path).ok()?;
-            let bytes = if meta.len() > workspace_files::MAX_FILE_BYTES {
-                let mtime = meta
-                    .modified()
-                    .ok()?
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .ok()?
-                    .as_nanos();
-                format!("{}:{mtime}", meta.len()).into_bytes()
-            } else {
-                std::fs::read(&path).ok()?
-            };
-            Some((rel, bytes))
-        })
-        .collect();
-    cedian_workflow::CurrentState::from_files(
-        files
-            .iter()
-            .map(|(rel, bytes)| (rel.clone(), bytes.as_slice())),
-    )
+    workflow_host::current_state(workdir)
 }
 
 /// Every host tool, with the P5 evidence resolver over this runtime's router
@@ -292,26 +245,7 @@ fn host_tools(
 ) -> Result<Vec<omp_rpc::HostTool>, String> {
     let router = rt.router();
     let resolve = move |tool: &str, needle: &str| {
-        let calls = router.finished_tool_calls();
-        let at = calls.iter().rposition(|call| {
-            !call.is_error
-                && call.tool_name == tool
-                && call.args_preview.contains(needle)
-                && !cedian_workflow::is_channel_call(&call.tool_name, &call.args_preview)
-        })?;
-        // ADR-0024: a later call that may have changed files means the
-        // workspace hashed now is not what this call saw.
-        let mutated_after = calls[at + 1..]
-            .iter()
-            .find(|c| cedian_workflow::may_mutate(&c.tool_name, &c.args_preview))
-            .map(|c| format!("{} {}", c.tool_name, c.args_preview));
-        let call = calls[at].clone();
-        Some(cedian_workflow::BoundCall {
-            tool_call_id: call.tool_call_id,
-            tool_name: call.tool_name,
-            args_preview: call.args_preview,
-            mutated_after,
-        })
+        workflow_host::bound_call(&router.finished_tool_calls(), tool, needle)
     };
     let channel = workflow_channel(workdir, settings, resolve)?;
     let root = workdir.to_path_buf();

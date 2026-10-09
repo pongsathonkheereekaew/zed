@@ -141,6 +141,9 @@ pub enum Connection {
     },
 }
 
+/// The app's task: its review, its workflow evidence and its correction rows.
+pub const TASK_ID: &str = "panel";
+
 pub struct CedianPanel {
     focus_handle: FocusHandle,
     project: Entity<Project>,
@@ -229,7 +232,7 @@ impl CedianPanel {
             link: None,
             connection: Connection::NotStarted,
             calls: HashMap::default(),
-            review: TaskReview::new("panel"),
+            review: TaskReview::new(TASK_ID),
             watched: HashSet::default(),
             buffer_subscriptions: Vec::new(),
             show_review: false,
@@ -1178,12 +1181,42 @@ impl CedianPanel {
                 if let Turn::Failed(reason) = std::mem::replace(&mut self.turn, Turn::Idle) {
                     self.notice = Some(format!("turn failed: {reason}"));
                 }
+                self.end_workflow_turn(cx);
             }
             _ => {}
         }
         self.subagents.apply(&event);
         self.thread.apply(&event);
         cx.notify();
+    }
+
+    /// Turn boundary (ADR-0036): a claim refused in the turn that just
+    /// ended blocks the workflow, and the panel says which gates are unmet.
+    fn end_workflow_turn(&mut self, cx: &mut Context<Self>) {
+        if self.state_dir.is_none() && self.workspace_root(cx).is_none() {
+            return;
+        }
+        let turn = Some(self.review.current_turn());
+        let said = match self
+            .state_dir(cx)
+            .and_then(|dir| cedian_shell::workflow_host::end_turn(&dir, TASK_ID, turn))
+        {
+            Ok(None) => return,
+            Ok(Some((status, missing))) => format!(
+                "workflow {}: the agent claimed done with required gates unmet: {}",
+                if status == cedian_workflow::WorkflowStatus::Failed {
+                    "failed"
+                } else {
+                    "blocked"
+                },
+                missing.join("; ")
+            ),
+            Err(e) => format!("the workflow could not end its turn: {e}"),
+        };
+        self.notice = Some(match self.notice.take() {
+            Some(notice) => format!("{notice}; {said}"),
+            None => said,
+        });
     }
 
     /// The Stop button: close the dialogs OMP waits on and abort the

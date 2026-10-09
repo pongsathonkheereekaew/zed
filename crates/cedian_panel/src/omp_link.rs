@@ -12,8 +12,8 @@
 //! or is stopped is recorded as `abstain` (§63 lease, ADR-0013).
 
 use cedian_omp::{
-    DialogRecord, NewSession, OmpBinary, OmpRuntime, RouterEvent, RuntimeConfig, RuntimeControl,
-    Sessions, SpawnPolicy, UserAnswer,
+    DialogRecord, EventRouter, NewSession, OmpBinary, OmpRuntime, RouterEvent, RuntimeConfig,
+    RuntimeControl, Sessions, SpawnPolicy, UserAnswer,
 };
 use cedian_shell::audit::AuditLog;
 use cedian_shell::{Policy, RunKind};
@@ -25,7 +25,7 @@ use omp_rpc::{
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, OnceLock, mpsc};
 use std::time::Duration;
 
 /// What the OMP thread tells the panel.
@@ -116,24 +116,46 @@ pub struct LaunchSpec {
     /// The host tools registered before the session opens (one
     /// `set_host_tools` replaces OMP's whole set, ADR-0004).
     pub tools: Vec<HostTool>,
+    /// The runtime's router once OMP runs: the workflow channel binds
+    /// reported evidence to the calls in its log (ADR-0031).
+    pub router: Arc<OnceLock<Arc<EventRouter>>>,
 }
 
 impl LaunchSpec {
     /// Resolve settings, policy and paths for `workdir`. The app registers
-    /// `cedian_worktree_request` only when project writes are allowed (it
-    /// writes `.worktrees/` and a branch with no dialog); the panel adds its `cedian://` scheme.
+    /// the workflow channel under either policy (it writes no workspace
+    /// file, ADR-0055), and `cedian_worktree_request` only when project
+    /// writes are allowed (it writes `.worktrees/` and a branch with no
+    /// dialog); the panel adds its `cedian://` scheme.
     pub fn resolve(workdir: &Path) -> Result<Self, String> {
         let settings = cedian_shell::resolve_settings(workdir).map_err(|e| e.to_string())?;
         let binary = cedian_shell::launch::omp_binary()?;
         let choice = settings.policy_for(workdir, RunKind::Interactive);
         let state_dir = cedian_shell::state::dir(workdir)?;
-        let (tools, names) = if cedian_shell::launch::registers_worktree_request(&settings) {
-            let tool =
-                cedian_worker::worktree_request_tool(workdir.to_path_buf(), state_dir.clone());
-            (vec![tool], vec![cedian_worker::WORKTREE_REQUEST_TOOL])
-        } else {
-            (Vec::new(), Vec::new())
-        };
+        let router: Arc<OnceLock<Arc<EventRouter>>> = Arc::default();
+        let log = Arc::clone(&router);
+        let channel = cedian_shell::workflow_host::channel(
+            crate::panel::TASK_ID,
+            workdir,
+            &state_dir,
+            &settings,
+            move |tool, needle| {
+                let calls = log.get()?.finished_tool_calls();
+                cedian_shell::workflow_host::bound_call(&calls, tool, needle)
+            },
+        );
+        let mut tools = channel.host_tools();
+        let mut names = vec![
+            cedian_workflow::WORKFLOW_UPDATE_TOOL,
+            cedian_workflow::COMPLETE_TOOL,
+        ];
+        if cedian_shell::launch::registers_worktree_request(&settings) {
+            tools.push(cedian_worker::worktree_request_tool(
+                workdir.to_path_buf(),
+                state_dir.clone(),
+            ));
+            names.push(cedian_worker::WORKTREE_REQUEST_TOOL);
+        }
         let mut policy = cedian_shell::launch::spawn_policy(&settings, choice.policy, &names);
         let policy_note = match choice.policy {
             Policy::Cedian => {
@@ -155,6 +177,7 @@ impl LaunchSpec {
             omp_state: cedian_omp::driver::state_root(),
             uris: Vec::new(),
             tools,
+            router,
         })
     }
 }
@@ -892,6 +915,7 @@ fn run(
             return;
         }
     };
+    let _ = spec.router.set(runtime.router());
     if !spec.tools.is_empty()
         && let Err(e) = runtime.set_host_tools(spec.tools)
     {
@@ -1591,6 +1615,7 @@ mod tests {
             omp_state: cedian_omp::driver::state_root(),
             uris: Vec::new(),
             tools: Vec::new(),
+            router: Arc::default(),
         };
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         let link = OmpLink::start(spec(), tx, None);

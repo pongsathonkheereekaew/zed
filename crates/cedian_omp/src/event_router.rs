@@ -440,7 +440,15 @@ fn classify_agent_event(event: &RpcAgentEvent) -> RouterEvent {
 /// `get_state.dumpTools` parameters; unknown tools fall back to key names.
 /// The files an edit-class tool writes. `write` and `ast_edit` name one
 /// `path`; `edit` takes a script whose `[path#hash]` headers name each file.
+/// A URI is no file: OMP 18.6.1 mounts host tools as `xd://` devices that
+/// a `read` or `write` calls.
 pub fn written_paths(name: &str, args: Option<&serde_json::Value>) -> Vec<String> {
+    let mut paths = edit_targets(name, args);
+    paths.retain(|p| !p.contains("://"));
+    paths
+}
+
+fn edit_targets(name: &str, args: Option<&serde_json::Value>) -> Vec<String> {
     let Some(args) = args else {
         return Vec::new();
     };
@@ -588,6 +596,11 @@ mod tests {
         );
         assert!(super::written_paths("bash", Some(&json!({"command": "rm notes.txt"}))).is_empty());
         assert!(super::written_paths("edit", None).is_empty());
+        let device = json!({"path": "xd://cedian_complete", "content": "{}"});
+        assert!(
+            super::written_paths("write", Some(&device)).is_empty(),
+            "a write to an xd:// device is a host tool call, not a file"
+        );
     }
 
     use super::*;

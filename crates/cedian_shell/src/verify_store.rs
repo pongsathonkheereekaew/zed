@@ -1,4 +1,4 @@
-//! Verification-profile ledger for the CLI harness (ADR-0025):
+//! Verification-profile ledger (ADR-0025):
 //! `verify.json` in the state dir (ADR-0044), `snapshot_version` envelope (P3, fails closed).
 //! Profile skills are read from `.omp/skills/<profile>/SKILL.md` — the
 //! user's OMP config, never written here (§77).
@@ -18,8 +18,8 @@ struct Stored<S> {
     ledger: S,
 }
 
-fn verify_path(workdir: &Path) -> Result<PathBuf, String> {
-    crate::state::file(workdir, "verify.json")
+fn verify_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("verify.json")
 }
 
 /// `verify-<app>` with a plain name: no path can escape `.omp/skills/`.
@@ -32,11 +32,15 @@ fn valid_profile(name: &str) -> bool {
     })
 }
 
-pub struct DiskProfileStore(pub PathBuf);
+/// The ledger in `state_dir`; profile skills from `workdir`.
+pub struct DiskProfileStore {
+    pub state_dir: PathBuf,
+    pub workdir: PathBuf,
+}
 
 impl ProfileStore for DiskProfileStore {
     fn load(&self) -> Result<ProfileLedger, String> {
-        let Ok(raw) = std::fs::read_to_string(verify_path(&self.0)?) else {
+        let Ok(raw) = std::fs::read_to_string(verify_path(&self.state_dir)) else {
             return Ok(ProfileLedger::default());
         };
         let version: Stored<serde::de::IgnoredAny> =
@@ -46,7 +50,7 @@ impl ProfileStore for DiskProfileStore {
                 "verification state too old (got v{}, want v{VERIFY_SNAPSHOT_VERSION}): \
                  delete {} and re-run the profile end to end",
                 version.snapshot_version,
-                verify_path(&self.0)?.display()
+                verify_path(&self.state_dir).display()
             ));
         }
         let stored: Stored<ProfileLedger> =
@@ -60,14 +64,20 @@ impl ProfileStore for DiskProfileStore {
             ledger,
         })
         .map_err(|e| e.to_string())?;
-        std::fs::write(verify_path(&self.0)?, raw).map_err(|e| e.to_string())
+        std::fs::write(verify_path(&self.state_dir), raw).map_err(|e| e.to_string())
     }
 
     fn skill(&self, profile: &str) -> Option<String> {
         if !valid_profile(profile) {
             return None;
         }
-        std::fs::read_to_string(self.0.join(".omp/skills").join(profile).join("SKILL.md")).ok()
+        std::fs::read_to_string(
+            self.workdir
+                .join(".omp/skills")
+                .join(profile)
+                .join("SKILL.md"),
+        )
+        .ok()
     }
 }
 
@@ -80,7 +90,11 @@ mod tests {
         let d = crate::test_dir::TestDir::new("verify");
         std::fs::create_dir_all(d.join(".omp/skills/verify-notes")).unwrap();
         std::fs::write(d.join(".omp/skills/verify-notes/SKILL.md"), "# v").unwrap();
-        let store = DiskProfileStore(d.to_path_buf());
+        let state = crate::test_dir::TestDir::new("verify-state");
+        let store = DiskProfileStore {
+            state_dir: state.to_path_buf(),
+            workdir: d.to_path_buf(),
+        };
         assert_eq!(store.load().unwrap(), ProfileLedger::default());
         let ledger = ProfileLedger {
             seq: 7,
@@ -91,7 +105,7 @@ mod tests {
         assert_eq!(store.skill("verify-notes").as_deref(), Some("# v"));
         assert_eq!(store.skill("verify-../../etc"), None);
         assert_eq!(store.skill("bug-fix"), None);
-        std::fs::write(verify_path(&d).unwrap(), r#"{"snapshot_version":0}"#).unwrap();
+        std::fs::write(verify_path(&state), r#"{"snapshot_version":0}"#).unwrap();
         assert!(store.load().unwrap_err().contains("too old"));
     }
 }

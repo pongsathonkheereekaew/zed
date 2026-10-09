@@ -17,7 +17,10 @@ pub mod settings;
 pub mod state;
 #[cfg(test)]
 mod test_dir;
+pub mod verify_store;
+pub mod workflow_host;
 pub mod workflow_store;
+pub mod workspace_files;
 
 pub use palette::{Palette, PaletteAction};
 pub use session_manager::{SESSIONS_SNAPSHOT_VERSION, SessionEntry, SessionManager};

@@ -108,3 +108,7 @@ harness = false
 [[test]]
 name = "review"
 harness = false
+
+[[test]]
+name = "inline_edit"
+harness = false

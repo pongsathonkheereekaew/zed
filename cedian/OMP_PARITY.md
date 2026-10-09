@@ -28,8 +28,8 @@ The one home for **per-feature OMP coverage** ([ADR-0034](https://github.com/pon
 | `handoff` | hand off to a new session with summary | deferred: S10 |
 | `export_html` | export thread | deferred: S10 |
 | `get_session_stats` | usage / cost meter | deferred: S10 |
-| `set_model`, `cycle_model`, `get_available_models` | model picker | deferred: S9 U11 |
-| `set_thinking_level`, `cycle_thinking_level`, `get_available_thinking_levels` | thinking-level picker | deferred: S9 U11 |
+| `set_model`, `cycle_model`, `get_available_models` | the panel's model and thinking-level picker (S9 U11, ADR-0057 decision 3): opening it reads `get_state` and `get_available_models`; a model button sends `set_model`, Next model `cycle_model`; OMP's refusal shows in the picker; all sent off the UI thread | native |
+| `set_thinking_level`, `cycle_thinking_level`, `get_available_thinking_levels` | the panel's model and thinking-level picker (S9 U11, ADR-0057 decision 3): one button per level OMP offers sends `set_thinking_level`, Next level `cycle_thinking_level` | native |
 | `set_fast_mode`, `set_slow_mode` | speed toggles | deferred: S10 |
 | `get_login_providers`, `login` | onboarding / account settings | deferred: S9 U11 |
 | `compact`, `set_auto_compaction` | context meter + compact action | deferred: S9 U11 |
@@ -59,7 +59,7 @@ The one home for **per-feature OMP coverage** ([ADR-0034](https://github.com/pon
 | `auto_compaction_start`, `auto_compaction_end` | compaction notice | deferred: S9 U11 |
 | `auto_retry_start`, `auto_retry_end`, `retry_fallback_applied`, `retry_fallback_succeeded` | retry / fallback banner | deferred: S9 U11 |
 | `cache_warming_start`, `cache_warming_end` | status line | deferred: S10 |
-| `model_changed`, `thinking_level_changed` | model picker state | deferred: S9 U11 |
+| `model_changed`, `thinking_level_changed` | the panel's model and thinking-level picker (S9 U11, ADR-0057 decision 3): `thinking_level_changed` sets the shown level; `model_changed` names no model, so an open picker re-reads `get_state` | native |
 | `config_warnings_changed` | a warning toast: the event carries no warnings, so it says they changed and that `omp` lists them; one toast row each in the panel, with its level and Dismiss (S9 U11, ADR-0057 decision 3) | native |
 | `advisor_cost_changed`, `advisor_yielded` | usage meter | deferred: S10 |
 | `ttsr_triggered` | an info toast naming the rules OMP injected mid-stream; one toast row each in the panel, with its level and Dismiss (S9 U11, ADR-0057 decision 3) | native |
@@ -136,5 +136,5 @@ Frames OMP sends besides the agent events above.
 | skills, rules, `AGENTS.md`, agents (`.omp/`) | used as-is; listed read-only in settings ([§77](https://github.com/pongsathonkheereekaew/cedian/blob/main/docs/ARCHITECTURE.md)) | internal (used as-is); deferred: S10 (listing) |
 | MCP servers, extensions | used as-is; listed read-only in settings | internal (used as-is); deferred: S10 (listing) |
 | memory | used as-is | internal (used as-is) |
-| provider/model routing | model picker | deferred: S9 U11 |
+| provider/model routing | the panel's model and thinking-level picker (S9 U11, ADR-0057 decision 3): models are `provider/id` as OMP lists them; routing itself is OMP's | native |
 | model roles (`modelRoles`, `modelRoleStorage`, `--smol`/`--slow`/`--plan`) | settings page "Model roles"; reviewer role ([ADR-0039](https://github.com/pongsathonkheereekaew/cedian/blob/main/docs/decisions/0039-model-roles-and-independent-review.md)) | deferred: S10 (page); reviewer (role, S3) |

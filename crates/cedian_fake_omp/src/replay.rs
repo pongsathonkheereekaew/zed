@@ -132,6 +132,25 @@ pub(crate) fn run(fixture: &Path, cwd: &Path, placeholders: &Placeholders) -> i3
                         }
                     }
                 }
+                // A parity-core command must be the recorded one, field by
+                // field (its id aside).
+                if got_type.is_some_and(|t| WHOLE_FRAME.contains(&t)) {
+                    let strip = |v: &Value| {
+                        let mut v = v.clone();
+                        if let Some(o) = v.as_object_mut() {
+                            o.remove("id");
+                        }
+                        v
+                    };
+                    if strip(&got) != strip(&expected) {
+                        eprintln!(
+                            "fake-omp replay: divergence at record {n}: expected {}, host sent {}",
+                            strip(&expected),
+                            strip(&got)
+                        );
+                        return crate::EXIT_DIVERGED;
+                    }
+                }
                 // A host URI read must answer what the recording answered.
                 let fields: &[&str] = match got_type {
                     Some("host_uri_result") => &["content", "isError", "error"],
@@ -240,6 +259,25 @@ fn first_lines(frame: &Value) -> Vec<&str> {
         .map(|text| text.lines().next().unwrap_or(""))
         .collect()
 }
+
+/// Commands replay checks whole (S9 U11, ADR-0057 decision 3).
+const WHOLE_FRAME: &[&str] = &[
+    "get_available_models",
+    "set_model",
+    "cycle_model",
+    "get_available_thinking_levels",
+    "set_thinking_level",
+    "cycle_thinking_level",
+    "abort_and_prompt",
+    "promote_queued_message",
+    "set_steering_mode",
+    "set_follow_up_mode",
+    "set_interrupt_mode",
+    "compact",
+    "set_auto_compaction",
+    "set_auto_retry",
+    "abort_retry",
+];
 
 fn remap_id(frame: &mut Value, ids: &HashMap<String, String>) {
     let Some(id) = frame.get("id").and_then(Value::as_str) else {

@@ -497,6 +497,12 @@ impl RuntimeControl {
             .map_err(OmpError::from)
     }
 
+    /// Any one RPC command, for the panel's settings of the live session
+    /// (model, thinking level, queue modes, compaction, retry).
+    pub fn call<C: omp_rpc::Command>(&self, command: &C) -> Result<C::Output, OmpError> {
+        self.client.call(command).map_err(OmpError::from)
+    }
+
     /// Abort the running turn; the blocked `prompt` returns.
     pub fn abort(&self) -> Result<(), OmpError> {
         self.client

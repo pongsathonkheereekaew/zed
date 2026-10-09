@@ -23,3 +23,26 @@
 {"dir":"out","frame":{"rules":[{"name":"no-console","path":"/rules/no-console.md"}],"type":"ttsr_triggered"}}
 {"dir":"out","frame":{"agentInvoked":true,"id":"req_6","sessionSettled":true,"status":"completed","type":"prompt_result"}}
 {"dir":"out","frame":{"type":"session_settled"}}
+
+{"dir":"in","frame":{"id":"req_7","type":"get_state"}}
+{"dir":"out","frame":{"command":"get_state","id":"req_7","success":true,"type":"response","data":{"sessionId":"01a113c8-6171-72ca-9b6b-1c696dd443e1","model":{"id":"claude-x","name":"Claude X","api":"x","provider":"anthropic","baseUrl":"https://x","reasoning":true,"input":["text"],"cost":{"input":1,"output":2,"cacheRead":0,"cacheWrite":0},"contextWindow":200000,"maxTokens":8192},"thinkingLevel":"high"}}}
+{"dir":"in","frame":{"id":"req_8","type":"get_available_models"}}
+{"dir":"out","frame":{"command":"get_available_models","id":"req_8","success":true,"type":"response","data":{"models":[{"id":"claude-x","name":"Claude X","api":"x","provider":"anthropic","baseUrl":"https://x","reasoning":true,"input":["text"],"cost":{"input":1,"output":2,"cacheRead":0,"cacheWrite":0},"contextWindow":200000,"maxTokens":8192},{"id":"gpt-y","name":"GPT Y","api":"x","provider":"openai","baseUrl":"https://x","reasoning":true,"input":["text"],"cost":{"input":1,"output":2,"cacheRead":0,"cacheWrite":0},"contextWindow":200000,"maxTokens":8192}]}}}
+{"dir":"in","frame":{"id":"req_9","type":"get_available_thinking_levels"}}
+{"dir":"out","frame":{"command":"get_available_thinking_levels","id":"req_9","success":true,"type":"response","data":{"levels":["off","low","high"]}}}
+{"dir":"in","frame":{"id":"req_10","type":"set_model","provider":"openai","modelId":"gpt-y"}}
+{"dir":"out","frame":{"command":"set_model","id":"req_10","success":true,"type":"response","data":{"id":"gpt-y","name":"GPT Y","api":"x","provider":"openai","baseUrl":"https://x","reasoning":true,"input":["text"],"cost":{"input":1,"output":2,"cacheRead":0,"cacheWrite":0},"contextWindow":200000,"maxTokens":8192}}}
+{"dir":"in","frame":{"id":"req_11","type":"cycle_model"}}
+{"dir":"out","frame":{"command":"cycle_model","id":"req_11","success":true,"type":"response","data":{"model":{"id":"claude-x","name":"Claude X","api":"x","provider":"anthropic","baseUrl":"https://x","reasoning":true,"input":["text"],"cost":{"input":1,"output":2,"cacheRead":0,"cacheWrite":0},"contextWindow":200000,"maxTokens":8192},"isScoped":false,"thinkingLevel":"low"}}}
+{"dir":"in","frame":{"id":"req_12","type":"set_thinking_level","level":"off"}}
+{"dir":"out","frame":{"command":"set_thinking_level","id":"req_12","success":true,"type":"response"}}
+{"dir":"in","frame":{"id":"req_13","type":"cycle_thinking_level"}}
+{"dir":"out","frame":{"command":"cycle_thinking_level","id":"req_13","success":true,"type":"response","data":{"level":"minimal"}}}
+{"dir":"out","frame":{"type":"thinking_level_changed","thinkingLevel":"medium"}}
+{"dir":"out","frame":{"type":"model_changed"}}
+{"dir":"in","frame":{"id":"req_14","type":"get_state"}}
+{"dir":"out","frame":{"command":"get_state","id":"req_14","success":true,"type":"response","data":{"sessionId":"01a113c8-6171-72ca-9b6b-1c696dd443e1","model":{"id":"gpt-y","name":"GPT Y","api":"x","provider":"openai","baseUrl":"https://x","reasoning":true,"input":["text"],"cost":{"input":1,"output":2,"cacheRead":0,"cacheWrite":0},"contextWindow":200000,"maxTokens":8192},"thinkingLevel":"medium"}}}
+{"dir":"in","frame":{"id":"req_15","type":"get_available_models"}}
+{"dir":"out","frame":{"command":"get_available_models","id":"req_15","success":true,"type":"response","data":{"models":[{"id":"claude-x","name":"Claude X","api":"x","provider":"anthropic","baseUrl":"https://x","reasoning":true,"input":["text"],"cost":{"input":1,"output":2,"cacheRead":0,"cacheWrite":0},"contextWindow":200000,"maxTokens":8192},{"id":"gpt-y","name":"GPT Y","api":"x","provider":"openai","baseUrl":"https://x","reasoning":true,"input":["text"],"cost":{"input":1,"output":2,"cacheRead":0,"cacheWrite":0},"contextWindow":200000,"maxTokens":8192}]}}}
+{"dir":"in","frame":{"id":"req_16","type":"get_available_thinking_levels"}}
+{"dir":"out","frame":{"command":"get_available_thinking_levels","id":"req_16","success":true,"type":"response","data":{"levels":["off","low","high"]}}}

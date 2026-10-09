@@ -86,6 +86,10 @@ pub enum RouterEvent {
     /// A dialog or UI notice from OMP: approvals and `ask` wait for an
     /// answer (`crate::dialog`); the rest are fire-and-forget.
     UiRequest(ExtensionUiRequest),
+    /// OMP's model changed; the event names none, `get_state` does.
+    ModelChanged,
+    /// OMP's effective thinking level changed.
+    ThinkingLevel(Option<omp_rpc::wire::ThinkingLevel>),
     /// One of OMP's notices for the person (ADR-0057 decision 3).
     Toast(Toast),
     /// Forward-compat: recognized frame, unmodeled kind — never fatal.
@@ -522,6 +526,10 @@ fn classify_agent_event(event: &RpcAgentEvent) -> RouterEvent {
             is_error: end.is_error.unwrap_or(false),
             before: texts_before(end.result.as_ref()),
         },
+        RpcAgentEvent::ModelChanged(_) => RouterEvent::ModelChanged,
+        RpcAgentEvent::ThinkingLevelChanged(event) => {
+            RouterEvent::ThinkingLevel(event.thinking_level)
+        }
         RpcAgentEvent::Notice(notice) => RouterEvent::Toast(Toast {
             level: notice.level.into(),
             text: match &notice.source {

@@ -5,6 +5,12 @@
 //! 1. One toast surface: `notice`, `extension_error`, the `notify` UI
 //!    request, `config_warnings_changed` and `ttsr_triggered` each show as
 //!    a toast with its level; Dismiss removes one.
+//! 2. The model and thinking-level picker: opening it reads `get_state`,
+//!    `get_available_models` and `get_available_thinking_levels`; picking a
+//!    model sends `set_model`, Next model `cycle_model`, a level
+//!    `set_thinking_level`, Next level `cycle_thinking_level` (replay checks
+//!    each request field by field); `thinking_level_changed` shows OMP's
+//!    level and `model_changed` re-reads the open picker.
 //!
 //! Harness off: invoked with `--mode` (or `config`) this binary is fake-omp.
 
@@ -104,7 +110,50 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
     wait(cx, &window, "one toast dismissed", |p| {
         p.toasts().len() == 4
     });
+
+    // 2. The model and thinking-level picker.
+    click(&mut vcx, "cedian-picker-toggle");
+    wait(cx, &window, "the picker's choices", |p| {
+        p.picker().models.len() == 2 && p.picker().levels.len() == 3
+    });
+    assert_picker(cx, &window, "anthropic/claude-x", "high");
+    click(&mut vcx, "cedian-model-openai/gpt-y");
+    wait(cx, &window, "set_model", |p| {
+        p.picker().model.as_deref() == Some("openai/gpt-y")
+    });
+    click(&mut vcx, "cedian-cycle-model");
+    wait(cx, &window, "cycle_model", |p| {
+        p.picker().model.as_deref() == Some("anthropic/claude-x") && level(p) == Some("low")
+    });
+    click(&mut vcx, "cedian-thinking-off");
+    wait(cx, &window, "set_thinking_level", |p| {
+        level(p) == Some("off")
+    });
+    click(&mut vcx, "cedian-cycle-thinking");
+    wait(
+        cx,
+        &window,
+        "cycle_thinking_level, then OMP's events",
+        |p| p.picker().model.as_deref() == Some("openai/gpt-y") && level(p) == Some("medium"),
+    );
+    assert!(rendered(&mut vcx, "cedian-model-anthropic/claude-x").is_some());
     assert_connected(cx, &window);
+}
+
+fn level(p: &CedianPanel) -> Option<&'static str> {
+    p.picker().thinking.map(|l| l.as_str())
+}
+
+fn assert_picker(
+    cx: &mut TestAppContext,
+    window: &WindowHandle<CedianPanel>,
+    model: &str,
+    thinking: &str,
+) {
+    let (m, t) = window
+        .update(cx, |p, _, _| (p.picker().model.clone(), level(p)))
+        .unwrap();
+    assert_eq!((m.as_deref(), t), (Some(model), Some(thinking)));
 }
 
 fn submit(cx: &mut TestAppContext, window: &WindowHandle<CedianPanel>, text: &str) {

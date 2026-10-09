@@ -334,6 +334,8 @@ pub struct CedianPanel {
     /// The last thing the person should know that is not on a dialog: a
     /// refused prompt, a failed turn, a dialog cedian closed.
     notice: Option<String>,
+    /// The model and thinking-level picker (ADR-0057 decision 3).
+    picker: ModelPicker,
     /// OMP's notices, oldest first, until dismissed (ADR-0057 decision 3).
     toasts: Vec<cedian_omp::Toast>,
     /// The OMP the panel runs is not the pinned one (ADR-0057 decision 4).
@@ -392,6 +394,20 @@ pub struct CedianPanel {
     follow_ups: Vec<QueuedFollowUp>,
     /// The inline edit the review's current turn is running, with its turn.
     edit_turn: Option<(u32, InlineEdit)>,
+}
+
+/// The model and thinking-level picker: OMP's choices once read, and what
+/// the session runs.
+#[derive(Debug, Clone, Default)]
+pub struct ModelPicker {
+    pub open: bool,
+    pub models: Vec<omp_rpc::ModelInfo>,
+    pub levels: Vec<omp_rpc::ThinkingLevel>,
+    /// `provider/id`.
+    pub model: Option<String>,
+    pub thinking: Option<omp_rpc::ThinkingLevel>,
+    /// OMP's refusal of the last read or change.
+    pub error: Option<String>,
 }
 
 /// The toasts kept: older ones fall off.
@@ -460,6 +476,7 @@ impl CedianPanel {
             connection: Connection::NotStarted,
             omp_warning: None,
             toasts: Vec::new(),
+            picker: ModelPicker::default(),
             calls: HashMap::default(),
             review: TaskReview::new(TASK_ID),
             watched: HashSet::default(),
@@ -520,6 +537,21 @@ impl CedianPanel {
             })
         });
         self.workspace = Some(workspace);
+    }
+
+    pub fn picker(&self) -> &ModelPicker {
+        &self.picker
+    }
+
+    /// Open or close the picker; opening reads OMP's choices.
+    pub fn toggle_picker(&mut self, cx: &mut Context<Self>) {
+        self.picker.open = !self.picker.open;
+        if self.picker.open
+            && let Some(link) = &self.link
+        {
+            link.refresh_picker();
+        }
+        cx.notify();
     }
 
     pub fn toasts(&self) -> &[cedian_omp::Toast] {
@@ -1711,6 +1743,33 @@ impl CedianPanel {
                     settings.update(cx, |settings, cx| settings.reload(cx));
                 }
             }
+            LinkEvent::Picker(Ok(state)) => {
+                self.picker.models = state.models;
+                self.picker.levels = state.levels;
+                self.picker.model = state.model;
+                self.picker.thinking = state.thinking;
+                self.picker.error = None;
+            }
+            LinkEvent::PickerChanged(Ok(change)) => {
+                if change.model.is_some() {
+                    self.picker.model = change.model;
+                }
+                if change.thinking.is_some() {
+                    self.picker.thinking = change.thinking;
+                }
+                self.picker.error = None;
+            }
+            LinkEvent::Picker(Err(e)) | LinkEvent::PickerChanged(Err(e)) => {
+                self.picker.error = Some(e);
+            }
+            LinkEvent::Event(RouterEvent::ModelChanged) => {
+                if self.picker.open
+                    && let Some(link) = &self.link
+                {
+                    link.refresh_picker();
+                }
+            }
+            LinkEvent::Event(RouterEvent::ThinkingLevel(level)) => self.picker.thinking = level,
             LinkEvent::Event(RouterEvent::Toast(toast)) => {
                 self.toasts.push(toast);
                 let excess = self.toasts.len().saturating_sub(MAX_TOASTS);
@@ -2348,6 +2407,91 @@ impl CedianPanel {
         }
         self.refresh_workflow(cx);
         cx.notify();
+    }
+
+    fn render_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+        let picker = &self.picker;
+        let level_name = |l: Option<omp_rpc::ThinkingLevel>| l.map_or("?", |l| l.as_str());
+        let summary = format!(
+            "Model: {} · Thinking: {}",
+            picker.model.as_deref().unwrap_or("?"),
+            level_name(picker.thinking)
+        );
+        let button = |id: String, label: String| {
+            div()
+                .debug_selector({
+                    let id = id.clone();
+                    move || id
+                })
+                .child(Button::new(SharedString::from(id), label))
+        };
+        let mut panel = v_flex().gap_1().child(
+            div()
+                .debug_selector(|| "cedian-picker-toggle".to_string())
+                .child(
+                    Button::new("cedian-picker-toggle", summary)
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_picker(cx))),
+                ),
+        );
+        if !picker.open {
+            return panel.into_any_element();
+        }
+        let models = picker.models.iter().map(|model| {
+            let key = crate::omp_link::model_key(model);
+            let (provider, id) = (model.provider.clone(), model.id.clone());
+            button(format!("cedian-model-{key}"), key).on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    if let Some(link) = &this.link {
+                        link.set_model(provider.clone(), id.clone());
+                    }
+                    cx.notify();
+                }),
+            )
+        });
+        let levels = picker.levels.iter().map(|level| {
+            let level = *level;
+            button(
+                format!("cedian-thinking-{}", level.as_str()),
+                level.as_str().to_string(),
+            )
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    if let Some(link) = &this.link {
+                        link.set_thinking_level(level);
+                    }
+                    cx.notify();
+                }),
+            )
+        });
+        panel = panel
+            .child(h_flex().flex_wrap().gap_1().children(models).child(
+                button("cedian-cycle-model".into(), "Next model".into()).on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        if let Some(link) = &this.link {
+                            link.cycle_model();
+                        }
+                        cx.notify();
+                    }),
+                ),
+            ))
+            .child(h_flex().flex_wrap().gap_1().children(levels).child(
+                button("cedian-cycle-thinking".into(), "Next level".into()).on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        if let Some(link) = &this.link {
+                            link.cycle_thinking_level();
+                        }
+                        cx.notify();
+                    }),
+                ),
+            ))
+            .when_some(picker.error.clone(), |panel, error| {
+                panel.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
+            });
+        panel.into_any_element()
     }
 
     /// OMP's notices, one row each with Dismiss.
@@ -3655,6 +3799,7 @@ impl Render for CedianPanel {
             .children(workflow)
             .children(browser)
             .children(dialogs)
+            .child(self.render_picker(cx))
             .children(self.render_toasts(cx))
             .when_some(self.omp_warning.clone(), |panel, warning| {
                 panel.child(

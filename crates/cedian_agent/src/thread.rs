@@ -194,6 +194,8 @@ impl Thread {
             }
             RouterEvent::UiRequest(_)
             | RouterEvent::Toast(_)
+            | RouterEvent::ModelChanged
+            | RouterEvent::ThinkingLevel(_)
             | RouterEvent::Unknown { .. }
             | RouterEvent::SubagentLifecycle { .. }
             | RouterEvent::SubagentProgress { .. } => {

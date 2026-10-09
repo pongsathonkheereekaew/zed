@@ -12,15 +12,18 @@
 //! or is stopped is recorded as `abstain` (§63 lease, ADR-0013).
 
 use cedian_omp::{
-    DialogRecord, EventRouter, NewSession, OmpBinary, OmpRuntime, RouterEvent, RuntimeConfig,
-    RuntimeControl, Sessions, SpawnPolicy, UserAnswer,
+    DialogRecord, EventRouter, NewSession, OmpBinary, OmpError, OmpRuntime, RouterEvent,
+    RuntimeConfig, RuntimeControl, Sessions, SpawnPolicy, UserAnswer,
 };
 use cedian_shell::audit::AuditLog;
 use cedian_shell::{Policy, RunKind};
 use collections::HashMap;
 use futures::channel::mpsc::UnboundedSender;
 use omp_rpc::{
-    ExtensionUiRequest, ExtensionUiResponse, HostTool, HostUri, ImageContent, RpcAgentEvent,
+    CycleModelCommand, CycleThinkingLevelCommand, ExtensionUiRequest, ExtensionUiResponse,
+    GetAvailableModelsCommand, GetAvailableThinkingLevelsCommand, GetStateCommand, HostTool,
+    HostUri, ImageContent, ModelInfo, RpcAgentEvent, SetModelCommand, SetThinkingLevelCommand,
+    ThinkingLevel,
 };
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
@@ -69,6 +72,10 @@ pub enum LinkEvent {
     /// Stop could not take some queued messages back: what to tell the
     /// person.
     TakeBackNotice(String),
+    /// The model picker's choices and OMP's current model and level.
+    Picker(Result<PickerState, String>),
+    /// OMP's answer to a model or thinking-level change.
+    PickerChanged(Result<PickerChange, String>),
     /// OMP's answer to a Steer on subagent `id`.
     SubagentSteered {
         id: String,
@@ -79,6 +86,30 @@ pub enum LinkEvent {
         id: String,
         result: Result<bool, String>,
     },
+}
+
+const NOT_RUNNING: &str = "OMP is not running";
+
+/// What OMP offers and runs now, for the model and thinking-level picker.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PickerState {
+    pub models: Vec<ModelInfo>,
+    pub levels: Vec<ThinkingLevel>,
+    /// `provider/id`.
+    pub model: Option<String>,
+    pub thinking: Option<ThinkingLevel>,
+}
+
+/// What a change made current; `None` where it changed nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickerChange {
+    pub model: Option<String>,
+    pub thinking: Option<ThinkingLevel>,
+}
+
+/// `provider/id`, how the picker names a model.
+pub fn model_key(model: &ModelInfo) -> String {
+    format!("{}/{}", model.provider, model.id)
 }
 
 /// What the panel asks of the OMP thread, in order.
@@ -892,6 +923,80 @@ impl OmpLink {
                 .events
                 .unbounded_send(LinkEvent::SubagentCancelled { id, result });
         });
+    }
+
+    /// Read the picker's state off the UI thread: the session's model and
+    /// level, and what OMP offers.
+    pub fn refresh_picker(&self) {
+        self.off_thread(LinkEvent::Picker(Err(NOT_RUNNING.to_string())), |control| {
+            let read = || -> Result<PickerState, OmpError> {
+                let state = control.call(&GetStateCommand {})?;
+                Ok(PickerState {
+                    models: control.call(&GetAvailableModelsCommand {})?,
+                    levels: control.call(&GetAvailableThinkingLevelsCommand {})?,
+                    model: state.model.as_ref().map(model_key),
+                    thinking: state.thinking_level,
+                })
+            };
+            LinkEvent::Picker(read().map_err(|e| e.to_string()))
+        });
+    }
+
+    /// Make `provider/id` the session's model.
+    pub fn set_model(&self, provider: String, model_id: String) {
+        self.change(move |control| {
+            let model = control.call(&SetModelCommand { provider, model_id })?;
+            Ok(PickerChange {
+                model: Some(model_key(&model)),
+                thinking: None,
+            })
+        });
+    }
+
+    /// OMP's next model in its cycle.
+    pub fn cycle_model(&self) {
+        self.change(|control| {
+            let next = control.call(&CycleModelCommand {})?;
+            Ok(PickerChange {
+                model: next.as_ref().map(|n| model_key(&n.model)),
+                thinking: next.and_then(|n| n.thinking_level),
+            })
+        });
+    }
+
+    pub fn set_thinking_level(&self, level: ThinkingLevel) {
+        self.change(move |control| {
+            control.call(&SetThinkingLevelCommand { level })?;
+            Ok(PickerChange {
+                model: None,
+                thinking: Some(level),
+            })
+        });
+    }
+
+    /// OMP's next thinking level in its cycle.
+    pub fn cycle_thinking_level(&self) {
+        self.change(|control| {
+            let next = control.call(&CycleThinkingLevelCommand {})?;
+            Ok(PickerChange {
+                model: None,
+                thinking: next.and_then(|n| {
+                    serde_json::to_value(n.level)
+                        .and_then(serde_json::from_value)
+                        .ok()
+                }),
+            })
+        });
+    }
+
+    fn change(
+        &self,
+        call: impl FnOnce(&RuntimeControl) -> Result<PickerChange, OmpError> + Send + 'static,
+    ) {
+        self.off_thread(
+            LinkEvent::PickerChanged(Err(NOT_RUNNING.to_string())),
+            move |control| LinkEvent::PickerChanged(call(&control).map_err(|e| e.to_string())),
+        );
     }
 
     /// Run a blocking control call on its own thread, as Stop's abort runs.

@@ -2,6 +2,7 @@
 name = "cedian_shell"
 version = "0.1.0"
 edition = "2021"
+license = "GPL-3.0-or-later"
 
 # Phase 2.5 (headless): app shell models without GPUI — settings TOML,
 # palette registry, session manager. GPUI views (onboarding wizard, settings

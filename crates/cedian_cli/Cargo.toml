@@ -2,6 +2,7 @@
 name = "cedian_cli"
 version = "0.1.0"
 edition = "2021"
+license = "GPL-3.0-or-later"
 
 # Throwaway harness: full agent loop over the headless crates, proving the
 # phases compose before GPUI exists. Dies when the Zed fork lands — the wiring

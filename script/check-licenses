@@ -73,13 +73,29 @@ check_license () {
     exit 1
 }
 
+# Vendored upstream code under its own license (ADR-0054), not first-party.
+third_party_crates=("vendor/omp-rpc")
+
+is_third_party () {
+    local dir="$1"
+    for crate in "${third_party_crates[@]}"; do
+        [[ "$dir" == "$crate" ]] && return 0
+    done
+    return 1
+}
+
 check_no_agpl_license_file
 
 git ls-files -z -- "Cargo.toml" "**/Cargo.toml" | while IFS= read -r -d '' cargo_toml; do
     check_manifest_for_agpl "$cargo_toml"
 
     if [[ "$cargo_toml" == */Cargo.toml ]]; then
-        check_license "$(dirname "$cargo_toml")"
+        dir="$(dirname "$cargo_toml")"
+        if is_third_party "$dir"; then
+            echo "third-party: $dir ($(grep -E '^license[[:space:]]*=' "$cargo_toml" | head -1))"
+        else
+            check_license "$dir"
+        fi
     fi
 done
 

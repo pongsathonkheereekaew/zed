@@ -2,6 +2,7 @@
 name = "cedian_review"
 version = "0.1.0"
 edition = "2021"
+license = "GPL-3.0-or-later"
 
 # Hunk shapes, findings and feedback payloads shared by the panel's review
 # (Zed buffers) and the headless reviewer.

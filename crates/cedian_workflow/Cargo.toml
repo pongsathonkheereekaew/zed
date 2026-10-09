@@ -2,6 +2,7 @@
 name = "cedian_workflow"
 version = "0.1.0"
 edition = "2021"
+license = "GPL-3.0-or-later"
 
 # S2: workflow engine core (plan §§46–56, Phase 10) — TaskProfile, Playbook,
 # Evidence, Gate, WorkflowState as PURE functions. The gate engine NEVER

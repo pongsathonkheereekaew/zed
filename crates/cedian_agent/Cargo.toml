@@ -2,6 +2,7 @@
 name = "cedian_agent"
 version = "0.1.0"
 edition = "2021"
+license = "GPL-3.0-or-later"
 
 # Phase 2: headless agent model — task/thread/state over cedian_omp.
 # No GPUI here: pure state machines fed by EventRouter, rendered by

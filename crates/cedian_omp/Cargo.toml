@@ -2,6 +2,7 @@
 name = "cedian_omp"
 version = "0.1.0"
 edition = "2021"
+license = "GPL-3.0-or-later"
 
 # Phase 1: OMP runtime boundary — spawn bundled `omp --mode rpc-ui`,
 # typed RPC over the vendored upstream client, EventRouter fan-out.

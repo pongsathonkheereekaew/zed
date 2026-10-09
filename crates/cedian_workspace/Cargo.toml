@@ -2,6 +2,7 @@
 name = "cedian_workspace"
 version = "0.1.0"
 edition = "2021"
+license = "GPL-3.0-or-later"
 
 # Phase 4: editor-native edit surface (headless).
 # WorkspaceHost trait + in-memory backend + cedian:// URIs + host tools.

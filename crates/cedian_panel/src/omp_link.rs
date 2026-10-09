@@ -221,8 +221,9 @@ struct Gate {
     /// Held by a steer or follow-up from the moment it is checked against
     /// Stop until OMP answered and it is in `queue`, and by Stop while it
     /// takes the queue back and aborts: none lands after Stop's snapshot.
-    /// So Stop's abort can wait on one call OMP is slow to answer (the
-    /// client's timeout bounds it; Restart frees it); the panel shows
+    /// So Stop can wait on one queue call OMP is slow to answer plus, on a
+    /// dead link, one timeout for its take-back and one for its abort (the
+    /// client's timeout bounds each; Restart frees them); the panel shows
     /// Stopping meanwhile.
     sending: Mutex<()>,
     /// Counts Stops; a queue call made before the latest is refused.
@@ -242,25 +243,6 @@ struct Queue {
     accepted: Vec<Queued>,
 }
 
-impl Queue {
-    /// What Stop removes: everything OMP lists, then each accepted message
-    /// the list does not cover, steers first.
-    fn take_back(&self) -> Vec<Queued> {
-        let mut plan = self.listed.clone();
-        let mut covered = self.listed.clone();
-        for item in &self.accepted {
-            match covered.iter().position(|listed| listed == item) {
-                Some(index) => {
-                    covered.swap_remove(index);
-                }
-                None => plan.push(item.clone()),
-            }
-        }
-        plan.sort_by_key(|(_, steering)| !steering);
-        plan
-    }
-}
-
 /// What came of Stop taking OMP's queue back, in the order tried.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct TakenBack {
@@ -274,28 +256,82 @@ struct TakenBack {
     error: Option<String>,
 }
 
-/// Try to take back each queued message in `queue`'s plan.
+/// Try to take back each queued message, steers first. Each accepted
+/// message is removed by the text the person typed: OMP 18.6.1 matches that
+/// first, then the content its `queue_update` shows, which differs for a
+/// template or slash command. A listed entry is tried only when no accepted
+/// message covers it: by its text, or, for display text, by count (each
+/// accepted message OMP gave back under a text it does not list is one such
+/// listed entry). After the first error the link is taken as dead: the rest
+/// go back to the composer unanswered, without another timeout.
 fn take_back(
     queue: &Queue,
     mut remove: impl FnMut(&str, bool) -> Result<bool, String>,
 ) -> TakenBack {
     let mut out = TakenBack::default();
-    for (text, steering) in queue.take_back() {
-        match remove(&text, steering) {
-            Ok(true) => out.restored.push(text),
-            Ok(false) => out.gone.push(text),
-            Err(e) => {
-                log::warn!("cedian: OMP did not answer taking back a queued message: {e}");
-                out.unanswered.push(text);
-                out.error = Some(e);
+    for steering in [true, false] {
+        let mut listed: Vec<&String> = queue
+            .listed
+            .iter()
+            .filter(|(_, s)| *s == steering)
+            .map(|(text, _)| text)
+            .collect();
+        let mut plan = Vec::new();
+        let mut display_only = Vec::new();
+        for (text, _) in queue.accepted.iter().filter(|(_, s)| *s == steering) {
+            match listed.iter().position(|shown| *shown == text) {
+                Some(index) => {
+                    listed.remove(index);
+                }
+                None => display_only.push(plan.len()),
             }
+            plan.push(text.clone());
+        }
+        let mut skip = 0;
+        for (index, text) in plan.into_iter().enumerate() {
+            if out.try_remove(text, steering, &mut remove) && display_only.contains(&index) {
+                skip += 1;
+            }
+        }
+        for text in listed.into_iter().skip(skip) {
+            out.try_remove(text.clone(), steering, &mut remove);
         }
     }
     out
 }
 
 impl TakenBack {
-    /// The text to hand back to the composer, oldest first.
+    /// Whether OMP gave `text` back.
+    fn try_remove(
+        &mut self,
+        text: String,
+        steering: bool,
+        remove: &mut impl FnMut(&str, bool) -> Result<bool, String>,
+    ) -> bool {
+        if self.error.is_some() {
+            self.unanswered.push(text);
+            return false;
+        }
+        match remove(&text, steering) {
+            Ok(true) => {
+                self.restored.push(text);
+                true
+            }
+            Ok(false) => {
+                self.gone.push(text);
+                false
+            }
+            Err(e) => {
+                log::warn!("cedian: OMP did not answer taking back a queued message: {e}");
+                self.unanswered.push(text);
+                self.error = Some(e);
+                false
+            }
+        }
+    }
+
+    /// The text to hand back to the composer, oldest first: everything
+    /// restored came before the first error, everything unanswered after.
     fn to_composer(&self) -> Vec<String> {
         self.restored
             .iter()
@@ -1229,11 +1265,26 @@ mod tests {
         });
         gate.accepted("faster", true);
         gate.accepted("two", false);
+        let (calls, _) = removes(&gate, |_| Ok(true));
         assert_eq!(
-            gate.queue.lock().take_back(),
+            calls,
             [steer("faster"), ("two".to_string(), false)],
             "OMP said yes to faster: Stop takes it back; two once"
         );
+    }
+
+    /// Run Stop's take-back on `gate`'s queue, recording each remove sent.
+    fn removes(
+        gate: &Gate,
+        answer: impl Fn(&str) -> Result<bool, String>,
+    ) -> (Vec<Queued>, TakenBack) {
+        let queue = gate.queue.lock().clone();
+        let mut calls = Vec::new();
+        let taken = take_back(&queue, |text, steering| {
+            calls.push((text.to_string(), steering));
+            answer(text)
+        });
+        (calls, taken)
     }
 
     fn bare_gate() -> Gate {
@@ -1257,8 +1308,8 @@ mod tests {
         let gate = Arc::new(bare_gate());
         gate.accepted("again", true);
         gate.accepted("again", true);
-        let plan = gate.queue.lock().take_back();
-        assert_eq!(plan, [steer("again"), steer("again")]);
+        let (calls, _) = removes(&gate, |_| Ok(true));
+        assert_eq!(calls, [steer("again"), steer("again")]);
     }
 
     #[test]
@@ -1274,16 +1325,56 @@ mod tests {
             steering: vec!["/review shown".to_string()],
             follow_up: vec!["later".to_string()],
         });
-        let plan = gate.queue.lock().take_back();
+        // OMP 18.6.1 removeQueuedMessage matches the raw text first, then
+        // the content queue_update shows (omp.strings ~593938).
+        let (calls, taken) = removes(&gate, |text| Ok(text != "/review shown"));
         assert_eq!(
-            plan,
-            [
-                steer("/review shown"),
-                steer("/review typed"),
-                ("later".to_string(), false)
-            ],
-            "OMP's own text first; an accepted text it does not list is tried too"
+            calls,
+            [steer("/review typed"), ("later".to_string(), false)],
+            "the typed text first; its listed display text is the same message"
         );
+        assert_eq!(taken.to_composer(), ["/review typed", "later"]);
+        assert_eq!(taken.notice(), None, "nothing was taken into a run");
+    }
+
+    #[test]
+    fn a_listed_message_nothing_accepted_names_is_taken_back_by_its_text() {
+        let gate = Arc::new(bare_gate());
+        gate.observe_run(&RouterEvent::Queue {
+            steering: vec!["/review shown".to_string()],
+            follow_up: Vec::new(),
+        });
+        gate.accepted("/review typed", true);
+        let (calls, taken) = removes(&gate, |text| Ok(text == "/review shown"));
+        assert_eq!(calls, [steer("/review typed"), steer("/review shown")]);
+        assert_eq!(taken.to_composer(), ["/review shown"]);
+    }
+
+    #[test]
+    fn a_dead_link_is_asked_once() {
+        let gate = Arc::new(bare_gate());
+        gate.accepted("a", true);
+        gate.accepted("b", true);
+        gate.accepted("c", false);
+        let (calls, taken) = removes(&gate, |_| Err("timed out".to_string()));
+        assert_eq!(calls, [steer("a")], "one timeout, not one per message");
+        assert_eq!(taken.to_composer(), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn the_composer_gets_the_messages_oldest_first() {
+        let gate = Arc::new(bare_gate());
+        gate.accepted("a", true);
+        gate.accepted("b", true);
+        gate.accepted("c", true);
+        let (_, taken) = removes(&gate, |text| {
+            if text == "b" {
+                Err("timed out".to_string())
+            } else {
+                Ok(true)
+            }
+        });
+        assert_eq!(taken.to_composer(), ["a", "b", "c"]);
     }
 
     #[test]

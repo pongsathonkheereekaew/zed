@@ -87,6 +87,61 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
+/// An inline edit asked for in the editor (ADR-0056): the selection, and
+/// what to do with it.
+#[derive(Clone, Debug)]
+pub struct InlineEdit {
+    /// The file as OMP names it (worktree relative).
+    pub path: String,
+    pub buffer: Entity<Buffer>,
+    /// The selection, anchored so it follows later edits.
+    pub range: std::ops::Range<text::Anchor>,
+    pub instruction: String,
+}
+
+impl InlineEdit {
+    /// 1-based first and last line of the selection.
+    pub fn lines(&self, cx: &App) -> (u32, u32) {
+        use text::ToPoint as _;
+        let buffer = self.buffer.read(cx);
+        let start = self.range.start.to_point(buffer);
+        let mut end = self.range.end.to_point(buffer);
+        if end.column == 0 && end.row > start.row {
+            end.row -= 1;
+        }
+        (start.row + 1, end.row + 1)
+    }
+
+    /// The prompt OMP gets: cedian's own words, short, naming the selection.
+    pub fn message(&self, cx: &App) -> String {
+        let (first, last) = self.lines(cx);
+        let selected: String = self
+            .buffer
+            .read(cx)
+            .text_for_range(self.range.clone())
+            .collect();
+        format!(
+            "Inline edit of {} lines {first}-{last}. Change only the selected text, with your edit tool.\nSelected:\n{}\nInstruction: {}",
+            self.path,
+            selected.trim_end_matches('\n'),
+            self.instruction
+        )
+    }
+
+    /// How the review names the turn.
+    pub fn label(&self, cx: &App) -> String {
+        let (first, last) = self.lines(cx);
+        format!("{}:{first}-{last} {}", self.path, self.instruction)
+    }
+}
+
+struct QueuedEdit {
+    edit: InlineEdit,
+    message: String,
+    /// OMP's queue has listed it.
+    in_queue: bool,
+}
+
 /// One edit-class tool call in flight: the open buffers marked before its
 /// write, and the files it names that are not open, with their disk text
 /// at the tool's start (`None`: absent then). Those are opened only at the
@@ -263,6 +318,10 @@ pub struct CedianPanel {
     _workspace_items: Option<gpui::Subscription>,
     /// The blocks open findings put under their hunk in open editors.
     finding_blocks: Vec<FindingBlock>,
+    /// Inline edits sent as follow-ups, oldest first, until OMP runs them.
+    queued_edits: Vec<QueuedEdit>,
+    /// The inline edit the review's current turn is running, with its turn.
+    edit_turn: Option<(u32, InlineEdit)>,
 }
 
 /// How long a quitting app waits for Chromium to close itself (flushing its
@@ -361,6 +420,8 @@ impl CedianPanel {
             launch_settings: None,
             _workspace_items: None,
             finding_blocks: Vec::new(),
+            queued_edits: Vec::new(),
+            edit_turn: None,
         };
         this._worktree_changes = Some(cx.subscribe(&this.project, |this, project, event, cx| {
             if let project::Event::WorktreeUpdatedEntries(worktree, changes) = event {
@@ -663,6 +724,14 @@ impl CedianPanel {
             self.notice = Some(event.to_string());
         });
         self.report_review(result, cx);
+    }
+
+    /// The Revert turn button's text: an inline edit is named.
+    pub fn revert_turn_label(&self, turn: u32) -> String {
+        match self.review.turn_label(turn) {
+            Some(label) => format!("Revert turn {turn}: inline edit {label}"),
+            None => format!("Revert turn {turn}"),
+        }
     }
 
     /// Revert turn from the editor (ADR-0056 decision 7): the latest turn;
@@ -1455,8 +1524,16 @@ impl CedianPanel {
                     self.input.update(cx, |editor, cx| editor.clear(window, cx));
                 }
             }
-            LinkEvent::QueueRefused(e) => self.notice = Some(format!("OMP did not queue it: {e}")),
-            LinkEvent::Restored(texts) => self.restore_to_composer(texts, window, cx),
+            LinkEvent::QueueRefused(e) => {
+                if let Some(i) = self.queued_edits.iter().rposition(|q| !q.in_queue) {
+                    self.queued_edits.remove(i);
+                }
+                self.notice = Some(format!("OMP did not queue it: {e}"))
+            }
+            LinkEvent::Restored(texts) => {
+                self.queued_edits.retain(|q| !texts.contains(&q.message));
+                self.restore_to_composer(texts, window, cx)
+            }
             LinkEvent::TakeBackNotice(notice) => self.notice = Some(notice),
             LinkEvent::SubagentSteered { id, result } => {
                 let note = match result {
@@ -1560,21 +1637,11 @@ impl CedianPanel {
                 return;
             }
         }
-        if self.connection == Connection::NotStarted {
-            self.start(window, cx);
-        }
-        let sent = match (&self.connection, &self.link) {
-            (Connection::Stopped(reason), _) => Err(format!("{reason}; restart OMP")),
-            (Connection::Taken { reason, .. }, _) => {
-                Err(format!("{reason}; start a new session or retry"))
-            }
-            (_, Some(link)) => link.send(Prompt {
-                text: self.with_context(&text, cx),
-                images: self.images.clone(),
-            }),
-            (_, None) => Err("OMP is not running; restart it".to_string()),
+        let prompt = Prompt {
+            text: self.with_context(&text, cx),
+            images: self.images.clone(),
         };
-        if let Err(e) = sent {
+        if let Err(e) = self.send_prompt(prompt, window, cx) {
             self.notice = Some(e);
             cx.notify();
             return;
@@ -1586,6 +1653,88 @@ impl CedianPanel {
         self.notice = None;
         self.set_turn(Turn::Queued);
         cx.notify();
+    }
+
+    fn send_prompt(
+        &mut self,
+        prompt: Prompt,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if self.connection == Connection::NotStarted {
+            self.start(window, cx);
+        }
+        match (&self.connection, &self.link) {
+            (Connection::Stopped(reason), _) => Err(format!("{reason}; restart OMP")),
+            (Connection::Taken { reason, .. }, _) => {
+                Err(format!("{reason}; start a new session or retry"))
+            }
+            (_, Some(link)) => link.send(prompt),
+            (_, None) => Err("OMP is not running; restart it".to_string()),
+        }
+    }
+
+    /// An inline edit from the editor (ADR-0056 decision 3): a turn in the
+    /// live session, or a follow-up with its chip while a turn runs.
+    pub fn inline_edit(&mut self, edit: InlineEdit, window: &mut Window, cx: &mut Context<Self>) {
+        let message = edit.message(cx);
+        match self.turn {
+            Turn::Idle => {
+                let prompt = Prompt {
+                    text: message.clone(),
+                    images: Vec::new(),
+                };
+                if let Err(e) = self.send_prompt(prompt, window, cx) {
+                    self.notice = Some(e);
+                    cx.notify();
+                    return;
+                }
+                self.thread.push_user(&message);
+                self.begin_edit_turn(edit, cx);
+                self.notice = None;
+                self.set_turn(Turn::Queued);
+            }
+            Turn::Streaming => {
+                let Some(link) = &self.link else {
+                    self.notice = Some("OMP is not running; restart it".to_string());
+                    cx.notify();
+                    return;
+                };
+                link.queue(message.clone(), false);
+                self.queued_edits.push(QueuedEdit {
+                    edit,
+                    message,
+                    in_queue: false,
+                });
+            }
+            _ => self.notice = Some("the turn is starting or stopping; wait for it".to_string()),
+        }
+        cx.notify();
+    }
+
+    fn begin_edit_turn(&mut self, edit: InlineEdit, cx: &App) {
+        let turn = self.review.begin_edit_turn(edit.label(cx));
+        self.edit_turn = Some((turn, edit));
+    }
+
+    /// OMP's queue changed: a queued inline edit that left it started
+    /// running, so its own turn begins in the review.
+    fn observe_queued_edits(&mut self, follow_up: &[String], cx: &mut Context<Self>) {
+        let mut i = 0;
+        while i < self.queued_edits.len() {
+            let queued = &mut self.queued_edits[i];
+            let listed = follow_up.contains(&queued.message);
+            if listed {
+                queued.in_queue = true;
+                i += 1;
+            } else if queued.in_queue {
+                let queued = self.queued_edits.remove(i);
+                self.review.end_turn();
+                self.begin_edit_turn(queued.edit, cx);
+            } else {
+                i += 1;
+            }
+        }
     }
 
     /// The Steer button: `text` goes into the running turn.
@@ -1665,6 +1814,7 @@ impl CedianPanel {
             {
                 self.set_turn(Turn::Streaming)
             }
+            RouterEvent::Queue { follow_up, .. } => self.observe_queued_edits(follow_up, cx),
             RouterEvent::Settled => {
                 self.review.end_turn();
                 if let Turn::Failed(reason) = std::mem::replace(&mut self.turn, Turn::Idle) {
@@ -2698,20 +2848,10 @@ impl CedianPanel {
                             div()
                                 .debug_selector(|| "cedian-revert-turn".to_string())
                                 .child(
-                                    Button::new(
-                                        "cedian-revert-turn",
-                                        match self.review.turn_label(turn) {
-                                            Some(label) => {
-                                                format!("Revert turn {turn}: inline edit {label}")
-                                            }
-                                            None => format!("Revert turn {turn}"),
-                                        },
-                                    )
-                                    .on_click(
-                                        cx.listener(move |this, _, _, cx| {
+                                    Button::new("cedian-revert-turn", self.revert_turn_label(turn))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
                                             this.revert_turn(turn, cx)
-                                        }),
-                                    ),
+                                        })),
                                 ),
                         )
                     }),
@@ -4343,6 +4483,40 @@ mod tests {
                  0 changed again by a later turn, kept, 0 accepted, kept"
             )
         );
+    }
+
+    /// U10c (ADR-0056 decision 3): an inline edit queued during a turn
+    /// gets its own turn in the review when OMP takes it from its queue.
+    #[gpui::test]
+    async fn a_queued_inline_edit_begins_its_turn_when_omp_runs_it(cx: &mut TestAppContext) {
+        let (f, buffer) = fixture(cx).await;
+        f.window
+            .update(cx, |panel, _, cx| {
+                let edit = buffer.read_with(cx, |b, _| InlineEdit {
+                    path: "notes.txt".to_string(),
+                    buffer: buffer.clone(),
+                    range: b.anchor_before(language::Point::new(1, 0))
+                        ..b.anchor_after(language::Point::new(2, 0)),
+                    instruction: "shout".to_string(),
+                });
+                let message = edit.message(cx);
+                panel.queued_edits.push(QueuedEdit {
+                    edit,
+                    message: message.clone(),
+                    in_queue: false,
+                });
+                let queue = |follow_up: Vec<String>| RouterEvent::Queue {
+                    steering: Vec::new(),
+                    follow_up,
+                };
+                panel.on_event(queue(vec![message]), cx);
+                assert_eq!(panel.review.current_turn(), 1, "still queued");
+                panel.on_event(queue(Vec::new()), cx);
+                assert_eq!(panel.review.current_turn(), 2);
+                assert_eq!(panel.review.turn_label(2), Some("notes.txt:2-2 shout"));
+                assert!(panel.queued_edits.is_empty());
+            })
+            .unwrap();
     }
 
     /// Zed's default keymap for this platform, as the app loads it; the

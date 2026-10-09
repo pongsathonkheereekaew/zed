@@ -2908,7 +2908,9 @@ version = "0.1.0"
 dependencies = [
  "cedian_agent_ui",
  "cedian_omp",
+ "cedian_review",
  "cedian_workflow",
+ "omp-rpc",
  "serde",
  "serde_json",
  "sha2",

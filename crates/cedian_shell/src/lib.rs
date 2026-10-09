@@ -7,11 +7,17 @@
 //! Onboarding wizard + auto-update + keybinding UI bind with the Zed fork.
 
 pub mod audit;
+pub mod corrections;
 pub mod launch;
 pub mod palette;
+pub mod review_agent;
+pub mod review_findings;
 pub mod session_manager;
 pub mod settings;
 pub mod state;
+#[cfg(test)]
+mod test_dir;
+pub mod workflow_store;
 
 pub use palette::{Palette, PaletteAction};
 pub use session_manager::{SESSIONS_SNAPSHOT_VERSION, SessionEntry, SessionManager};

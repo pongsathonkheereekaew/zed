@@ -1,9 +1,7 @@
-//! Workflow persistence for the CLI harness (headless stopgap).
-//!
-//! Same pattern as `session.rs`: per-workdir `workflow.json` beside the
-//! baseline, so `workflow …` invocations share state. The app shell will own
-//! a real store; until then JSON round-trip of `WorkflowState`, wrapped in a
-//! `snapshot_version` envelope (ADR-0016 / P3): other versions fail closed.
+//! Workflow persistence: `workflow.json` in a workspace's state dir
+//! (ADR-0044), shared by the app and the CLI. A JSON round-trip of
+//! `WorkflowState` in a `snapshot_version` envelope (ADR-0016 / P3): other
+//! versions fail closed.
 
 use cedian_workflow::WorkflowState;
 use serde::{Deserialize, Serialize};
@@ -22,18 +20,18 @@ struct Stored<S> {
     state: S,
 }
 
-fn workflow_path(workdir: &Path) -> Result<PathBuf, String> {
-    crate::state::file(workdir, "workflow.json")
+fn workflow_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("workflow.json")
 }
 
 /// Whether a workflow was ever started here.
-pub fn exists(workdir: &Path) -> bool {
-    workflow_path(workdir).is_ok_and(|p| p.exists())
+pub fn exists(state_dir: &Path) -> bool {
+    workflow_path(state_dir).exists()
 }
 
 /// Load the workflow, or fail with usage hint when none is running.
-pub fn load(workdir: &Path) -> Result<WorkflowState, String> {
-    let raw = std::fs::read_to_string(workflow_path(workdir)?)
+pub fn load(state_dir: &Path) -> Result<WorkflowState, String> {
+    let raw = std::fs::read_to_string(workflow_path(state_dir))
         .map_err(|_| "no workflow: run `cedian workflow run <kind> <title>` first".to_string())?;
     let version: Stored<serde::de::IgnoredAny> =
         serde_json::from_str(&raw).map_err(|e| format!("corrupt workflow.json: {e}"))?;
@@ -50,20 +48,27 @@ pub fn load(workdir: &Path) -> Result<WorkflowState, String> {
 }
 
 /// Save the workflow into the workspace's state dir (ADR-0044).
-pub fn save(workdir: &Path, state: &WorkflowState) -> Result<(), String> {
+pub fn save(state_dir: &Path, state: &WorkflowState) -> Result<(), String> {
     let raw = serde_json::to_string_pretty(&Stored {
         snapshot_version: WORKFLOW_SNAPSHOT_VERSION,
         state,
     })
     .map_err(|e| e.to_string())?;
-    std::fs::write(workflow_path(workdir)?, raw).map_err(|e| e.to_string())
+    std::fs::write(workflow_path(state_dir), raw).map_err(|e| e.to_string())
 }
 
-/// Delete the workflow (fresh `run` overwrites anyway; explicit for tests).
-#[allow(unused)]
-pub fn clear(workdir: &Path) {
-    if let Ok(path) = workflow_path(workdir) {
-        let _ = std::fs::remove_file(path);
+/// `workflow.json` in a state dir as the workflow channel's store.
+pub struct DiskWorkflowStore(pub PathBuf);
+
+impl cedian_workflow::WorkflowStore for DiskWorkflowStore {
+    fn load(&self) -> Result<Option<WorkflowState>, String> {
+        if !exists(&self.0) {
+            return Ok(None);
+        }
+        load(&self.0).map(Some)
+    }
+    fn save(&self, state: &WorkflowState) -> Result<(), String> {
+        save(&self.0, state)
     }
 }
 
@@ -90,7 +95,7 @@ mod tests {
         })
         .unwrap();
         save(&d, &state).unwrap();
-        let raw = std::fs::read_to_string(workflow_path(&d).unwrap()).unwrap();
+        let raw = std::fs::read_to_string(workflow_path(&d)).unwrap();
         assert!(raw.contains("\"snapshot_version\": 2"));
         assert_eq!(load(&d).unwrap().task.title, "t");
     }
@@ -98,10 +103,10 @@ mod tests {
     #[test]
     fn unversioned_or_other_version_fails_closed() {
         let d = dir("stale");
-        std::fs::write(workflow_path(&d).unwrap(), "{}").unwrap();
+        std::fs::write(workflow_path(&d), "{}").unwrap();
         assert!(load(&d).unwrap_err().contains("too old (got v0"));
         // v1 = pre-ADR-0024 evidence (`ok: bool`, no code state).
-        std::fs::write(workflow_path(&d).unwrap(), r#"{"snapshot_version":1}"#).unwrap();
+        std::fs::write(workflow_path(&d), r#"{"snapshot_version":1}"#).unwrap();
         assert!(load(&d).unwrap_err().contains("too old (got v1"));
     }
 }

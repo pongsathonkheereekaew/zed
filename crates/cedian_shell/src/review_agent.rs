@@ -5,7 +5,7 @@
 //! as its only host tool. The reviewer's tool calls and the dialogs headless
 //! refuses for it go to the same audit log.
 
-use crate::review_findings::{self, REVIEW_FINDING_TOOL};
+use crate::review_findings::{self, REVIEW_FINDING_TOOL, TaskDiffs};
 use cedian_omp::sandbox::{ReviewerLayout, ReviewerSandbox, credential_paths, resolve_allow_list};
 use cedian_omp::{
     Approvals, BashRule, OmpBinary, OmpRuntime, RuntimeConfig, SpawnPolicy, ToolPolicy,
@@ -19,6 +19,24 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const REVIEW_REQUEST_TOOL: &str = "cedian_review_request";
+
+/// What one review reads: the task's diffs, each file's baseline text, and
+/// the models that edited the task.
+#[derive(Debug, Default, Clone)]
+pub struct ReviewTask {
+    pub diffs: Vec<FileDiff>,
+    pub baseline: HashMap<PathBuf, String>,
+    pub editors: Vec<String>,
+}
+
+/// Where a review runs: the workspace, its state dir (ADR-0044) and the
+/// implementer's session dir, under which the reviewer gets its own.
+#[derive(Debug, Clone)]
+pub struct ReviewPlace {
+    pub workdir: PathBuf,
+    pub state_dir: PathBuf,
+    pub session_dir: PathBuf,
+}
 
 /// The reviewer's directory: fixed per implementer session, so a replay can
 /// install the reviewer's recorded turn there. Canonical, because Seatbelt
@@ -184,13 +202,10 @@ pub fn review_outcome(independent: bool, blocker: bool) -> Outcome {
     }
 }
 
-/// Who asked for the review. Inside an implementer turn: its live buffers,
-/// the models that answered so far, the asking call and the workflow
-/// channel. From the CLI: the stored task only.
+/// Who asked for the review. Inside an implementer turn: the models that
+/// answered so far, the asking call and the workflow channel.
 #[derive(Default)]
 pub struct Requester<'a> {
-    /// The implementer's live buffers, flushed into the review first.
-    pub live_buffers: Option<&'a cedian_workspace::HostTools>,
     pub implementer_models: Vec<String>,
     pub tool_call_id: Option<String>,
     pub channel: Option<&'a cedian_workflow::WorkflowChannel>,
@@ -236,13 +251,12 @@ fn prompt_files_below(workdir: &Path, home: Option<&Path>) -> Vec<PathBuf> {
 
 /// ADR-0053: no reviewer runs; the review is inconclusive and audited.
 fn refuse_review(
-    workdir: &Path,
+    state_dir: &Path,
     found: &[PathBuf],
     requester: Requester,
 ) -> Result<String, String> {
     let files: Vec<String> = found.iter().map(|p| p.display().to_string()).collect();
-    let mut audit =
-        cedian_shell::audit::AuditLog::open(&crate::state::dir(workdir)?, Approvals::Reviewer)?;
+    let mut audit = crate::audit::AuditLog::open(state_dir, Approvals::Reviewer)?;
     audit.review_refused(&files)?;
     let mut reply = format!(
         "no reviewer ran: the workspace carries OMP system-prompt files that would rewrite what \
@@ -267,32 +281,31 @@ fn refuse_review(
     Ok(reply)
 }
 
-/// Run one review. Returns the summary the implementing turn sees.
+/// Run one review of `task`; the reviewer's findings bind to `task_diffs`
+/// as it reports them. Returns the summary the implementing turn sees.
 pub fn run_review(
-    workdir: &Path,
-    session_dir: &Path,
-    settings: &cedian_shell::Settings,
+    place: &ReviewPlace,
+    settings: &crate::Settings,
     focus: &str,
+    task: ReviewTask,
+    task_diffs: TaskDiffs,
     requester: Requester,
 ) -> Result<String, String> {
-    if let Some(live) = requester.live_buffers {
-        crate::flush_turn_for_review(workdir, live)?;
-    }
-    let (store, diffs) = crate::task_diffs(workdir)?;
-    let baseline: HashMap<PathBuf, String> = store
-        .baseline
-        .iter()
-        .map(|(key, text)| (PathBuf::from(key), text.clone()))
-        .collect();
-    let diff = render_diff(&diffs, &baseline);
+    let ReviewPlace {
+        workdir,
+        state_dir,
+        session_dir,
+    } = place;
+    let (workdir, state_dir) = (workdir.as_path(), state_dir.as_path());
+    let diff = render_diff(&task.diffs, &task.baseline);
     if diff.is_empty() {
         return Err("nothing to review: no open hunks in this task".to_string());
     }
     let found = workspace_prompt_files(workdir);
     if !found.is_empty() {
-        return refuse_review(workdir, &found, requester);
+        return refuse_review(state_dir, &found, requester);
     }
-    let mut editors = store.models.clone();
+    let mut editors = task.editors;
     editors.extend(requester.implementer_models.iter().cloned());
 
     let layout = ReviewerLayout {
@@ -301,8 +314,8 @@ pub fn run_review(
     layout
         .reset()
         .map_err(|e| format!("reviewer run dir: {e}"))?;
-    let binary =
-        std::fs::canonicalize(crate::omp_binary_path()?).map_err(|e| format!("omp binary: {e}"))?;
+    let binary = std::fs::canonicalize(crate::launch::omp_binary()?)
+        .map_err(|e| format!("omp binary: {e}"))?;
     let (exec_allow, mut notes) = resolve_allow_list(
         &settings.reviewer_allow_list,
         std::env::var("PATH").ok().as_deref(),
@@ -343,13 +356,12 @@ pub fn run_review(
     std::fs::write(layout.profile(), profile).map_err(|e| format!("reviewer profile: {e}"))?;
     // Opened before the reviewer runs: a log that cannot be written stops
     // the review instead of leaving its tool calls unrecorded.
-    let mut audit =
-        cedian_shell::audit::AuditLog::open(&crate::state::dir(workdir)?, Approvals::Reviewer)?;
+    let mut audit = crate::audit::AuditLog::open(state_dir, Approvals::Reviewer)?;
 
     let mut policy = SpawnPolicy {
         approvals: Approvals::Reviewer,
         bash_patterns: allow_patterns(&settings.reviewer_allow_list),
-        config_allows: cedian_shell::launch::config_allows(&crate::omp_binary_path()?, workdir)?,
+        config_allows: crate::launch::config_allows(&crate::launch::omp_binary()?, workdir)?,
         model,
         sandbox: Some(layout.clone()),
         ..SpawnPolicy::default()
@@ -367,12 +379,13 @@ pub fn run_review(
     .map_err(|e| format!("reviewer spawn: {e}"))?;
     rt.deny_ui_requests();
     rt.set_host_tools(vec![review_findings::review_finding_tool(
-        workdir.to_path_buf(),
+        state_dir.to_path_buf(),
+        task_diffs,
     )])
     .map_err(|e| e.to_string())?;
     let router = rt.router();
     let (sub, events) = router.subscribe();
-    let before = review_findings::load(workdir)?.findings.len();
+    let before = review_findings::load(state_dir)?.findings.len();
     let turn = rt.prompt(&prompt(&diff, focus), vec![]);
 
     let mut audit_result = Ok(());
@@ -395,12 +408,12 @@ pub fn run_review(
         reviewer: reviewer_models,
         implementer: editors.into_iter().collect(),
     };
-    let mut findings = review_findings::load(workdir)?;
+    let mut findings = review_findings::load(state_dir)?;
     for f in findings.findings.iter_mut().skip(before) {
         f.reviewer_model = Some(attribution.reviewer.join(", "));
         f.implementer_models = attribution.implementer.clone();
     }
-    review_findings::save(workdir, &mut findings)?;
+    review_findings::save(state_dir, &mut findings)?;
     let found = findings.findings.split_off(before);
     audit.review(
         &attribution.role,
@@ -451,12 +464,13 @@ fn outcome_word(outcome: Outcome) -> &'static str {
     }
 }
 
-/// The implementer's host tool.
+/// The implementer's host tool. `read_task` brings the turn's edits in and
+/// reads the task when a review is asked for.
 pub fn review_request_tool(
-    workdir: PathBuf,
-    session_dir: PathBuf,
-    settings: cedian_shell::Settings,
-    live: std::sync::Arc<cedian_workspace::HostTools>,
+    place: ReviewPlace,
+    settings: crate::Settings,
+    read_task: std::sync::Arc<dyn Fn() -> Result<ReviewTask, String> + Send + Sync>,
+    task_diffs: TaskDiffs,
     implementer: std::sync::Arc<cedian_omp::EventRouter>,
     channel: std::sync::Arc<cedian_workflow::WorkflowChannel>,
 ) -> HostTool {
@@ -479,14 +493,20 @@ pub fn review_request_tool(
         move |args, ctx| {
             let focus = args.get("focus").and_then(Value::as_str).unwrap_or("");
             let requester = Requester {
-                live_buffers: Some(&live),
                 implementer_models: implementer.answered_models(),
                 tool_call_id: Some(ctx.tool_call_id().to_string()),
                 channel: Some(&channel),
             };
-            run_review(&workdir, &session_dir, &settings, focus, requester)
-                .map(Into::into)
-                .map_err(Into::into)
+            run_review(
+                &place,
+                &settings,
+                focus,
+                read_task()?,
+                task_diffs.clone(),
+                requester,
+            )
+            .map(Into::into)
+            .map_err(Into::into)
         },
     )
 }
@@ -634,6 +654,10 @@ mod tests {
         );
     }
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a test's one synchronous git init"
+    )]
     fn git_init(dir: &Path) {
         let ok = std::process::Command::new("git")
             .args(["init", "-q"])

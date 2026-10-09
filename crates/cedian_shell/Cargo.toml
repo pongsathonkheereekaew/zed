@@ -11,7 +11,9 @@ license = "GPL-3.0-or-later"
 [dependencies]
 cedian_agent_ui = { path = "../cedian_agent_ui" }
 cedian_omp = { path = "../cedian_omp" }
+cedian_review = { path = "../cedian_review" }
 cedian_workflow = { path = "../cedian_workflow" }
+omp-rpc = { path = "../../vendor/omp-rpc" }
 sha2 = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

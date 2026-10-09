@@ -20,12 +20,15 @@ pub struct FindingStore {
     pub findings: Vec<AttachedFinding>,
 }
 
-fn findings_path(workdir: &Path) -> Result<PathBuf, String> {
-    crate::state::file(workdir, "findings.json")
+/// The task's diffs, read when a finding needs them.
+pub type TaskDiffs = std::sync::Arc<dyn Fn() -> Result<Vec<FileDiff>, String> + Send + Sync>;
+
+fn findings_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("findings.json")
 }
 
-pub fn load(workdir: &Path) -> Result<FindingStore, String> {
-    let raw = match std::fs::read_to_string(findings_path(workdir)?) {
+pub fn load(state_dir: &Path) -> Result<FindingStore, String> {
+    let raw = match std::fs::read_to_string(findings_path(state_dir)) {
         Ok(raw) => raw,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(FindingStore::default()),
         Err(e) => return Err(format!("findings.json: {e}")),
@@ -42,10 +45,23 @@ pub fn load(workdir: &Path) -> Result<FindingStore, String> {
     Ok(store)
 }
 
-pub fn save(workdir: &Path, store: &mut FindingStore) -> Result<(), String> {
+pub fn save(state_dir: &Path, store: &mut FindingStore) -> Result<(), String> {
     store.snapshot_version = FINDINGS_SNAPSHOT_VERSION;
     let raw = serde_json::to_string_pretty(store).map_err(|e| e.to_string())?;
-    std::fs::write(findings_path(workdir)?, raw).map_err(|e| e.to_string())
+    std::fs::write(findings_path(state_dir), raw).map_err(|e| e.to_string())
+}
+
+/// `path`'s diff among the task's.
+pub fn diff_for(diffs: &[FileDiff], path: &Path) -> Result<FileDiff, String> {
+    let key = path.to_string_lossy();
+    diffs
+        .iter()
+        .find(|d| d.path == key)
+        .cloned()
+        .ok_or_else(|| {
+            let changed: Vec<&str> = diffs.iter().map(|d| d.path.as_str()).collect();
+            format!("{key} is not in this review task; changed files: {changed:?}")
+        })
 }
 
 /// Parse a reviewer's report and bind it to a hunk of `diff_for(path)`.
@@ -116,17 +132,20 @@ pub fn record(
 
 /// Each finding with its state against the current review diff, for
 /// `cedian review` and the review gate.
-pub fn states(workdir: &Path) -> Result<Vec<(AttachedFinding, &'static str)>, String> {
-    let store = load(workdir)?;
+pub fn states(
+    state_dir: &Path,
+    task_diffs: impl FnOnce() -> Result<Vec<FileDiff>, String>,
+) -> Result<Vec<(AttachedFinding, &'static str)>, String> {
+    let store = load(state_dir)?;
     if store.findings.is_empty() {
         return Ok(Vec::new());
     }
-    let (_review, diffs) = crate::task_diffs(workdir)?;
+    let diffs = task_diffs()?;
     Ok(store
         .findings
         .into_iter()
         .map(|f| {
-            let state = match crate::diff_for(&diffs, Path::new(&f.finding.path)) {
+            let state = match diff_for(&diffs, Path::new(&f.finding.path)) {
                 _ if f.dismissed.is_some() => "dismissed",
                 Ok(diff) if f.blocks(&diff) => "open blocker",
                 Ok(diff) if f.is_stale(&diff) => "stale (its hunk changed)",
@@ -140,8 +159,11 @@ pub fn states(workdir: &Path) -> Result<Vec<(AttachedFinding, &'static str)>, St
 
 /// One line per open blocker; any refuses `cedian_complete`. Unreadable
 /// findings fail closed.
-pub fn open_blockers(workdir: &Path) -> Vec<String> {
-    match states(workdir) {
+pub fn open_blockers(
+    state_dir: &Path,
+    task_diffs: impl FnOnce() -> Result<Vec<FileDiff>, String>,
+) -> Vec<String> {
+    match states(state_dir, task_diffs) {
         Ok(all) => all
             .into_iter()
             .filter(|(_, state)| *state == "open blocker")
@@ -157,8 +179,16 @@ pub fn open_blockers(workdir: &Path) -> Vec<String> {
 }
 
 /// A person closes a finding with a reason; the audit log records it.
-pub fn dismiss(workdir: &Path, id: &str, reason: &str) -> Result<String, String> {
-    let mut store = load(workdir)?;
+/// `turn_touching` names the turn that last wrote a path, so two dismissals
+/// from two turns can form a reviewer-noise class (ADR-0032).
+pub fn dismiss(
+    state_dir: &Path,
+    task: &str,
+    id: &str,
+    reason: &str,
+    turn_touching: impl FnOnce(&str) -> Result<Option<u32>, String>,
+) -> Result<String, String> {
+    let mut store = load(state_dir)?;
     let finding = store
         .findings
         .iter_mut()
@@ -167,12 +197,11 @@ pub fn dismiss(workdir: &Path, id: &str, reason: &str) -> Result<String, String>
     finding.dismiss(reason)?;
     let path = finding.finding.path.clone();
     let excerpt = finding.hunk_text.clone();
-    save(workdir, &mut store)?;
-    // The turn that wrote the hunk, so two dismissals from two turns can
-    // form a reviewer-noise class (ADR-0032).
-    let turn = crate::session::load(workdir)?.and_then(|r| r.last_turn_touching(&path));
+    save(state_dir, &mut store)?;
+    let turn = turn_touching(&path)?;
     crate::corrections::record(
-        workdir,
+        state_dir,
+        task,
         crate::corrections::CorrectionKind::FindingDismissed,
         crate::corrections::Event {
             turn,
@@ -182,11 +211,8 @@ pub fn dismiss(workdir: &Path, id: &str, reason: &str) -> Result<String, String>
             ..crate::corrections::Event::default()
         },
     )?;
-    cedian_shell::audit::AuditLog::open(
-        &crate::state::dir(workdir)?,
-        cedian_omp::Approvals::Cedian(Default::default()),
-    )?
-    .dismissal(id, reason.trim())?;
+    crate::audit::AuditLog::open(state_dir, cedian_omp::Approvals::Cedian(Default::default()))?
+        .dismissal(id, reason.trim())?;
     Ok(format!("dismissed {id} on {path}: {}", reason.trim()))
 }
 
@@ -194,9 +220,9 @@ pub fn dismiss(workdir: &Path, id: &str, reason: &str) -> Result<String, String>
 pub const MAX_MESSAGE_CHARS: usize = 2000;
 pub const MAX_FINDINGS_PER_REVIEW: usize = 50;
 
-/// The reviewer's host tool over `workdir`'s review diff.
-pub fn review_finding_tool(workdir: PathBuf) -> HostTool {
-    let first_of_review = load(&workdir).map(|s| s.findings.len()).unwrap_or(0);
+/// The reviewer's host tool over the task's review diff.
+pub fn review_finding_tool(state_dir: PathBuf, task_diffs: TaskDiffs) -> HostTool {
+    let first_of_review = load(&state_dir).map(|s| s.findings.len()).unwrap_or(0);
     let params = json!({
         "type": "object",
         "properties": {
@@ -218,12 +244,12 @@ pub fn review_finding_tool(workdir: PathBuf) -> HostTool {
          `blocker` keeps the change from completing until it is fixed or a person dismisses it.",
         params,
         move |args, _ctx| {
-            let (_review, diffs) = crate::task_diffs(&workdir)?;
-            let mut store = load(&workdir)?;
+            let diffs = task_diffs()?;
+            let mut store = load(&state_dir)?;
             let reply = record(&mut store, &args, first_of_review, |path| {
-                crate::diff_for(&diffs, path)
+                diff_for(&diffs, path)
             })?;
-            save(&workdir, &mut store)?;
+            save(&state_dir, &mut store)?;
             Ok(reply.into())
         },
     )
@@ -352,7 +378,7 @@ mod tests {
         .unwrap();
         save(&dir, &mut store).unwrap();
         assert_eq!(load(&dir).unwrap().findings.len(), 1);
-        std::fs::write(findings_path(&dir).unwrap(), r#"{"findings":[]}"#).unwrap();
+        std::fs::write(findings_path(&dir), r#"{"findings":[]}"#).unwrap();
         assert!(load(&dir).unwrap_err().contains("cedian review reset"));
     }
 }

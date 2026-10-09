@@ -60,8 +60,8 @@ pub fn excerpt_hash(text: &str) -> String {
     format!("{:016x}", cedian_workflow::content_hash(text.as_bytes()))
 }
 
-pub fn load(workdir: &Path) -> Result<Vec<Correction>, String> {
-    match std::fs::read_to_string(crate::state::file(workdir, CORRECTIONS_FILE)?) {
+pub fn load(state_dir: &Path) -> Result<Vec<Correction>, String> {
+    match std::fs::read_to_string(state_dir.join(CORRECTIONS_FILE)) {
         Ok(text) => parse(&text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(format!("corrections.jsonl: {e}")),
@@ -75,10 +75,12 @@ fn parse(text: &str) -> Result<Vec<Correction>, String> {
         .collect()
 }
 
-/// Append one row. A user edit over an agent hunk is noticed each time the
-/// tracker rebuilds, so that kind is recorded once per hunk text.
+/// Append one row for `task`. A user edit over an agent hunk is noticed
+/// each time the tracker rebuilds, so that kind is recorded once per hunk
+/// text.
 pub fn record(
-    workdir: &Path,
+    state_dir: &Path,
+    task: &str,
     kind: CorrectionKind,
     event: Event,
 ) -> Result<Option<String>, String> {
@@ -89,7 +91,7 @@ pub fn record(
         .create(true)
         .read(true)
         .append(true)
-        .open(crate::state::file(workdir, CORRECTIONS_FILE)?)
+        .open(state_dir.join(CORRECTIONS_FILE))
         .map_err(|e| format!("corrections.jsonl: {e}"))?;
     file.lock()
         .map_err(|e| format!("corrections.jsonl lock: {e}"))?;
@@ -114,7 +116,7 @@ pub fn record(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0),
-        task: crate::session::CLI_TASK.to_string(),
+        task: task.to_string(),
         turn: event.turn,
         kind,
         path: event.path,
@@ -286,8 +288,8 @@ struct ClassStore {
     classes: Vec<CorrectionClass>,
 }
 
-fn save_class(workdir: &Path, class: CorrectionClass) -> Result<(), String> {
-    let path = crate::state::file(workdir, CLASSES_FILE)?;
+fn save_class(state_dir: &Path, class: CorrectionClass) -> Result<(), String> {
+    let path = state_dir.join(CLASSES_FILE);
     let mut store: ClassStore = match std::fs::read_to_string(&path) {
         Ok(raw) => {
             let s: ClassStore = serde_json::from_str(&raw)
@@ -323,7 +325,7 @@ fn save_class(workdir: &Path, class: CorrectionClass) -> Result<(), String> {
 
 /// OMP's host tool for proposing a class over recorded corrections.
 pub fn correction_class_tool(
-    workdir: PathBuf,
+    state_dir: PathBuf,
     current: impl Fn() -> CurrentState + Send + Sync + 'static,
 ) -> HostTool {
     let params = json!({
@@ -352,8 +354,8 @@ pub fn correction_class_tool(
          with proof that its enforcer fails on the old code and passes now.",
         params,
         move |args, _ctx| {
-            let rows = load(&workdir)?;
-            let state: Option<WorkflowState> = crate::workflow_store::load(&workdir).ok();
+            let rows = load(&state_dir)?;
+            let state: Option<WorkflowState> = crate::workflow_store::load(&state_dir).ok();
             let lookup = |id: &str| state.as_ref().and_then(|s| s.evidence.get(id).cloned());
             let class = check_class(&args, &rows, &lookup, &current())?;
             let reply = format!(
@@ -366,7 +368,7 @@ pub fn correction_class_tool(
                     .map(|n| format!(" ({n})"))
                     .unwrap_or_default()
             );
-            save_class(&workdir, class)?;
+            save_class(&state_dir, class)?;
             Ok(reply.into())
         },
     )
@@ -513,17 +515,17 @@ mod tests {
             ..Event::default()
         };
         assert_eq!(
-            record(&dir, CorrectionKind::UserEditedAgentHunk, edit())
+            record(&dir, "cli", CorrectionKind::UserEditedAgentHunk, edit())
                 .unwrap()
                 .as_deref(),
             Some("c1")
         );
         assert_eq!(
-            record(&dir, CorrectionKind::UserEditedAgentHunk, edit()).unwrap(),
+            record(&dir, "cli", CorrectionKind::UserEditedAgentHunk, edit()).unwrap(),
             None
         );
         assert_eq!(
-            record(&dir, CorrectionKind::HunkRejected, edit())
+            record(&dir, "cli", CorrectionKind::HunkRejected, edit())
                 .unwrap()
                 .as_deref(),
             Some("c2")
@@ -543,8 +545,7 @@ mod tests {
     }
 
     fn classes(dir: &Path) -> Vec<CorrectionClass> {
-        let raw =
-            std::fs::read_to_string(crate::state::dir(dir).unwrap().join(CLASSES_FILE)).unwrap();
+        let raw = std::fs::read_to_string(dir.join(CLASSES_FILE)).unwrap();
         serde_json::from_str::<ClassStore>(&raw).unwrap().classes
     }
 
@@ -560,7 +561,7 @@ mod tests {
                         excerpt: Some(format!("hunk {i}")),
                         ..Event::default()
                     };
-                    record(&dir, CorrectionKind::HunkRejected, event)
+                    record(&dir, "cli", CorrectionKind::HunkRejected, event)
                         .unwrap()
                         .unwrap()
                 })
@@ -579,7 +580,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = crate::test_dir::TestDir::new("corr-perm");
         save_class(&dir, class("kept", ClassStatus::Enforced)).unwrap();
-        let path = crate::state::dir(&dir).unwrap().join(CLASSES_FILE);
+        let path = dir.join(CLASSES_FILE);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
         let result = save_class(&dir, class("new", ClassStatus::Documented));
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();

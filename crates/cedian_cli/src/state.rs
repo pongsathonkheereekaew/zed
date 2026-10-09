@@ -4,8 +4,6 @@
 
 use std::path::{Path, PathBuf};
 
-pub use cedian_shell::state::outside_workspace;
-
 fn root() -> Result<PathBuf, String> {
     if cfg!(test) && std::env::var_os("CEDIAN_STATE_DIR").is_none() {
         return Ok(std::env::temp_dir().join(format!("cedian-test-state-{}", std::process::id())));

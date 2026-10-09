@@ -24,9 +24,6 @@
     reason = "headless, synchronous process control (OMP, LSP, DAP, Chrome, git, sandbox-exec): Zed's async spawn helpers do not apply"
 )]
 
-mod corrections;
-mod review_agent;
-mod review_findings;
 mod session;
 mod shell;
 mod shell_lock;
@@ -35,12 +32,12 @@ mod state;
 mod test_dir;
 mod timing;
 mod verify_store;
-mod workflow_store;
 mod workspace_files;
 
 use cedian_agent_ui::Panel;
 use cedian_omp::{OmpBinary, OmpRuntime, RuntimeConfig};
 use cedian_review::FileDiff;
+use cedian_shell::{corrections, review_agent, review_findings, workflow_store};
 use cedian_workspace::{HostTools, WorkspaceHost};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -110,18 +107,36 @@ pub(crate) fn dispatch(args: Vec<String>, in_shell: bool) -> Result<(), String> 
                 let usage = "usage: cedian review dismiss <finding id> <reason>";
                 let id = args.get(2).ok_or(usage)?;
                 let reason = args[3.min(args.len())..].join(" ");
-                println!("{}", review_findings::dismiss(&workdir, id, &reason)?);
+                let turn_touching = |path: &str| {
+                    Ok(session::load(&workdir)?.and_then(|r| r.last_turn_touching(path)))
+                };
+                println!(
+                    "{}",
+                    review_findings::dismiss(
+                        &state::dir(&workdir)?,
+                        session::CLI_TASK,
+                        id,
+                        &reason,
+                        turn_touching
+                    )?
+                );
                 Ok(())
             }
             Some("--agent") => {
                 let focus = args[2.min(args.len())..].join(" ");
-                let channel = workflow_channel(&workdir, &settings, |_, _| None);
+                let channel = workflow_channel(&workdir, &settings, |_, _| None)?;
                 let requester = review_agent::Requester {
                     channel: Some(&channel),
                     ..Default::default()
                 };
-                let reply =
-                    review_agent::run_review(&workdir, &session_dir, &settings, &focus, requester)?;
+                let reply = review_agent::run_review(
+                    &review_place(&workdir, &session_dir)?,
+                    &settings,
+                    &focus,
+                    read_review_task(&workdir)?,
+                    task_diff_reader(&workdir),
+                    requester,
+                )?;
                 println!("{reply}");
                 Ok(())
             }
@@ -177,29 +192,30 @@ fn workflow_channel(
     workdir: &Path,
     settings: &cedian_shell::Settings,
     resolve: impl Fn(&str, &str) -> Option<cedian_workflow::BoundCall> + Send + Sync + 'static,
-) -> std::sync::Arc<cedian_workflow::WorkflowChannel> {
+) -> Result<std::sync::Arc<cedian_workflow::WorkflowChannel>, String> {
     let root = workdir.to_path_buf();
-    cedian_workflow::WorkflowChannel::with_policy(
+    Ok(cedian_workflow::WorkflowChannel::with_policy(
         "cli",
-        Box::new(DiskWorkflowStore(workdir.to_path_buf())),
+        Box::new(workflow_store::DiskWorkflowStore(state::dir(workdir)?)),
         resolve,
         move || current_state(&root),
         settings.floor.clone(),
         Box::new(verify_store::DiskProfileStore(workdir.to_path_buf())),
-    )
+    ))
 }
 
 /// Turn boundary (ADR-0036): a refused `cedian_complete` in this turn
 /// blocks the workflow (or leaves it failed when the agent failed a phase);
 /// say so with the missing gates.
 fn end_workflow_turn(workdir: &Path) -> Result<(), String> {
-    if !workflow_store::exists(workdir) {
+    let state_dir = state::dir(workdir)?;
+    if !workflow_store::exists(&state_dir) {
         return Ok(());
     }
-    let mut state = workflow_store::load(workdir)?;
+    let mut state = workflow_store::load(&state_dir)?;
     let Some((status, missing)) = state.end_turn() else {
         if state.last_completion.is_some() {
-            workflow_store::save(workdir, &state)?;
+            workflow_store::save(&state_dir, &state)?;
         }
         return Ok(());
     };
@@ -207,7 +223,8 @@ fn end_workflow_turn(workdir: &Path) -> Result<(), String> {
         .map(|s| s.turns.len() as u32 + 1)
         .unwrap_or(1);
     corrections::record(
-        workdir,
+        &state_dir,
+        session::CLI_TASK,
         corrections::CorrectionKind::CompletionRefused,
         corrections::Event {
             turn: Some(next_turn),
@@ -215,7 +232,7 @@ fn end_workflow_turn(workdir: &Path) -> Result<(), String> {
             ..corrections::Event::default()
         },
     )?;
-    workflow_store::save(workdir, &state)?;
+    workflow_store::save(&state_dir, &state)?;
     let (word, next) = if status == cedian_workflow::WorkflowStatus::Failed {
         ("FAILED", "start a new workflow to retry")
     } else {
@@ -262,21 +279,6 @@ fn current_state(workdir: &Path) -> cedian_workflow::CurrentState {
     )
 }
 
-/// `workflow.json` in the state dir as the channel's store.
-struct DiskWorkflowStore(PathBuf);
-
-impl cedian_workflow::WorkflowStore for DiskWorkflowStore {
-    fn load(&self) -> Result<Option<cedian_workflow::WorkflowState>, String> {
-        if !workflow_store::exists(&self.0) {
-            return Ok(None);
-        }
-        workflow_store::load(&self.0).map(Some)
-    }
-    fn save(&self, state: &cedian_workflow::WorkflowState) -> Result<(), String> {
-        workflow_store::save(&self.0, state)
-    }
-}
-
 /// Every host tool, with the P5 evidence resolver over this runtime's router
 /// log: evidence binds to the most recent call of the named tool (args
 /// containing `needle`) that finished without error and is not itself a
@@ -311,36 +313,44 @@ fn host_tools(
             mutated_after,
         })
     };
-    let channel = workflow_channel(workdir, settings, resolve);
+    let channel = workflow_channel(workdir, settings, resolve)?;
     let root = workdir.to_path_buf();
+    let state_dir = state::dir(workdir)?;
     let live = std::sync::Arc::clone(host);
+    let blockers_dir = state_dir.clone();
     channel.set_blockers(move || {
         // Bring this turn's edits in first: a hunk fixed this turn is fixed.
         match flush_turn_for_review(&root, &live) {
-            Ok(()) => review_findings::open_blockers(&root),
+            Ok(()) => review_findings::open_blockers(&blockers_dir, || {
+                task_diffs(&root).map(|(_, diffs)| diffs)
+            }),
             Err(e) => vec![format!("review: cannot bring this turn's edits in ({e})")],
         }
     });
     let names = host_tool_names(settings);
     let mut tools = vec![host.apply_edit_tool()];
     tools.extend(channel.host_tools());
+    let (root, live) = (workdir.to_path_buf(), host.clone());
     tools.push(review_agent::review_request_tool(
-        workdir.to_path_buf(),
-        session_dir.to_path_buf(),
+        review_place(workdir, session_dir)?,
         settings.clone(),
-        host.clone(),
+        std::sync::Arc::new(move || {
+            flush_turn_for_review(&root, &live)?;
+            read_review_task(&root)
+        }),
+        task_diff_reader(workdir),
         rt.router(),
         std::sync::Arc::clone(&channel),
     ));
     let class_root = workdir.to_path_buf();
     tools.push(corrections::correction_class_tool(
-        workdir.to_path_buf(),
+        state_dir.clone(),
         move || current_state(&class_root),
     ));
     if names.contains(&cedian_worker::WORKTREE_REQUEST_TOOL) {
         tools.push(cedian_worker::worktree_request_tool(
             workdir.to_path_buf(),
-            state::dir(workdir)?,
+            state_dir,
         ));
     }
     debug_assert_eq!(tools.len(), names.len());
@@ -469,10 +479,11 @@ fn load_workspace(host: &HostTools, workdir: &Path) -> Vec<PathBuf> {
 /// told when to call the channel; compliance is checked, never assumed).
 fn workflow_ambient(workdir: &Path) -> Option<String> {
     use cedian_workflow::WorkflowStatus;
-    if !workflow_store::exists(workdir) {
+    let state_dir = state::dir(workdir).ok()?;
+    if !workflow_store::exists(&state_dir) {
         return None;
     }
-    let state = workflow_store::load(workdir).ok()?;
+    let state = workflow_store::load(&state_dir).ok()?;
     if !matches!(
         state.status,
         WorkflowStatus::Running | WorkflowStatus::Blocked
@@ -794,21 +805,37 @@ fn task_diffs(workdir: &Path) -> Result<(session::ReviewStore, Vec<FileDiff>), S
     Ok((store, diffs))
 }
 
-/// `path`'s diff among the task's.
-fn diff_for(diffs: &[FileDiff], path: &Path) -> Result<FileDiff, String> {
-    let key = path.to_string_lossy();
-    diffs
-        .iter()
-        .find(|d| d.path == key)
-        .cloned()
-        .ok_or_else(|| {
-            let changed: Vec<&str> = diffs.iter().map(|d| d.path.as_str()).collect();
-            format!("{key} is not in this review task; changed files: {changed:?}")
-        })
+/// The task as a review reads it, from the stored task and disk.
+fn read_review_task(workdir: &Path) -> Result<review_agent::ReviewTask, String> {
+    let (store, diffs) = task_diffs(workdir)?;
+    Ok(review_agent::ReviewTask {
+        diffs,
+        baseline: store
+            .baseline
+            .iter()
+            .map(|(key, text)| (PathBuf::from(key), text.clone()))
+            .collect(),
+        editors: store.models.into_iter().collect(),
+    })
+}
+
+fn task_diff_reader(workdir: &Path) -> review_findings::TaskDiffs {
+    let root = workdir.to_path_buf();
+    std::sync::Arc::new(move || task_diffs(&root).map(|(_, diffs)| diffs))
+}
+
+fn review_place(workdir: &Path, session_dir: &Path) -> Result<review_agent::ReviewPlace, String> {
+    Ok(review_agent::ReviewPlace {
+        workdir: workdir.to_path_buf(),
+        state_dir: state::dir(workdir)?,
+        session_dir: session_dir.to_path_buf(),
+    })
 }
 
 fn cmd_review(workdir: &Path) -> Result<(), String> {
-    let findings = review_findings::states(workdir)?;
+    let findings = review_findings::states(&state::dir(workdir)?, || {
+        task_diffs(workdir).map(|(_, d)| d)
+    })?;
     if findings.is_empty() {
         println!("no review findings");
         return Ok(());
@@ -855,6 +882,7 @@ fn cmd_workflow(
     settings: &cedian_shell::Settings,
     args: &[String],
 ) -> Result<(), String> {
+    let state_dir = state::dir(workdir)?;
     match args.first().map(|s| s.as_str()) {
         Some("run") => {
             let kind = args
@@ -895,12 +923,12 @@ fn cmd_workflow(
             }
             let state = cedian_workflow::WorkflowState::start_with_floor(profile, &settings.floor)
                 .map_err(|e| e.to_string())?;
-            workflow_store::save(workdir, &state)?;
+            workflow_store::save(&state_dir, &state)?;
             render_workflow(&state, &current_state(workdir));
             Ok(())
         }
         Some("status") => {
-            let state = workflow_store::load(workdir)?;
+            let state = workflow_store::load(&state_dir)?;
             render_workflow(&state, &current_state(workdir));
             Ok(())
         }
@@ -917,7 +945,7 @@ fn cmd_workflow(
                     _ => return Err(format!("unknown flag {flag:?}")),
                 }
             }
-            let mut state = workflow_store::load(workdir)?;
+            let mut state = workflow_store::load(&state_dir)?;
             // S2 exit: typed evidence has no router-log call behind it, so
             // it is unattributed and can never pass a required gate.
             let id = format!("e{}", state.evidence.len() + 1);
@@ -931,7 +959,7 @@ fn cmd_workflow(
             )
             .with_code_state(current.bind(&[]));
             state.attach(item).map_err(|e| e.to_string())?;
-            workflow_store::save(workdir, &state)?;
+            workflow_store::save(&state_dir, &state)?;
             match state.gate_result(gate, &current) {
                 Ok(r) => println!(
                     "evidence {id} → gate {gate:?}: {:?} ({})",
@@ -943,34 +971,34 @@ fn cmd_workflow(
         }
         Some("advance") => {
             let passed = !args[1..].contains(&"--fail".to_string());
-            let mut state = workflow_store::load(workdir)?;
+            let mut state = workflow_store::load(&state_dir)?;
             state
                 .advance(passed, &current_state(workdir))
                 .map_err(|e| e.to_string())?;
             if !passed {
                 println!("phase failed — workflow failed");
             }
-            workflow_store::save(workdir, &state)?;
+            workflow_store::save(&state_dir, &state)?;
             render_workflow(&state, &current_state(workdir));
             Ok(())
         }
         Some("resume") => {
-            let mut state = workflow_store::load(workdir)?;
+            let mut state = workflow_store::load(&state_dir)?;
             state.resume()?;
-            workflow_store::save(workdir, &state)?;
+            workflow_store::save(&state_dir, &state)?;
             render_workflow(&state, &current_state(workdir));
             Ok(())
         }
         Some("complete") => {
-            let mut state = workflow_store::load(workdir)?;
+            let mut state = workflow_store::load(&state_dir)?;
             match state.complete(&current_state(workdir)) {
                 Ok(()) => {
-                    workflow_store::save(workdir, &state)?;
+                    workflow_store::save(&state_dir, &state)?;
                     println!("complete");
                     Ok(())
                 }
                 Err(missing) => {
-                    workflow_store::save(workdir, &state)?;
+                    workflow_store::save(&state_dir, &state)?;
                     Err(format!("blocked:\n  - {}", missing.join("\n  - ")))
                 }
             }
@@ -1251,7 +1279,8 @@ mod tests {
         use cedian_workflow::{CompletionAttempt, TaskKind, TaskProfile, WorkflowStatus};
         let d = crate::test_dir::TestDir::new("u5");
         end_workflow_turn(&d).unwrap(); // fast lane: no workflow, nothing to do
-        assert!(!workflow_store::exists(&d));
+        let sd = state::dir(&d).unwrap();
+        assert!(!workflow_store::exists(&sd));
         let mut state =
             cedian_workflow::WorkflowState::start(TaskProfile::new("t", TaskKind::BugFix)).unwrap();
         state.last_completion = Some(CompletionAttempt {
@@ -1260,10 +1289,10 @@ mod tests {
             missing: vec!["required gate \"verify\"".into()],
             turn_ended: false,
         });
-        workflow_store::save(&d, &state).unwrap();
+        workflow_store::save(&sd, &state).unwrap();
         end_workflow_turn(&d).unwrap();
         assert_eq!(
-            workflow_store::load(&d).unwrap().status,
+            workflow_store::load(&sd).unwrap().status,
             WorkflowStatus::Blocked
         );
         cmd_workflow(
@@ -1273,7 +1302,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            workflow_store::load(&d).unwrap().status,
+            workflow_store::load(&sd).unwrap().status,
             WorkflowStatus::Running
         );
         assert!(

@@ -344,6 +344,7 @@ pub struct CedianPanel {
     retrying: bool,
     /// The model and thinking-level picker (ADR-0057 decision 3).
     picker: ModelPicker,
+    onboarding: Option<Onboarding>,
     /// OMP's notices, oldest first, until dismissed (ADR-0057 decision 3),
     /// each with the id its Dismiss button names.
     toasts: Vec<(u64, cedian_omp::Toast)>,
@@ -423,6 +424,19 @@ pub struct ModelPicker {
     pub error: Option<String>,
 }
 
+/// Onboarding, while OMP's session has no model: OMP's login providers
+/// and the login the person runs (ADR-0057 decision 3).
+#[derive(Debug, Clone, Default)]
+pub struct Onboarding {
+    pub providers: Vec<omp_rpc::LoginProvider>,
+    /// The provider whose login runs now.
+    pub running: Option<String>,
+    /// OMP's sign-in page for the running login, kept as a link.
+    pub url: Option<omp_rpc::OpenUrlUiRequest>,
+    /// OMP's refusal of the provider list or of the last login.
+    pub error: Option<String>,
+}
+
 /// The toasts kept: older ones fall off.
 const MAX_TOASTS: usize = 8;
 /// The session notes kept: older ones fall off.
@@ -494,6 +508,7 @@ impl CedianPanel {
             toasts: Vec::new(),
             next_toast: 0,
             picker: ModelPicker::default(),
+            onboarding: None,
             session_notes: Vec::new(),
             retrying: false,
             calls: HashMap::default(),
@@ -617,6 +632,10 @@ impl CedianPanel {
 
     pub fn picker(&self) -> &ModelPicker {
         &self.picker
+    }
+
+    pub fn onboarding(&self) -> Option<&Onboarding> {
+        self.onboarding.as_ref()
     }
 
     /// Open or close the picker; opening reads OMP's choices.
@@ -1648,6 +1667,7 @@ impl CedianPanel {
         self.follow_ups.clear();
         self.retrying = false;
         self.picker = ModelPicker::default();
+        self.onboarding = None;
         self.toasts.clear();
         self.session_notes.clear();
         self.edit_turn = None;
@@ -1754,8 +1774,12 @@ impl CedianPanel {
                 ..
             } => {
                 self.forget_subagents();
+                self.onboarding = None;
                 if model.is_some() {
                     self.picker.model = model;
+                } else if let Some(link) = &self.link {
+                    self.onboarding = Some(Onboarding::default());
+                    link.login_providers();
                 }
                 if thinking.is_some() {
                     self.picker.thinking = thinking;
@@ -1825,6 +1849,9 @@ impl CedianPanel {
             LinkEvent::Event(RouterEvent::UiRequest(ExtensionUiRequest::Cancel(cancel))) => {
                 self.dialogs.shift_remove(&cancel.target_id);
             }
+            LinkEvent::Event(RouterEvent::UiRequest(ExtensionUiRequest::OpenUrl(request))) => {
+                self.open_url(request, cx);
+            }
             LinkEvent::Event(RouterEvent::UiRequest(request)) => {
                 let id = cedian_omp::dialog::dialog(&request).map(|(id, _)| id.to_string());
                 if let Some(id) = id
@@ -1885,7 +1912,32 @@ impl CedianPanel {
                 }
                 self.push_note(text);
             }
+            LinkEvent::LoginProviders(result) => {
+                if let Some(onboarding) = &mut self.onboarding {
+                    match result {
+                        Ok(providers) => onboarding.providers = providers,
+                        Err(e) => onboarding.error = Some(e),
+                    }
+                }
+            }
+            LinkEvent::LoggedIn { provider, result } => {
+                if let Some(onboarding) = &mut self.onboarding {
+                    onboarding.running = None;
+                    onboarding.url = None;
+                    match result {
+                        Ok(()) => {
+                            if let Some(link) = &self.link {
+                                link.refresh_picker();
+                            }
+                        }
+                        Err(e) => onboarding.error = Some(format!("login with {provider}: {e}")),
+                    }
+                }
+            }
             LinkEvent::Picker(Ok(state)) => {
+                if state.model.is_some() {
+                    self.onboarding = None;
+                }
                 self.picker.models = state.models;
                 self.picker.levels = state.levels;
                 self.picker.model = state.model;
@@ -1910,12 +1962,7 @@ impl CedianPanel {
                 }
             }
             LinkEvent::Event(RouterEvent::ThinkingLevel(level)) => self.picker.thinking = level,
-            LinkEvent::Event(RouterEvent::Toast(toast)) => {
-                self.toasts.push((self.next_toast, toast));
-                self.next_toast += 1;
-                let excess = self.toasts.len().saturating_sub(MAX_TOASTS);
-                self.toasts.drain(..excess);
-            }
+            LinkEvent::Event(RouterEvent::Toast(toast)) => self.push_toast(toast),
             LinkEvent::Event(event) => return self.on_event(event, cx),
         }
         cx.notify();
@@ -2765,6 +2812,100 @@ impl CedianPanel {
                 panel.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
             });
         panel.into_any_element()
+    }
+
+    /// OMP's sign-in page for a login the person started opens in the
+    /// system browser, never the agent's Chromium (ADR-0049): there the
+    /// agent could read the page and its tokens. Any other `open_url` is
+    /// only shown, so OMP or an extension cannot open pages unasked.
+    fn open_url(&mut self, request: omp_rpc::OpenUrlUiRequest, cx: &mut Context<Self>) {
+        match &mut self.onboarding {
+            Some(onboarding) if onboarding.running.is_some() => {
+                cx.open_url(&request.url);
+                onboarding.url = Some(request);
+            }
+            _ => self.push_toast(cedian_omp::Toast {
+                level: cedian_omp::ToastLevel::Info,
+                text: format!("OMP asks to open {}", request.url),
+            }),
+        }
+    }
+
+    fn push_toast(&mut self, toast: cedian_omp::Toast) {
+        self.toasts.push((self.next_toast, toast));
+        self.next_toast += 1;
+        let excess = self.toasts.len().saturating_sub(MAX_TOASTS);
+        self.toasts.drain(..excess);
+    }
+
+    fn start_login(&mut self, provider: String, cx: &mut Context<Self>) {
+        let (Some(link), Some(onboarding)) = (&self.link, &mut self.onboarding) else {
+            return;
+        };
+        if onboarding.running.is_some() {
+            return;
+        }
+        onboarding.running = Some(provider.clone());
+        onboarding.error = None;
+        link.login(provider);
+        cx.notify();
+    }
+
+    /// No model yet: OMP's providers, each with Log in, and the running
+    /// login's sign-in link.
+    fn render_onboarding(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let onboarding = self.onboarding.as_ref()?;
+        let running = onboarding.running.clone();
+        let providers = onboarding.providers.iter().map(|provider| {
+            let selector = format!("cedian-login-{}", provider.id);
+            let label = if running.as_deref() == Some(provider.id.as_str()) {
+                format!("{}: signing in…", provider.name)
+            } else if provider.authenticated {
+                format!("{} (signed in)", provider.name)
+            } else {
+                format!("Log in with {}", provider.name)
+            };
+            let id = provider.id.clone();
+            div()
+                .debug_selector({
+                    let selector = selector.clone();
+                    move || selector
+                })
+                .child(
+                    Button::new(SharedString::from(selector), label)
+                        .disabled(!provider.available || running.is_some())
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| this.start_login(id.clone(), cx)),
+                        ),
+                )
+        });
+        Some(
+            v_flex()
+                .debug_selector(|| "cedian-onboarding".to_string())
+                .gap_1()
+                .child(Label::new(
+                    "OMP has no model to use yet: log in to a provider.",
+                ))
+                .child(h_flex().flex_wrap().gap_1().children(providers))
+                .when_some(onboarding.url.clone(), |panel, url| {
+                    let link = url.launch_url.clone().unwrap_or_else(|| url.url.clone());
+                    panel.child(
+                        v_flex()
+                            .debug_selector(|| "cedian-login-url".to_string())
+                            .when_some(url.instructions, |panel, text| {
+                                panel.child(Label::new(text).size(LabelSize::Small))
+                            })
+                            .child(
+                                Button::new("cedian-login-url", link)
+                                    .on_click(move |_, _, cx| cx.open_url(&url.url)),
+                            ),
+                    )
+                })
+                .when_some(onboarding.error.clone(), |panel, error| {
+                    panel.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
+                })
+                .into_any_element(),
+        )
     }
 
     /// OMP's notices, one row each with Dismiss.
@@ -4072,6 +4213,7 @@ impl Render for CedianPanel {
             .children(workflow)
             .children(browser)
             .children(dialogs)
+            .children(self.render_onboarding(cx))
             .child(self.render_picker(cx))
             .child(self.render_session(cx))
             .children(self.render_toasts(cx))

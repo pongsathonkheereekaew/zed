@@ -31,7 +31,7 @@ The one home for **per-feature OMP coverage** ([ADR-0034](https://github.com/pon
 | `set_model`, `cycle_model`, `get_available_models` | the panel's model and thinking-level picker (S9 U11, ADR-0057 decision 3): opening it reads `get_state` and `get_available_models`; a model button sends `set_model`, Next model `cycle_model`; OMP's refusal shows in the picker; all sent off the UI thread | native |
 | `set_thinking_level`, `cycle_thinking_level`, `get_available_thinking_levels` | the panel's model and thinking-level picker (S9 U11, ADR-0057 decision 3): one button per level OMP offers sends `set_thinking_level`, Next level `cycle_thinking_level` | native |
 | `set_fast_mode`, `set_slow_mode` | speed toggles | deferred: S10 |
-| `get_login_providers`, `login` | onboarding / account settings | deferred: S9 U11 |
+| `get_login_providers`, `login` | onboarding in the app panel: when OMP's session has no model the panel lists OMP's login providers (`get_login_providers`), Log in runs `login` (OAuth only in RPC mode; the sign-in page comes as `open_url`, OMP's code prompt as an `input` dialog, progress as `notify` toasts) and then re-reads the model for the picker (`crates/cedian_panel/tests/parity_core.rs` step 0) | native (S9 U11) |
 | `compact`, `set_auto_compaction` | Compact now (its result, tokens and short summary, is a note in the thread) and Auto-compact on/off beside the open picker (S9 U11, ADR-0057 decision 3). No context meter yet: `get_session_stats` is S10 | native |
 | `set_cache_warming` | runtime settings | deferred: S10 |
 | `set_auto_retry`, `abort_retry` | Auto-retry on/off beside the open picker; Stop retry while OMP waits to retry (S9 U11, ADR-0057 decision 3) | native |
@@ -96,7 +96,7 @@ Frames OMP sends besides the agent events above.
 | `notify` | a toast at its `notifyType` (info when absent); one toast row each in the panel, with its level and Dismiss (S9 U11, ADR-0057 decision 3) | native |
 | `setStatus`, `setWidget`, `setTitle` | status line, panel widget, window title | deferred: S10 |
 | `set_editor_text` | composer text | deferred: S10 |
-| `open_url` | open in the app's owned Chromium (ADR-0049); headless browser use is OMP's own | deferred: S10 |
+| `open_url` | during a login the person started: the system browser opens the URL, never the agent's Chromium (ADR-0049), where the agent could read the sign-in page, and the panel keeps the link (`launchUrl`) and OMP's instructions; any other `open_url` is only a toast naming the URL, so nothing opens unasked (`parity_core.rs` step 0) | native (S9 U11) |
 
 ## Tools (hand-reviewed on pin bump)
 

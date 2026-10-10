@@ -183,7 +183,6 @@ fn every_parity_row_has_an_adr_0057_status() {
 /// unnoticed: changing one means changing this list.
 const DEFERRED_IN_S9: &[&str] = &[
     "`abort_and_prompt`",
-    "`get_login_providers`, `login`",
     "`set_host_tools`, `set_host_uri_schemes`",
 ];
 

@@ -19,6 +19,9 @@
 //!    with no review turn of its own.
 //! 4. Under `policy = "omp"` the panel shows the OMP policy badge.
 //!
+//! Step 0 runs first: OMP has no model, so the panel onboards through
+//! `get_login_providers` and `login` (ADR-0057 decision 3).
+//!
 //! Harness off: invoked with `--mode` (or `config`) this binary is fake-omp.
 
 use cedian_panel::{CedianPanel, Connection, ToastLevel, Turn};
@@ -93,13 +96,49 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
     wait(cx, &window, "OMP ready", |p| {
         matches!(p.connection(), Connection::Ready { .. })
     });
-    wait(
-        cx,
-        &window,
-        "the closed picker reads OMP's state at connect",
-        |p| p.picker().model.is_some(),
+    // 0. OMP has no model: the panel onboards. It lists OMP's login
+    // providers, Log in runs `login`, the sign-in page opens in the system
+    // browser, OMP's code prompt is a dialog, and the model OMP then has is
+    // read for the picker.
+    wait(cx, &window, "the login providers", |p| {
+        p.onboarding().is_some_and(|o| o.providers.len() == 2)
+    });
+    assert!(rendered(&mut vcx, "cedian-onboarding").is_some());
+    assert!(rendered(&mut vcx, "cedian-login-openai-codex").is_some());
+    click(&mut vcx, "cedian-login-anthropic");
+    wait(cx, &window, "OMP's code prompt", |p| {
+        p.dialog_ids() == ["login-code"]
+    });
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://claude.ai/oauth/authorize?code=true&client_id=x"),
+        "the sign-in page opens in the system browser"
     );
+    assert!(
+        rendered(&mut vcx, "cedian-login-url").is_some(),
+        "its link stays shown"
+    );
+    window
+        .update(cx, |panel, window, cx| {
+            let text_box = panel.dialog("login-code").unwrap().text_box().unwrap();
+            text_box.update(cx, |e, cx| e.set_text("abc#123", window, cx));
+        })
+        .unwrap();
+    click(&mut vcx, "cedian-dialog-login-code-Submit");
+    wait(cx, &window, "the login to finish", |p| {
+        p.onboarding().is_none() && p.picker().model.is_some()
+    });
     assert_picker(cx, &window, "anthropic/claude-x", "high");
+    let progress = window.update(cx, |p, _, _| p.toasts().to_vec()).unwrap();
+    assert!(
+        progress.len() == 1
+            && progress[0]
+                .text
+                .contains("Waiting for the authorization code"),
+        "{progress:?}"
+    );
+    click(&mut vcx, "cedian-toast-0-dismiss");
+    assert!(rendered(&mut vcx, "cedian-onboarding").is_none());
 
     // 1. Every OMP notice kind is a toast, with its level.
     submit(cx, &window, "hello");

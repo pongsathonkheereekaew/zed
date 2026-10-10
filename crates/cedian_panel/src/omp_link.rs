@@ -22,10 +22,11 @@ use futures::channel::mpsc::UnboundedSender;
 use omp_rpc::{
     AbortRetryCommand, CompactCommand, CycleModelCommand, CycleThinkingLevelCommand,
     ExtensionUiRequest, ExtensionUiResponse, GetAvailableModelsCommand,
-    GetAvailableThinkingLevelsCommand, GetStateCommand, HostTool, HostUri, ImageContent,
-    InterruptMode, ModelInfo, PromoteQueuedMessageCommand, QueueMode, RpcAgentEvent,
-    SetAutoCompactionCommand, SetAutoRetryCommand, SetFollowUpModeCommand, SetInterruptModeCommand,
-    SetModelCommand, SetSteeringModeCommand, SetThinkingLevelCommand, ThinkingLevel,
+    GetAvailableThinkingLevelsCommand, GetLoginProvidersCommand, GetStateCommand, HostTool,
+    HostUri, ImageContent, InterruptMode, LoginCommand, LoginProvider, ModelInfo,
+    PromoteQueuedMessageCommand, QueueMode, RpcAgentEvent, SetAutoCompactionCommand,
+    SetAutoRetryCommand, SetFollowUpModeCommand, SetInterruptModeCommand, SetModelCommand,
+    SetSteeringModeCommand, SetThinkingLevelCommand, ThinkingLevel,
 };
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
@@ -87,6 +88,13 @@ pub enum LinkEvent {
     Picker(Result<PickerState, String>),
     /// OMP's answer to a model or thinking-level change.
     PickerChanged(Result<PickerChange, String>),
+    /// OMP's login providers, for onboarding.
+    LoginProviders(Result<Vec<LoginProvider>, String>),
+    /// OMP's answer to a login with `provider`.
+    LoggedIn {
+        provider: String,
+        result: Result<(), String>,
+    },
     /// OMP's answer to a session setting: what it now is, for the thread.
     Setting(Result<String, String>),
     /// OMP's answer to promoting the queued follow-up `text` to a steer.
@@ -1071,6 +1079,39 @@ impl OmpLink {
                 })
             };
             LinkEvent::Picker(read().map_err(|e| e.to_string()))
+        });
+    }
+
+    /// OMP's login providers, off the UI thread.
+    pub fn login_providers(&self) {
+        self.off_thread(
+            LinkEvent::LoginProviders(Err(NOT_RUNNING.to_string())),
+            |control| {
+                LinkEvent::LoginProviders(
+                    control
+                        .call(&GetLoginProvidersCommand {})
+                        .map_err(|e| e.to_string()),
+                )
+            },
+        );
+    }
+
+    /// Run OMP's login with `provider`. It blocks until the person signs
+    /// in (OMP allows 10 minutes); its sign-in page and code prompt come as
+    /// `open_url` and `input` UI requests meanwhile.
+    pub fn login(&self, provider: String) {
+        let refused = LinkEvent::LoggedIn {
+            provider: provider.clone(),
+            result: Err(NOT_RUNNING.to_string()),
+        };
+        self.off_thread(refused, move |control| {
+            let result = control
+                .call(&LoginCommand {
+                    provider_id: provider.clone(),
+                })
+                .map(drop)
+                .map_err(|e| e.to_string());
+            LinkEvent::LoggedIn { provider, result }
         });
     }
 

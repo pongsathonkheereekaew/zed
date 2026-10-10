@@ -10,11 +10,25 @@
 {"dir": "in", "frame": {"id": "req_sub_1", "level": "progress", "type": "set_subagent_subscription"}}
 {"dir": "out", "frame": {"command": "set_subagent_subscription", "data": {"level": "progress"}, "id": "req_sub_1", "success": true, "type": "response"}}
 {"dir": "in", "frame": {"id": "req_3", "type": "get_state"}}
-{"dir": "out", "frame": {"command": "get_state", "id": "req_3", "success": true, "type": "response", "data": {"sessionId": "01a113c8-6171-72ca-9b6b-1c696dd443e1", "sessionFile": "${CEDIAN_SESSION_DIR}/2026-10-07T00-34-21-681Z_01a113c8-6171-72ca-9b6b-1c696dd443e1.jsonl"}}}
+{"dir":"out","frame":{"command":"get_state","id":"req_3","success":true,"type":"response","data":{"sessionId":"01a113c8-6171-72ca-9b6b-1c696dd443e1","sessionFile":"${CEDIAN_SESSION_DIR}/2026-10-07T00-34-21-681Z_01a113c8-6171-72ca-9b6b-1c696dd443e1.jsonl","model":{"id":"claude-x","name":"Claude X","api":"x","provider":"anthropic","baseUrl":"https://x","reasoning":true,"input":["text"],"cost":{"input":1,"output":2,"cacheRead":0,"cacheWrite":0},"contextWindow":200000,"maxTokens":8192}}}}
 {"dir": "in", "frame": {"id": "req_5", "sessionDir": "${CEDIAN_SESSION_DIR}", "type": "open_session"}}
 {"dir": "out", "frame": {"command": "open_session", "data": {"cancelled": false, "resumed": false, "sessionFile": "${CEDIAN_SESSION_DIR}/2026-10-07T00-34-21-681Z_01a113c8-6171-72ca-9b6b-1c696dd443e1.jsonl", "sessionId": "01a113c8-6171-72ca-9b6b-1c696dd443e1"}, "id": "req_5", "success": true, "type": "response"}}
 {"dir":"in","frame":{"id":"req_ready_state","type":"get_state"}}
-{"dir":"out","frame":{"command":"get_state","id":"req_ready_state","success":true,"type":"response","data":{"sessionId":"01a113c8-6171-72ca-9b6b-1c696dd443e1","sessionFile":"${CEDIAN_SESSION_DIR}/2026-10-07T00-34-21-681Z_01a113c8-6171-72ca-9b6b-1c696dd443e1.jsonl","model":{"id":"claude-x","name":"Claude X","api":"x","provider":"anthropic","baseUrl":"https://x","reasoning":true,"input":["text"],"cost":{"input":1,"output":2,"cacheRead":0,"cacheWrite":0},"contextWindow":200000,"maxTokens":8192},"thinkingLevel":"high"}}}
+{"dir":"out","frame":{"command":"get_state","id":"req_ready_state","success":true,"type":"response","data":{"sessionId":"01a113c8-6171-72ca-9b6b-1c696dd443e1","sessionFile":"${CEDIAN_SESSION_DIR}/2026-10-07T00-34-21-681Z_01a113c8-6171-72ca-9b6b-1c696dd443e1.jsonl"}}}
+{"dir":"in","frame":{"id":"req_login_1","type":"get_login_providers"}}
+{"dir":"out","frame":{"command":"get_login_providers","id":"req_login_1","success":true,"type":"response","data":{"providers":[{"id":"anthropic","name":"Anthropic (Claude Pro/Max)","available":true,"authenticated":false},{"id":"openai-codex","name":"ChatGPT Plus/Pro (Codex Subscription)","available":true,"authenticated":false}]}}}
+{"dir":"in","frame":{"id":"req_login_2","providerId":"anthropic","type":"login"}}
+{"dir":"out","frame":{"id":"login-url","instructions":"Sign in, then paste the code shown","launchUrl":"http://localhost:54545/l","method":"open_url","type":"extension_ui_request","url":"https://claude.ai/oauth/authorize?code=true&client_id=x"}}
+{"dir":"out","frame":{"id":"login-progress","message":"Waiting for the authorization code","method":"notify","notifyType":"info","type":"extension_ui_request"}}
+{"dir":"out","frame":{"id":"login-code","method":"input","placeholder":"code#state","timeout":600000,"title":"Paste the authorization code","type":"extension_ui_request"}}
+{"dir":"in","frame":{"id":"login-code","type":"extension_ui_response","value":"abc#123"}}
+{"dir":"out","frame":{"command":"login","id":"req_login_2","success":true,"type":"response","data":{"providerId":"anthropic"}}}
+{"dir":"in","frame":{"id":"req_login_state","type":"get_state"}}
+{"dir":"out","frame":{"command":"get_state","id":"req_login_state","success":true,"type":"response","data":{"sessionId":"01a113c8-6171-72ca-9b6b-1c696dd443e1","sessionFile":"${CEDIAN_SESSION_DIR}/2026-10-07T00-34-21-681Z_01a113c8-6171-72ca-9b6b-1c696dd443e1.jsonl","model":{"id":"claude-x","name":"Claude X","api":"x","provider":"anthropic","baseUrl":"https://x","reasoning":true,"input":["text"],"cost":{"input":1,"output":2,"cacheRead":0,"cacheWrite":0},"contextWindow":200000,"maxTokens":8192},"thinkingLevel":"high"}}}
+{"dir":"in","frame":{"id":"req_login_models","type":"get_available_models"}}
+{"dir":"out","frame":{"command":"get_available_models","id":"req_login_models","success":true,"type":"response","data":{"models":[{"id":"claude-x","name":"Claude X","api":"x","provider":"anthropic","baseUrl":"https://x","reasoning":true,"input":["text"],"cost":{"input":1,"output":2,"cacheRead":0,"cacheWrite":0},"contextWindow":200000,"maxTokens":8192},{"id":"gpt-y","name":"GPT Y","api":"x","provider":"openai","baseUrl":"https://x","reasoning":true,"input":["text"],"cost":{"input":1,"output":2,"cacheRead":0,"cacheWrite":0},"contextWindow":200000,"maxTokens":8192}]}}}
+{"dir":"in","frame":{"id":"req_login_levels","type":"get_available_thinking_levels"}}
+{"dir":"out","frame":{"command":"get_available_thinking_levels","id":"req_login_levels","success":true,"type":"response","data":{"levels":["off","low","high"]}}}
 {"dir":"in","frame":{"id":"req_6","message":"hello","type":"prompt"}}
 {"dir":"out","frame":{"command":"prompt","id":"req_6","success":true,"type":"response"}}
 {"dir":"out","frame":{"type":"agent_start"}}

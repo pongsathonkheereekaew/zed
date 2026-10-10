@@ -386,6 +386,10 @@ pub struct CedianPanel {
     /// The §54 escalation the blocked workflow waits on the person for.
     escalation: Option<String>,
     _worktree_changes: Option<Subscription>,
+    /// Open buffers with unsaved edits, which evidence binds to; shared
+    /// with the running launch's workflow channel.
+    unsaved: crate::omp_link::Unsaved,
+    _unsaved_watch: Vec<Subscription>,
     /// The reviewer's reader of the task's review: it crosses to this
     /// thread and back (ADR-0055).
     review_reader: ReviewReader,
@@ -537,6 +541,8 @@ impl CedianPanel {
             browser_evidence: Vec::new(),
             _context: None,
             _worktree_changes: None,
+            unsaved: Default::default(),
+            _unsaved_watch: Vec::new(),
             review_reader,
             _review_reads,
             findings: Vec::new(),
@@ -555,10 +561,64 @@ impl CedianPanel {
                 this.bash_changed(&project, *worktree, changes, cx);
             }
         }));
+        let buffer_store = this.project.read(cx).buffer_store().clone();
+        this._unsaved_watch
+            .push(cx.subscribe(&buffer_store, |this, _, event, cx| {
+                if let project::buffer_store::BufferStoreEvent::BufferAdded(buffer) = event {
+                    this.watch_unsaved(buffer.clone(), cx);
+                }
+            }));
+        let open: Vec<Entity<Buffer>> = buffer_store.read(cx).buffers().collect();
+        for buffer in open {
+            this.watch_unsaved(buffer, cx);
+        }
         if this.workspace_root(cx).is_some() {
             this.start(window, cx);
         }
         this
+    }
+
+    fn watch_unsaved(&mut self, buffer: Entity<Buffer>, cx: &mut Context<Self>) {
+        self.note_unsaved(&buffer, cx);
+        self._unsaved_watch
+            .push(cx.subscribe(&buffer, |this, buffer, event, cx| {
+                if matches!(
+                    event,
+                    BufferEvent::Edited { .. }
+                        | BufferEvent::DirtyChanged
+                        | BufferEvent::Saved
+                        | BufferEvent::Reloaded
+                        | BufferEvent::FileHandleChanged
+                ) && this.note_unsaved(&buffer, cx)
+                    && this.workflow.is_some()
+                {
+                    this.refresh_workflow(cx);
+                }
+            }));
+    }
+
+    /// Record `buffer`'s version while it has unsaved edits (ADR-0057
+    /// decision 7); a saved buffer is the disk again. Whether it changed.
+    fn note_unsaved(&mut self, buffer: &Entity<Buffer>, cx: &App) -> bool {
+        let (Some(root), Some(file)) = (
+            self.workspace_root(cx),
+            project::File::from_dyn(buffer.read(cx).file()),
+        ) else {
+            return false;
+        };
+        let abs = language::LocalFile::abs_path(file, cx);
+        let Ok(rel) = abs.strip_prefix(&root) else {
+            return false;
+        };
+        let rel = rel.to_string_lossy().into_owned();
+        let buffer = buffer.read(cx);
+        let mut unsaved = self.unsaved.lock();
+        if buffer.is_dirty() {
+            let version = format!("unsaved {:?}", buffer.version());
+            unsaved.insert(rel, version.clone()) != Some(version)
+        } else {
+            unsaved.remove(&rel).is_some()
+        }
     }
 
     /// The workspace whose active editor and selection OMP is told about.
@@ -1333,6 +1393,13 @@ impl CedianPanel {
         self.omp_policy = (spec.policy_source == cedian_shell::Policy::Omp).then(|| {
             "◆ OMP policy — approvals and computer from your OMP config (reading it…)".to_string()
         });
+        spec.unsaved.lock().extend(
+            self.unsaved
+                .lock()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
+        self.unsaved = Arc::clone(&spec.unsaved);
         self.state_dir = Some(spec.state_dir.clone());
         self.refresh_workflow(cx);
         if self.browser.is_none() {
@@ -2562,6 +2629,7 @@ impl CedianPanel {
         // not hashed again on every turn. `None` keeps the view.
         let shown_finished = self.workflow.as_ref().is_some_and(|v| !live(v.status));
         let frame_seq = self.current_state().frame_seq;
+        let unsaved = self.unsaved.lock().clone();
         let read = cx.background_spawn(async move {
             if !cedian_shell::workflow_store::exists(&dir) {
                 return Ok(Some(None));
@@ -2572,6 +2640,7 @@ impl CedianPanel {
             }
             let mut current = cedian_shell::workflow_host::current_state(&root);
             current.frame_seq = frame_seq;
+            current.overlay(&unsaved);
             Ok::<_, String>(Some(Some(WorkflowView::new(&state, &current))))
         });
         self._workflow_load = Some(cx.spawn(async move |this, cx| {

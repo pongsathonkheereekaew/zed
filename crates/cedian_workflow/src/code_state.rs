@@ -2,7 +2,9 @@
 //!
 //! Headless form (ROADMAP stand-in row H, ADR-0036): a stable content hash
 //! per file, or one fingerprint over the workspace tree for repo-wide checks
-//! (a test suite run). S9 swaps the hash for Zed's `clock::Global`.
+//! (a test suite run). In the app a file open in a Zed buffer with unsaved
+//! edits is bound to that buffer's `clock::Global` instead
+//! ([`CurrentState::overlay`], ADR-0057 decision 7).
 //!
 //! Staleness is pure: the caller hashes the workspace into a
 //! [`CurrentState`] and passes it in; nothing here touches the disk.
@@ -40,6 +42,16 @@ pub fn content_hash(bytes: &[u8]) -> u64 {
     h
 }
 
+fn tree_of(files: &BTreeMap<String, u64>) -> u64 {
+    let mut flat = Vec::new();
+    for (path, hash) in files {
+        flat.extend_from_slice(path.as_bytes());
+        flat.push(0);
+        flat.extend_from_slice(&hash.to_le_bytes());
+    }
+    content_hash(&flat)
+}
+
 impl CurrentState {
     /// From `(relative path, contents)` pairs, in any order.
     pub fn from_files<'a>(files: impl IntoIterator<Item = (String, &'a [u8])>) -> Self {
@@ -47,17 +59,21 @@ impl CurrentState {
             .into_iter()
             .map(|(path, bytes)| (path, content_hash(bytes)))
             .collect();
-        let mut flat = Vec::new();
-        for (path, hash) in &files {
-            flat.extend_from_slice(path.as_bytes());
-            flat.push(0);
-            flat.extend_from_slice(&hash.to_le_bytes());
-        }
         Self {
-            tree: content_hash(&flat),
+            tree: tree_of(&files),
             files,
             frame_seq: None,
         }
+    }
+
+    /// Unsaved buffers over the disk: each path's entry becomes its
+    /// buffer's version token, so a keystroke changes it without a save.
+    pub fn overlay<'a>(&mut self, unsaved: impl IntoIterator<Item = (&'a String, &'a String)>) {
+        for (path, version) in unsaved {
+            self.files
+                .insert(path.clone(), content_hash(version.as_bytes()));
+        }
+        self.tree = tree_of(&self.files);
     }
 
     /// The state a call saw: the named files when it named any that exist,

@@ -199,7 +199,7 @@ fn workflow_channel(
         &state::dir(workdir)?,
         settings,
         resolve,
-        || None,
+        |_| {},
     ))
 }
 

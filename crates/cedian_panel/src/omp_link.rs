@@ -246,7 +246,14 @@ pub struct LaunchSpec {
     pub review: Arc<OnceLock<ReviewReader>>,
     /// The settings resolved for this launch; every review of it uses them.
     pub settings: cedian_shell::Settings,
+    /// The panel's unsaved buffers, which evidence binds to.
+    pub unsaved: Unsaved,
 }
+
+/// Workspace-relative path → version of each open buffer with unsaved
+/// edits, kept by the panel on the app thread and read wherever evidence
+/// binds (ADR-0057 decision 7).
+pub type Unsaved = Arc<Mutex<std::collections::BTreeMap<String, String>>>;
 
 /// Reads the task's review on the app thread. Never call it there.
 pub type ReviewReader =
@@ -266,6 +273,7 @@ impl LaunchSpec {
         let log = Arc::clone(&router);
         let browser: Arc<OnceLock<Arc<crate::browser::BrowserHost>>> = Arc::default();
         let frame = Arc::clone(&browser);
+        let unsaved = Unsaved::default();
         let channel = cedian_shell::workflow_host::channel(
             crate::panel::TASK_ID,
             workdir,
@@ -275,10 +283,16 @@ impl LaunchSpec {
                 let calls = log.get()?.finished_tool_calls();
                 cedian_shell::workflow_host::bound_call(&calls, tool, needle)
             },
-            move || {
-                Some(frame.get()?.state())
-                    .filter(|s| s.running)
-                    .map(|s| s.seq)
+            {
+                let unsaved = Arc::clone(&unsaved);
+                move |state| {
+                    state.frame_seq = frame
+                        .get()
+                        .map(|b| b.state())
+                        .filter(|s| s.running)
+                        .map(|s| s.seq);
+                    state.overlay(unsaved.lock().iter());
+                }
             },
         );
         let review: Arc<OnceLock<ReviewReader>> = Arc::default();
@@ -335,6 +349,7 @@ impl LaunchSpec {
             workflow: channel,
             review,
             settings,
+            unsaved,
         })
     }
 
@@ -2061,6 +2076,7 @@ mod tests {
             ),
             review: Arc::default(),
             settings: cedian_shell::Settings::default(),
+            unsaved: Unsaved::default(),
         };
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         let link = OmpLink::start(spec(), tx, None);

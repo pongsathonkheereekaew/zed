@@ -12,7 +12,8 @@
 //!    workflow is blocked and the refusal is a correction row;
 //! 3. the panel shows it: the phases with the current one blocked, the
 //!    unmet required `verify` gate with its reason, the evidence with its
-//!    outcome, the refused claims ledger; Resume sets it running again.
+//!    outcome, the refused claims ledger; Resume sets it running again;
+//! 4. an unsaved keystroke in notes.txt makes e1 stale (ADR-0057 decision 7).
 //!
 //! Harness off: invoked with `--mode` (or `config`) this binary is fake-omp.
 
@@ -171,6 +172,24 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
     let raw = std::fs::read_to_string(state.join("workflow.json")).unwrap();
     assert!(raw.contains("\"status\": \"running\""), "{raw}");
     assert!(rendered(&mut vcx, "cedian-workflow-resume").is_none());
+    assert!(!view.evidence[0].contains("stale"), "{:?}", view.evidence);
+
+    // 4. A keystroke in notes.txt, never saved, makes its evidence stale
+    // (ADR-0057 decision 7): evidence binds to the Zed buffer's version.
+    let buffer = project
+        .update(cx, |p, cx| p.open_local_buffer(ws.join("notes.txt"), cx))
+        .await
+        .unwrap();
+    buffer.update(cx, |b, cx| b.edit([(0..0, "x")], None, cx));
+    wait(cx, &window, "the unsaved edit to stale e1", |p| {
+        p.workflow()
+            .is_some_and(|w| w.evidence[0].contains("stale: notes.txt changed since"))
+    });
+    assert_eq!(
+        std::fs::read_to_string(ws.join("notes.txt")).unwrap(),
+        "alpha\nbeta\ngamma\n",
+        "never saved"
+    );
 }
 
 fn rendered(

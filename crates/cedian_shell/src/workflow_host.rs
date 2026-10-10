@@ -12,16 +12,16 @@ use std::sync::Arc;
 
 /// The channel for `task` over the workspace at `workdir`, with the
 /// user's floor and the project's verification profiles. `resolve` binds
-/// reported evidence to a finished tool call. `frame_seq` is the shared
-/// browser's frame now, when one runs: evidence from an earlier frame
-/// reads `stale-frame`.
+/// reported evidence to a finished tool call. `adjust` adds what the
+/// disk does not hold: the app's shared browser frame (evidence from an
+/// earlier frame reads `stale-frame`) and its unsaved buffers.
 pub fn channel(
     task: &str,
     workdir: &Path,
     state_dir: &Path,
     settings: &crate::Settings,
     resolve: impl Fn(&str, &str) -> Option<BoundCall> + Send + Sync + 'static,
-    frame_seq: impl Fn() -> Option<u64> + Send + Sync + 'static,
+    adjust: impl Fn(&mut CurrentState) + Send + Sync + 'static,
 ) -> Arc<WorkflowChannel> {
     let root = workdir.to_path_buf();
     WorkflowChannel::with_policy(
@@ -30,7 +30,7 @@ pub fn channel(
         resolve,
         move || {
             let mut state = current_state(&root);
-            state.frame_seq = frame_seq();
+            adjust(&mut state);
             state
         },
         settings.floor.clone(),

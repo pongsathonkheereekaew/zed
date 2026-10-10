@@ -6,7 +6,8 @@ cd "$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 export PATH="$HOME/.cargo/bin:$PATH"
 export CARGO_PROFILE_DEV_DEBUG=${CARGO_PROFILE_DEV_DEBUG:-line-tables-only}
 # A full disk mid-build fails with no useful message; free build output first.
-script/cedian-prune 5
+# One check run needs about 9 GB.
+script/cedian-prune 10
 
 crates=(omp-rpc)
 for dir in crates/cedian_*; do

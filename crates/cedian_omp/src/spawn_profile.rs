@@ -766,9 +766,11 @@ mod tests {
     #[test]
     fn host_tools_allowed_but_never_shadow_exec_tools() {
         let mut policy = SpawnPolicy::default();
-        policy.host_tools.insert("cedian_apply_edit".to_string());
+        policy
+            .host_tools
+            .insert("cedian_worktree_request".to_string());
         assert_eq!(
-            policy.overlay().unwrap()["tools"]["approval"]["cedian_apply_edit"],
+            policy.overlay().unwrap()["tools"]["approval"]["cedian_worktree_request"],
             "allow"
         );
         policy.host_tools.insert("bash".to_string());
@@ -778,15 +780,17 @@ mod tests {
     #[test]
     fn config_allow_for_an_unnamed_tool_is_pinned_to_prompt() {
         let mut policy = SpawnPolicy::default();
-        policy.host_tools.insert("cedian_apply_edit".to_string());
-        for tool in ["some_mcp_tool", "cedian_apply_edit", "bash"] {
+        policy
+            .host_tools
+            .insert("cedian_worktree_request".to_string());
+        for tool in ["some_mcp_tool", "cedian_worktree_request", "bash"] {
             policy.config_allows.insert(tool.to_string());
         }
         let overlay = policy.overlay().unwrap();
         let approval = &overlay["tools"]["approval"];
         assert_eq!(approval["some_mcp_tool"], "prompt", "ADR-0028 gap closed");
         assert_eq!(
-            approval["cedian_apply_edit"], "allow",
+            approval["cedian_worktree_request"], "allow",
             "host tools keep allow"
         );
         assert_eq!(approval["bash"], "prompt", "exec floor unchanged");
@@ -1098,7 +1102,9 @@ mod tests {
     fn opted_in() -> SpawnProfile {
         let mut p = profile();
         p.policy.approvals = Approvals::Omp;
-        p.policy.host_tools.insert("cedian_apply_edit".to_string());
+        p.policy
+            .host_tools
+            .insert("cedian_worktree_request".to_string());
         p.policy
             .tool_policies
             .insert("write".to_string(), ToolPolicy::Deny);
@@ -1131,7 +1137,7 @@ mod tests {
         assert_eq!(
             overlay,
             json!({
-                "tools": {"approval": {"cedian_apply_edit": "allow", "write": "deny"}},
+                "tools": {"approval": {"cedian_worktree_request": "allow", "write": "deny"}},
                 "bash": {
                     "patterns": [{"match": "rm -rf *", "approval": "deny"}],
                     "allowCompoundCommands": false,
@@ -1142,7 +1148,7 @@ mod tests {
         bare.policy.bash_patterns.clear();
         assert_eq!(
             bare.policy.overlay().unwrap(),
-            json!({"tools": {"approval": {"cedian_apply_edit": "allow", "write": "deny"}}})
+            json!({"tools": {"approval": {"cedian_worktree_request": "allow", "write": "deny"}}})
         );
     }
 

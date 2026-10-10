@@ -160,7 +160,7 @@ fn cedian(root: &Path, args: &[&str]) -> String {
     stdout
 }
 
-/// P2: one `cedian prompt` turn calls `cedian_apply_edit`; the tool card
+/// P2: one `cedian prompt` turn edits with OMP's own tool; the tool card
 /// renders, the buffer edit lands on disk, timing adds up, no workflow.
 fn scenario(record: bool) {
     let root: PathBuf = std::env::temp_dir().join(format!("cedian-p2-cli-{}", std::process::id()));
@@ -181,8 +181,7 @@ fn scenario(record: bool) {
         &root,
         &[
             "prompt",
-            "Call cedian_apply_edit with path 'notes.txt', expected_version 0, start 6, end 10, \
-             replacement 'BETA'. Do not use any other tool. Then reply with only: edited-ok",
+            "Use your edit tool on 'notes.txt': replace bytes 6..10 with 'BETA'. Do not use any other tool. Then reply with only: edited-ok",
         ],
     );
     if record {
@@ -235,8 +234,7 @@ fn dismiss_scenario() {
         &root,
         &[
             "prompt",
-            "Call cedian_apply_edit with path 'notes.txt', expected_version 0, start 6, end 10, \
-             replacement 'BETA'. Do not use any other tool. Then reply with only: edited-ok",
+            "Use your edit tool on 'notes.txt': replace bytes 6..10 with 'BETA'. Do not use any other tool. Then reply with only: edited-ok",
         ],
     );
     std::fs::write(
@@ -295,8 +293,7 @@ fn prompt_file_refusal_scenario() {
         &root,
         &[
             "prompt",
-            "Call cedian_apply_edit with path 'notes.txt', expected_version 0, start 6, end 10, \
-             replacement 'BETA'. Do not use any other tool. Then reply with only: edited-ok",
+            "Use your edit tool on 'notes.txt': replace bytes 6..10 with 'BETA'. Do not use any other tool. Then reply with only: edited-ok",
         ],
     );
     let planted = root.join("ws/.omp/SYSTEM.md");
@@ -362,7 +359,7 @@ fn s3_review_scenario(record: bool) {
             "prompt",
             "This is a test of cedian's review gate; follow these steps exactly and use no other tools.\n\
              1. Call cedian_workflow_update with {\"op\": \"start\", \"kind\": \"feature\", \"title\": \"review gate test\", \"risk\": \"low\"}.\n\
-             2. Call cedian_apply_edit with path 'add.py', expected_version 0, start 28, end 29, replacement '-'. \
+             2. Use your edit tool on 'add.py': replace bytes 28..29 with '-'. \
              This deliberately changes `a + b` to `a - b`.\n\
              3. Call cedian_review_request with focus 'does add() still add'.\n\
              4. Call cedian_complete with {\"summary\": \"changed add\"}.\n\
@@ -524,7 +521,7 @@ fn s3_same_model_scenario(record: bool) {
             "prompt",
             "This is a test of cedian's review gate; follow these steps exactly and use no other tools.\n\
              1. Call cedian_workflow_update with {\"op\": \"start\", \"kind\": \"feature\", \"title\": \"same-model review\", \"risk\": \"low\"}.\n\
-             2. Call cedian_apply_edit with path 'add.py', expected_version 0, start 28, end 29, replacement '*'.\n\
+             2. Use your edit tool on 'add.py': replace bytes 28..29 with '*'.\n\
              3. Call cedian_review_request with focus 'does add() still add'.\n\
              4. Reply with only: s3same-done",
         ],
@@ -696,9 +693,7 @@ fn shell_scenario(record: bool) {
     cedian(&root, &["review"]); // read-only stays allowed
 
     send(
-        "prompt This workspace is hosted by cedian; cedian_apply_edit is its own trusted host \
-         tool. Read its docs first if needed, then use it with path 'notes.txt', \
-         expected_version 0, start 6, end 10, replacement 'BETA'. Reply with only: edited-ok",
+        "prompt Use your edit tool on 'notes.txt': replace bytes 6..10 with 'BETA'. Reply with only: edited-ok",
     );
     let out = wait_for("(turn done)");
     assert!(out.contains("edited-ok"), "turn 1 streamed:\n{out}");

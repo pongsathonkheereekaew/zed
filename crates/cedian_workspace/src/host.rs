@@ -1,22 +1,16 @@
 //! `WorkspaceHost`: the editor boundary (plan §12 trait shape).
 //!
-//! Headless implementation over [`BufferStore`]: selection/active-file are
-//! caller-provided (no editor yet — the Zed binding feeds real cursor state),
-//! `apply_edit` is the transaction path OMP host tools call, Agent Sync
-//! (§13) saves dirty buffers before the turn.
+//! Text snapshots of the files the caller opened: the app feeds Zed's
+//! buffers, the headless CLI the disk. Selection and active file are
+//! caller-provided. OMP edits with its own tools (ADR-0057 decision 6).
 //!
-//! Threading: the store lives behind `parking_lot::Mutex`; host-tool handler
+//! Threading: the texts live behind `parking_lot::Mutex`; host-tool handler
 //! threads (vendored client) lock briefly per call — no await, no UI thread.
 
-use crate::buffer::{
-    ApplyEditResult, BufferError, BufferStore, TextEdit, parse_version_token, version_token,
-};
-use clock::Global;
-use omp_rpc::{HostTool, HostUri};
+use omp_rpc::HostUri;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -24,8 +18,6 @@ use std::sync::Arc;
 pub const HEADLESS_LSP: &str = "served by the cedian app from Zed's language servers; \
      headless, use OMP's own lsp tool";
 
-/// Name of the host edit tool (also allow-listed in the OMP spawn overlay).
-pub const APPLY_EDIT_TOOL: &str = "cedian_apply_edit";
 /// Normalize any key-shaped path to canonical `/rel` form (leading `/`
 /// enforced, `.` components kept — keys never touch disk by themselves).
 fn normalize_key(path: &Path) -> PathBuf {
@@ -56,50 +48,19 @@ pub enum DiagnosticSeverity {
     Info,
 }
 
-/// Editor boundary: active file, selection, versioned edits, save, diagnostics.
-/// Mirrors plan §12 (`buffer_version` + `apply_edit(path, expected, edit)`);
-/// the Zed binding implements this same trait over `clock::Global` + `History`.
+/// Editor boundary: active file, selection, buffer text, diagnostics.
 pub trait WorkspaceHost: Send + Sync {
     /// File the user is editing, if any.
     fn active_file(&self) -> Option<PathBuf>;
     /// Current selection as `(path, start, end)` byte offsets, if any.
     fn selection(&self) -> Option<(PathBuf, usize, usize)>;
-    /// Current buffer version (optimistic-concurrency token).
-    fn buffer_version(&self, path: &Path) -> Option<Global>;
-    /// Apply one edit transactionally. Version mismatch fails closed.
-    fn apply_edit(
-        &self,
-        path: &Path,
-        expected: Global,
-        edit: &TextEdit,
-    ) -> Result<ApplyEditResult, BufferError>;
-    /// Undo the newest edit on one buffer (no-op when clean).
-    fn undo(&self, path: &Path) -> Option<Global>;
     /// Read buffer text (agents see buffers, not just the filesystem — §13).
     fn read_buffer(&self, path: &Path) -> Option<String>;
     /// Published diagnostics for one buffer (fork: real LSP state).
     fn diagnostics(&self, path: &Path) -> Vec<Diagnostic>;
 }
 
-/// The version an `expected_version` argument names. A number is read as
-/// its decimal text, so a recorded call that sent `0` still names the
-/// untouched buffer; anything that is not a version token refuses the edit.
-fn expected_version(arg: Option<&Value>) -> Result<Global, omp_rpc::HostToolError> {
-    let token = match arg {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Number(n)) => n.to_string(),
-        _ => String::new(),
-    };
-    parse_version_token(&token).ok_or_else(|| {
-        format!(
-            "expected_version {token:?} is not a version token; read the buffer's current \
-             version from cedian:// and retry"
-        )
-        .into()
-    })
-}
-
-/// Headless host: in-memory buffers + caller-set editor chrome + published
+/// Host: opened texts + caller-set editor chrome + published
 /// diagnostics (headless stand-in for Zed `Project::diagnostics`; the fork
 /// binding publishes real LSP diagnostics here).
 ///
@@ -109,7 +70,7 @@ fn expected_version(arg: Option<&Value>) -> Result<Global, omp_rpc::HostToolErro
 /// and bare relative paths all land on the same buffer; paths escaping the
 /// workspace are rejected (fail closed, never a jailbreak).
 pub struct HostTools {
-    store: Mutex<BufferStore>,
+    buffers: Mutex<BTreeMap<PathBuf, String>>,
     active_file: Mutex<Option<PathBuf>>,
     selection: Mutex<Option<(PathBuf, usize, usize)>>,
     diagnostics: Mutex<HashMap<PathBuf, Vec<Diagnostic>>>,
@@ -122,7 +83,7 @@ impl HostTools {
     /// URIs never match `resolve` and diagnostics silently vanish.
     pub fn new(workdir: &Path) -> Self {
         Self {
-            store: Mutex::new(BufferStore::new()),
+            buffers: Mutex::default(),
             active_file: Mutex::new(None),
             selection: Mutex::new(None),
             diagnostics: Mutex::new(HashMap::new()),
@@ -139,7 +100,7 @@ impl HostTools {
 
     /// Open buffer keys (for CLI sync + `cedian://open-editors`).
     pub fn open_keys(&self) -> Vec<PathBuf> {
-        self.store.lock().open_paths()
+        self.buffers.lock().keys().cloned().collect()
     }
 
     /// Open a buffer with initial text (test setup / workspace scan). Accepts
@@ -148,13 +109,7 @@ impl HostTools {
     /// Untrusted spellings go through [`HostTools::resolve`] first.
     pub fn open(&self, path: &Path, text: &str) {
         let key = normalize_key(path);
-        self.store.lock().open(&key, text);
-    }
-
-    /// Re-read a buffer from disk text; see [`BufferStore::reload`].
-    pub fn reload(&self, path: &Path, text: &str) -> bool {
-        let key = normalize_key(path);
-        self.store.lock().reload(&key, text)
+        self.buffers.lock().insert(key, text.to_string());
     }
 
     /// Resolve any workspace path spelling to its canonical buffer key:
@@ -199,7 +154,7 @@ impl HostTools {
     /// Whether `/`-prefixed `path` names an open buffer or a workspace file.
     fn is_workspace_key(&self, path: &Path) -> bool {
         let key = normalize_key(path);
-        if self.store.lock().version(&key).is_some() {
+        if self.buffers.lock().contains_key(&key) {
             return true;
         }
         let rel = path.strip_prefix("/").unwrap_or(path);
@@ -212,14 +167,14 @@ impl HostTools {
     /// Returns `false` when there is nothing to open (no disk file either) —
     /// callers fail with a visible "not open" error, never an empty buffer.
     fn ensure_open(&self, key: &Path) -> bool {
-        if self.store.lock().version(key).is_some() {
+        if self.buffers.lock().contains_key(key) {
             return true;
         }
         let rel = key.strip_prefix("/").unwrap_or(key);
         let local = self.workdir.join(rel);
         match std::fs::read_to_string(&local) {
             Ok(text) => {
-                self.store.lock().open(key, &text);
+                self.buffers.lock().insert(key.to_path_buf(), text);
                 true
             }
             Err(_) => false,
@@ -234,74 +189,6 @@ impl HostTools {
     /// Set the selection (Zed binding: selection changes).
     pub fn set_selection(&self, sel: Option<(PathBuf, usize, usize)>) {
         *self.selection.lock() = sel;
-    }
-
-    /// Agent Sync (§13): save every dirty buffer, return saved paths.
-    /// Idempotent — a crash between save and prompt loses nothing (saves are
-    /// plain version stamps; re-running saves the same content).
-    pub fn agent_sync(&self) -> Vec<PathBuf> {
-        let mut store = self.store.lock();
-        let dirty = store.dirty_buffers();
-        for path in &dirty {
-            store.mark_saved(path);
-        }
-        dirty
-    }
-
-    /// Build the `cedian_apply_edit` host tool: the OMP-side route calls this
-    /// for cedian-relevant paths (plan §10: host tools, never `cedian_edit`).
-    /// Args: `{path, expected_version, start, end, replacement}`;
-    /// `expected_version` is the token `cedian://` reports for the buffer.
-    pub fn apply_edit_tool(self: &Arc<Self>) -> HostTool {
-        let host = Arc::clone(self);
-        let params: Map<String, Value> = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {"type": "string"},
-                "expected_version": {"type": "string", "description": "the buffer's version token as cedian:// reports it (\"0\" for a buffer no edit has touched)"},
-                "start": {"type": "integer"},
-                "end": {"type": "integer"},
-                "replacement": {"type": "string"}
-            },
-            "required": ["path", "expected_version", "start", "end", "replacement"],
-            "additionalProperties": false
-        })
-        .as_object()
-        .unwrap()
-        .clone();
-        HostTool::new(
-            APPLY_EDIT_TOOL,
-            "Apply one edit to a cedian workspace buffer transactionally (preferred over filesystem writes for project files).",
-            params,
-            move |args, _ctx| {
-                let raw = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                let key = match host.resolve(Path::new(raw)) {
-                    Ok(key) => key,
-                    Err(e) => return Err(e.into()),
-                };
-                if !host.ensure_open(&key) {
-                    return Err(format!("buffer not open (no file on disk): {raw}").into());
-                }
-                let edit = TextEdit {
-                    start: args.get("start").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-                    end: args.get("end").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-                    replacement: args
-                        .get("replacement")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                };
-                let expected = expected_version(args.get("expected_version"))?;
-                match host.apply_edit(&key, expected, &edit) {
-                    Ok(result) => Ok(format!(
-                        "applied, now at version {}",
-                        version_token(&result.new_version)
-                    )
-                    .into()),
-                    Err(e) => Err(e.to_string().into()),
-                }
-            },
-        )
     }
 
     /// Build the `cedian` URI scheme: serves every Phase 6 kind (buffer,
@@ -417,10 +304,9 @@ impl HostTools {
     /// Render `cedian://open-editors`: one open buffer path per line.
     fn render_open_editors(&self) -> String {
         let mut paths: Vec<String> = self
-            .store
+            .buffers
             .lock()
-            .open_paths()
-            .iter()
+            .keys()
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
         paths.sort();
@@ -437,25 +323,8 @@ impl WorkspaceHost for HostTools {
         self.selection.lock().clone()
     }
 
-    fn buffer_version(&self, path: &Path) -> Option<Global> {
-        self.store.lock().version(path)
-    }
-
-    fn apply_edit(
-        &self,
-        path: &Path,
-        expected: Global,
-        edit: &TextEdit,
-    ) -> Result<ApplyEditResult, BufferError> {
-        self.store.lock().apply_edit(path, expected, edit)
-    }
-
-    fn undo(&self, path: &Path) -> Option<Global> {
-        self.store.lock().undo(path)
-    }
-
     fn read_buffer(&self, path: &Path) -> Option<String> {
-        self.store.lock().read(path).map(|(text, _)| text)
+        self.buffers.lock().get(path).cloned()
     }
 
     fn diagnostics(&self, path: &Path) -> Vec<Diagnostic> {
@@ -471,46 +340,6 @@ impl WorkspaceHost for HostTools {
 mod tests {
     use super::*;
 
-    #[test]
-    fn expected_version_takes_a_token_and_refuses_the_rest() {
-        let ok = |v: Value| expected_version(Some(&v)).unwrap();
-        assert_eq!(ok(serde_json::json!("0")), Global::new());
-        assert_eq!(ok(serde_json::json!(0)), Global::new());
-        let mut one = Global::new();
-        one.observe(clock::Lamport {
-            replica_id: clock::ReplicaId::LOCAL,
-            value: 1,
-        });
-        assert_eq!(ok(serde_json::json!("0.1")), one);
-        for bad in [
-            serde_json::json!(1),
-            serde_json::json!("1"),
-            serde_json::json!("x"),
-        ] {
-            let e = expected_version(Some(&bad)).unwrap_err().to_string();
-            assert!(e.contains("not a version token"), "{bad}: {e}");
-        }
-        assert!(expected_version(None).is_err());
-    }
-
-    #[test]
-    fn sync_saves_dirty() {
-        let h = HostTools::new(Path::new("/"));
-        h.open(Path::new("/a.rs"), "hi");
-        h.apply_edit(
-            Path::new("/a.rs"),
-            Global::new(),
-            &TextEdit {
-                start: 0,
-                end: 2,
-                replacement: "yo".into(),
-            },
-        )
-        .unwrap();
-        let saved = h.agent_sync();
-        assert_eq!(saved, vec![PathBuf::from("/a.rs")]);
-        assert!(h.agent_sync().is_empty());
-    }
     #[test]
     fn uri_kinds_serve() {
         use crate::{CedianUri, UriKind};

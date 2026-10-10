@@ -181,10 +181,7 @@ fn every_parity_row_has_an_adr_0057_status() {
 /// The rows still `deferred: S9`, which S9 cannot close with. Listed here
 /// and printed, so a row cannot slip into or out of S9's partial exit
 /// unnoticed: changing one means changing this list.
-const DEFERRED_IN_S9: &[&str] = &[
-    "`abort_and_prompt`",
-    "`set_host_tools`, `set_host_uri_schemes`",
-];
+const DEFERRED_IN_S9: &[&str] = &["`abort_and_prompt`"];
 
 #[test]
 fn the_rows_deferred_in_s9_are_the_listed_ones() {

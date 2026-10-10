@@ -4,18 +4,14 @@ version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 
-# Phase 4: editor-native edit surface (headless).
-# WorkspaceHost trait + in-memory backend + cedian:// URIs + host tools.
-# Zed binding (clock::Global, text::Transaction, History) lands with the fork;
-# the trait shape already mirrors plan §12 so the swap is mechanical.
+# The host side of the editor: WorkspaceHost and cedian:// URIs.
+# No integration tests: the live ones drove cedian_apply_edit (ADR-0057).
+autotests = false
 
 [dependencies]
-clock.workspace = true
-cedian_omp = { path = "../cedian_omp" }
 omp-rpc = { path = "../../vendor/omp-rpc" }
 parking_lot = "0.12"
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
 
 [lints]
 workspace = true

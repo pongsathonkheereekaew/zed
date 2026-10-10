@@ -173,7 +173,6 @@ pub(crate) fn dispatch(args: Vec<String>, in_shell: bool) -> Result<(), String> 
 /// when project writes are allowed.
 fn host_tool_names(settings: &cedian_shell::Settings) -> Vec<&'static str> {
     let mut names = vec![
-        cedian_workspace::APPLY_EDIT_TOOL,
         cedian_workflow::WORKFLOW_UPDATE_TOOL,
         cedian_workflow::COMPLETE_TOOL,
         review_agent::REVIEW_REQUEST_TOOL,
@@ -242,7 +241,6 @@ fn host_tools(
     session_dir: &Path,
     workdir: &Path,
     settings: &cedian_shell::Settings,
-    host: &std::sync::Arc<HostTools>,
 ) -> Result<Vec<omp_rpc::HostTool>, String> {
     let router = rt.router();
     let resolve = move |tool: &str, needle: &str| {
@@ -251,11 +249,10 @@ fn host_tools(
     let channel = workflow_channel(workdir, settings, resolve)?;
     let root = workdir.to_path_buf();
     let state_dir = state::dir(workdir)?;
-    let live = std::sync::Arc::clone(host);
     let blockers_dir = state_dir.clone();
     channel.set_blockers(move || {
         // Bring this turn's edits in first: a hunk fixed this turn is fixed.
-        match flush_turn_for_review(&root, &live) {
+        match flush_turn_for_review(&root) {
             Ok(()) => review_findings::open_blockers(&blockers_dir, || {
                 task_diffs(&root).map(|(_, diffs)| diffs)
             }),
@@ -263,14 +260,13 @@ fn host_tools(
         }
     });
     let names = host_tool_names(settings);
-    let mut tools = vec![host.apply_edit_tool()];
-    tools.extend(channel.host_tools());
-    let (root, live) = (workdir.to_path_buf(), host.clone());
+    let mut tools = channel.host_tools();
+    let root = workdir.to_path_buf();
     tools.push(review_agent::review_request_tool(
         review_place(workdir, session_dir)?,
         settings.clone(),
         std::sync::Arc::new(move || {
-            flush_turn_for_review(&root, &live)?;
+            flush_turn_for_review(&root)?;
             read_review_task(&root)
         }),
         task_diff_reader(workdir),
@@ -342,7 +338,7 @@ fn spawn(
     .map_err(|e| e.to_string())?;
     // Nothing in the CLI can answer an OMP dialog: refuse at once (P5 gap).
     rt.deny_ui_requests();
-    rt.set_host_tools(host_tools(&rt, session_dir, workdir, settings, host)?)
+    rt.set_host_tools(host_tools(&rt, session_dir, workdir, settings)?)
         .map_err(|e| e.to_string())?;
     rt.set_host_uris(vec![host.cedian_uri_scheme()])
         .map_err(|e| e.to_string())?;
@@ -350,21 +346,15 @@ fn spawn(
 }
 
 /// Load every text file under workdir into the host buffers (headless scan).
-/// Re-reads buffers that disk moved past: in `cedian shell` the host lives
-/// across turns, and OMP's own writes land on disk (row G). A buffer with
-/// unsaved host edits is kept and reported.
+/// Re-read each turn: in `cedian shell` the host lives across turns, and
+/// OMP's own writes land on disk (row G).
 fn load_workspace(host: &HostTools, workdir: &Path) -> Vec<PathBuf> {
     workspace_files::scan_text_files(workdir)
         .into_iter()
         .filter_map(|path| {
             let key = workspace_files::buffer_key(workdir, &path)?;
             let text = std::fs::read_to_string(&path).ok()?;
-            if !host.reload(&key, &text) {
-                eprintln!(
-                    "{}: unsaved buffer edits kept over a newer disk text",
-                    key.display()
-                );
-            }
+            host.open(&key, &text);
             Some(key)
         })
         .collect()
@@ -562,42 +552,6 @@ pub(crate) fn run_turn(
     }
     end_workflow_turn(workdir)?;
 
-    // Write back ONLY buffers cedian itself changed (host-tool edits), and
-    // never over a file that changed on disk during the turn: OMP's native
-    // `edit`/`write` write the filesystem directly (plan §84 row G), so disk
-    // is authoritative for them.
-    let mut conflicts = Vec::new();
-    let mut synced = 0;
-    for key in &keys {
-        let (Some(before), Some(buffer)) = (pre.get(key), host.read_buffer(key)) else {
-            continue;
-        };
-        if &buffer == before {
-            continue;
-        }
-        let Some(local) = workspace_files::local_path(workdir, key) else {
-            continue;
-        };
-        let disk = std::fs::read_to_string(&local).unwrap_or_default();
-        if disk == buffer {
-            continue; // already flushed for a mid-turn review
-        }
-        if &disk != before {
-            conflicts.push(key.display().to_string());
-            continue;
-        }
-        std::fs::write(&local, &buffer).map_err(|e| e.to_string())?;
-        synced += 1;
-    }
-    if synced > 0 {
-        eprintln!("(synced {synced} buffer(s) to disk)");
-    }
-    for c in &conflicts {
-        eprintln!(
-            "conflict: {c} changed on disk AND in the buffer during the turn — buffer NOT written"
-        );
-    }
-
     let mut turn_files = Vec::new();
     for (key, before, after) in changed_since(workdir, &pre) {
         store.baseline_once(&key, &before); // first change in task (new file: empty)
@@ -653,25 +607,13 @@ impl Drop for TurnPre {
     }
 }
 
-/// Bring this turn's changes into review before a mid-turn review: write
-/// back buffers cedian changed (only where disk still holds the pre-turn
-/// text, row G) and baseline every file the turn changed. Provenance is
-/// still recorded when the turn ends. A no-op between turns.
-fn flush_turn_for_review(workdir: &Path, host: &HostTools) -> Result<(), String> {
+/// Bring this turn's changes into review before a mid-turn review:
+/// baseline every file the turn changed on disk. Provenance is still
+/// recorded when the turn ends. A no-op between turns.
+fn flush_turn_for_review(workdir: &Path) -> Result<(), String> {
     let Some(pre) = TURN_PRE.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
         return Ok(());
     };
-    for (key, before) in &pre {
-        let Some(buffer) = host.read_buffer(key) else {
-            continue;
-        };
-        let Some(local) = workspace_files::local_path(workdir, key) else {
-            continue;
-        };
-        if &buffer != before && std::fs::read_to_string(&local).ok().as_ref() == Some(before) {
-            std::fs::write(&local, &buffer).map_err(|e| e.to_string())?;
-        }
-    }
     let mut store = session::load(workdir)?.unwrap_or_default();
     for (key, before, _) in changed_since(workdir, &pre) {
         store.baseline_once(&key, &before);
@@ -1155,10 +1097,7 @@ mod tests {
         let mut settings = cedian_shell::Settings::default();
         let names = host_tool_names(&settings);
         assert!(names.contains(&cedian_worker::WORKTREE_REQUEST_TOOL));
-        for name in names
-            .iter()
-            .filter(|n| **n != cedian_workspace::APPLY_EDIT_TOOL)
-        {
+        for name in &names {
             assert!(cedian_workflow::is_channel_call(name, ""), "{name}");
         }
         for verdict in [cedian_shell::Verdict::Ask, cedian_shell::Verdict::Deny] {

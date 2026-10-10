@@ -220,7 +220,7 @@ mod tests {
             call_id: call_id.to_string(),
             name: name.to_string(),
             status: ToolCallStatus::Done,
-            preview: "xd://cedian_apply_edit".to_string(),
+            preview: "xd://cedian_worktree_request".to_string(),
             summary: String::new(),
         };
         let (_, cards) = render_thread(&[tool("r", "read"), tool("w", "write")]);
@@ -229,7 +229,10 @@ mod tests {
             (cards[0].name.as_str(), cards[0].title.as_str()),
             ("read", "Read host tool docs")
         );
-        assert_eq!(cards[1].name, "cedian_apply_edit");
-        assert_eq!(cards[1].display_line(), "Host tool — cedian_apply_edit");
+        assert_eq!(cards[1].name, "cedian_worktree_request");
+        assert_eq!(
+            cards[1].display_line(),
+            "Host tool — cedian_worktree_request"
+        );
     }
 }

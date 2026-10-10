@@ -1299,7 +1299,7 @@ mod tests {
     fn channel_calls_are_recognized_by_name_and_device() {
         assert!(is_channel_call("cedian_complete", ""));
         assert!(is_channel_call("write", "xd://cedian_workflow_update"));
-        assert!(!is_channel_call("write", "xd://cedian_apply_edit"));
+        assert!(!is_channel_call("write", "xd://some_host_tool"));
         assert!(!is_channel_call("bash", "cargo test"));
         assert!(may_mutate("edit", "notes.txt"));
         assert!(may_mutate("bash", "ls"));

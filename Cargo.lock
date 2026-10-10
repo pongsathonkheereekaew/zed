@@ -2940,12 +2940,9 @@ dependencies = [
 name = "cedian_workspace"
 version = "0.1.0"
 dependencies = [
- "cedian_omp",
- "clock",
  "omp-rpc",
  "parking_lot",
  "serde",
- "serde_json",
 ]
 
 [[package]]

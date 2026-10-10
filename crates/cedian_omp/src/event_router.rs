@@ -678,7 +678,7 @@ fn summarize_args(name: &str, args: Option<&serde_json::Value>) -> String {
             .collect::<String>()
     };
     let preview: String = match name {
-        "read" | "write" | "glob" | "cedian_apply_edit" => get("path").to_string(),
+        "read" | "write" | "glob" => get("path").to_string(),
         "edit" => get("input")
             .lines()
             .next()

@@ -208,14 +208,18 @@ mod tests {
 
     #[test]
     fn host_tools_are_exactly_the_ones_named() {
-        let policy = spawn_policy(&Settings::default(), Policy::Cedian, &["cedian_apply_edit"]);
+        let policy = spawn_policy(
+            &Settings::default(),
+            Policy::Cedian,
+            &["cedian_worktree_request"],
+        );
         assert_eq!(
             policy
                 .host_tools
                 .iter()
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
-            ["cedian_apply_edit"]
+            ["cedian_worktree_request"]
         );
     }
 }

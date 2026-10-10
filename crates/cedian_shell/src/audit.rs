@@ -305,7 +305,7 @@ mod tests {
         log.record(&RouterEvent::ToolStart {
             tool_call_id: "c1".into(),
             tool_name: "write".into(),
-            args_preview: "xd://cedian_apply_edit".into(),
+            args_preview: "xd://cedian_worktree_request".into(),
             paths: Vec::new(),
         })
         .unwrap();
@@ -342,7 +342,7 @@ mod tests {
             .collect();
         assert_eq!(rows[0]["item"]["kind"], "tool");
         assert_eq!(gates.len(), 4, "{rows:?}");
-        assert_eq!(gates[0]["item"]["tool"], "cedian_apply_edit");
+        assert_eq!(gates[0]["item"]["tool"], "cedian_worktree_request");
         assert_eq!(
             gates[0]["item"]["decision"], "allow",
             "cedian served its host tool"

@@ -246,7 +246,7 @@ impl InlineEdit {
             "Inline edit from the cedian editor. Change ONLY lines {s}-{e} of {p}; leave every \
              other line and every other file untouched. Instruction: {i}\n\
              Current lines {s}-{e} of {p}:\n```\n{t}```\n\
-             Make the change with your own edit tool (not cedian_apply_edit), then reply \
+             Make the change with your own edit tool, then reply \
              with only: done",
             s = self.start,
             e = self.end,

@@ -103,8 +103,8 @@ mod tests {
     #[test]
     fn xd_devices_map_to_host_tools() {
         assert_eq!(
-            host_device("write", "xd://cedian_apply_edit"),
-            Some(("cedian_apply_edit", true))
+            host_device("write", "xd://cedian_worktree_request"),
+            Some(("cedian_worktree_request", true))
         );
         assert_eq!(
             host_device("read", "xd://echo_host"),

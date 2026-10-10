@@ -72,10 +72,18 @@ pub struct OmpChoice {
     pub warning: Option<String>,
 }
 
-/// The OMP binary (ADR-0057 decision 4): the first of the `omp` on `PATH`,
-/// `~/.local/bin/omp` and `CEDIAN_OMP_BINARY` whose `--version` is the pin;
-/// when none is, the first found, with a warning naming both versions.
+/// The OMP binary (ADR-0057 decision 4). A set `CEDIAN_OMP_BINARY` runs as
+/// given, asked `--version` once only for the warning. Otherwise the first
+/// of PATH's `omp` and `~/.local/bin/omp` whose `--version` is the pin, else
+/// the first found. Off the pin, the warning names both versions. Blocking:
+/// call it off the UI thread.
 pub fn omp_binary() -> Result<OmpChoice, String> {
+    let pinned = pinned_omp_version();
+    let probe = |binary: &Path| cedian_omp::omp_version(binary, Duration::from_secs(3));
+    if let Some(binary) = std::env::var_os("CEDIAN_OMP_BINARY").map(PathBuf::from) {
+        let warning = off_pin(&pinned, &binary, probe(&binary));
+        return Ok(OmpChoice { binary, warning });
+    }
     let mut candidates: Vec<PathBuf> = Vec::new();
     candidates
         .extend(cedian_omp::resolve_on_path("omp", std::env::var("PATH").ok().as_deref()).ok());
@@ -84,13 +92,11 @@ pub fn omp_binary() -> Result<OmpChoice, String> {
             .map(|home| PathBuf::from(home).join(".local/bin/omp"))
             .filter(|path| path.is_file()),
     );
-    candidates.extend(std::env::var_os("CEDIAN_OMP_BINARY").map(PathBuf::from));
     let mut seen = BTreeSet::new();
-    candidates.retain(|path| seen.insert(path.clone()));
-    let pinned = pinned_omp_version();
+    candidates.retain(|path| seen.insert(std::fs::canonicalize(path).unwrap_or(path.clone())));
     let mut first = None;
     for binary in candidates {
-        let version = cedian_omp::omp_version(&binary, Duration::from_secs(3));
+        let version = probe(&binary);
         if version.as_ref().is_ok_and(|v| *v == pinned) {
             return Ok(OmpChoice {
                 binary,
@@ -100,16 +106,25 @@ pub fn omp_binary() -> Result<OmpChoice, String> {
         first.get_or_insert((binary, version));
     }
     let (binary, version) =
-        first.ok_or("omp not found on PATH, in ~/.local/bin or CEDIAN_OMP_BINARY")?;
+        first.ok_or("omp not found in CEDIAN_OMP_BINARY, on PATH or in ~/.local/bin")?;
+    let warning = off_pin(&pinned, &binary, version);
+    Ok(OmpChoice { binary, warning })
+}
+
+fn off_pin(
+    pinned: &str,
+    binary: &Path,
+    version: Result<String, cedian_omp::OmpError>,
+) -> Option<String> {
     let found = match version {
+        Ok(version) if version == pinned => return None,
         Ok(version) => format!("OMP {version}"),
         Err(e) => format!("an OMP whose version cannot be read ({e})"),
     };
-    let warning = Some(format!(
+    Some(format!(
         "cedian is pinned to OMP {pinned} but found {found} at {}; it runs that one",
         binary.display()
-    ));
-    Ok(OmpChoice { binary, warning })
+    ))
 }
 
 /// Tools OMP's merged config sets to `allow` in `workdir` (ADR-0041

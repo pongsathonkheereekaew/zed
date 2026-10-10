@@ -1,7 +1,7 @@
-//! ADR-0057 decision 4: cedian runs the pinned OMP when one is found (the
-//! `omp` on PATH, then `~/.local/bin/omp`, then `CEDIAN_OMP_BINARY`, each
-//! asked `--version`), else the first one found with a warning naming both
-//! versions. One test: it sets the process environment.
+//! ADR-0057 decision 4: a set `CEDIAN_OMP_BINARY` runs as given; otherwise
+//! cedian runs the first of PATH's `omp` and `~/.local/bin/omp` whose
+//! `--version` is the pin, else the first one found. Off the pin, a warning
+//! names both versions. One test: it sets the process environment.
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -32,7 +32,7 @@ fn the_pinned_omp_is_found_first_else_the_first_one_warns() {
         }
     };
 
-    set(&root.join("bin"), &home, Some(&env_omp));
+    set(&root.join("bin"), &home, None);
     let choice = cedian_shell::launch::omp_binary().unwrap();
     assert_eq!(
         choice.binary, local,
@@ -40,9 +40,30 @@ fn the_pinned_omp_is_found_first_else_the_first_one_warns() {
     );
     assert_eq!(choice.warning, None);
 
+    let off_pin = fake(&root.join("env-off"), "18.9.0");
+    set(&root.join("bin"), &home, Some(&off_pin));
+    let choice = cedian_shell::launch::omp_binary().unwrap();
+    assert_eq!(
+        choice.binary, off_pin,
+        "a set CEDIAN_OMP_BINARY wins over ~/.local/bin's pin"
+    );
+    let warning = choice.warning.expect("an off-pin CEDIAN_OMP_BINARY warns");
+    assert!(
+        warning.contains("18.9.0") && warning.contains("18.6.1"),
+        "{warning}"
+    );
+
+    set(&home.join(".local/bin"), &home, Some(&env_omp));
+    assert_eq!(
+        cedian_shell::launch::omp_binary().unwrap(),
+        cedian_shell::launch::OmpChoice {
+            binary: env_omp,
+            warning: None
+        },
+        "PATH already holds the pin, and the set CEDIAN_OMP_BINARY still wins"
+    );
+
     let nobody = root.join("nobody");
-    set(&root.join("bin"), &nobody, Some(&env_omp));
-    assert_eq!(cedian_shell::launch::omp_binary().unwrap().binary, env_omp);
 
     set(&root.join("bin"), &nobody, None);
     let choice = cedian_shell::launch::omp_binary().unwrap();

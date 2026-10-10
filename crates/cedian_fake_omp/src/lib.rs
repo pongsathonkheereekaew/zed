@@ -40,8 +40,8 @@ pub const REPLAY_FILE: &str = "fake-omp.replay.jsonl";
 pub const EXIT_DIVERGED: i32 = 3;
 
 /// `omp --version`: fake-omp answers as the pinned OMP, so a hermetic lane
-/// that points `CEDIAN_OMP_BINARY` at it is chosen over an unpinned `omp`
-/// on PATH (ADR-0057 decision 4).
+/// that points `CEDIAN_OMP_BINARY` at it runs with no off-pin warning
+/// (ADR-0057 decision 4).
 pub fn version() -> i32 {
     let pin: serde_json::Value =
         serde_json::from_str(include_str!("../../../vendor/omp-revision.json"))

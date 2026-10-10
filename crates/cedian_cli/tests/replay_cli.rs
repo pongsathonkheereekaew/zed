@@ -112,8 +112,9 @@ fn main() {
     }
 }
 
-/// The CLI under test, isolated in `root`: its own workspace, session dir
-/// and user `cedian.toml` (never the developer's).
+/// The CLI under test, isolated in `root`: its own workspace, session dir,
+/// user `cedian.toml` and HOME (never the developer's), and a PATH with no
+/// `omp` on it, so only fake-omp can run.
 fn cli(root: &Path) -> Command {
     let config = root.join("cedian.toml");
     if !config.exists() {
@@ -125,8 +126,16 @@ fn cli(root: &Path) -> Command {
         .env("CEDIAN_SESSION_DIR", root.join("sessions"))
         .env("CEDIAN_STATE_DIR", root.join("state"))
         .env("CEDIAN_OMP_BINARY", std::env::current_exe().unwrap())
-        .env("CEDIAN_TIMING", root.join("timing.jsonl"));
+        .env("CEDIAN_TIMING", root.join("timing.jsonl"))
+        .env("HOME", root.join("home"))
+        .env("PATH", path_without_omp());
     cmd
+}
+
+fn path_without_omp() -> std::ffi::OsString {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::join_paths(std::env::split_paths(&path).filter(|dir| !dir.join("omp").exists()))
+        .unwrap()
 }
 
 /// The workspace's state dir under the test's `CEDIAN_STATE_DIR` (one

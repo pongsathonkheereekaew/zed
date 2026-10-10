@@ -13,6 +13,8 @@
 {"dir":"out","frame":{"command":"get_state","id":"req_3","success":true,"type":"response","data":{"sessionId":"7e1f0000-0000-7000-8000-000000000001","sessionFile":"${CEDIAN_CWD}/session.jsonl"}}}
 {"dir":"in","frame":{"id":"req_4","sessionDir":"${CEDIAN_CWD}","type":"open_session"}}
 {"dir":"out","frame":{"command":"open_session","data":{"cancelled":false,"resumed":true,"sessionFile":"${CEDIAN_CWD}/session.jsonl","sessionId":"7e1f0000-0000-7000-8000-000000000001"},"id":"req_4","success":true,"type":"response"}}
+{"dir":"in","frame":{"id":"req_ready_state","type":"get_state"}}
+{"dir":"out","frame":{"command":"get_state","id":"req_ready_state","success":true,"type":"response","data":{"sessionId":"7e1f0000-0000-7000-8000-000000000001","sessionFile":"${CEDIAN_CWD}/session.jsonl"}}}
 {"dir":"in","frame":{"id":"req_5","message":"fan out","type":"prompt"}}
 {"dir":"out","frame":{"command":"prompt","id":"req_5","success":true,"type":"response"}}
 {"dir":"out","frame":{"type":"agent_start"}}

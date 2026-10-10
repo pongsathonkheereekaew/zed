@@ -15,6 +15,8 @@
 {"dir": "out", "frame": {"command": "get_state", "id": "req_3", "success": true, "type": "response", "data": {"sessionId": "01a113c8-6171-72ca-9b6b-1c696dd443e1", "sessionFile": "${CEDIAN_SESSION_DIR}/2026-10-07T00-34-21-681Z_01a113c8-6171-72ca-9b6b-1c696dd443e1.jsonl"}}}
 {"dir": "in", "frame": {"id": "req_5", "sessionDir": "${CEDIAN_SESSION_DIR}", "type": "open_session"}}
 {"dir": "out", "frame": {"command": "open_session", "data": {"cancelled": false, "resumed": false, "sessionFile": "${CEDIAN_SESSION_DIR}/2026-10-07T00-34-21-681Z_01a113c8-6171-72ca-9b6b-1c696dd443e1.jsonl", "sessionId": "01a113c8-6171-72ca-9b6b-1c696dd443e1"}, "id": "req_5", "success": true, "type": "response"}}
+{"dir":"in","frame":{"id":"req_ready_state","type":"get_state"}}
+{"dir":"out","frame":{"command":"get_state","id":"req_ready_state","success":true,"type":"response","data":{"sessionId":"01a113c8-6171-72ca-9b6b-1c696dd443e1","sessionFile":"${CEDIAN_SESSION_DIR}/2026-10-07T00-34-21-681Z_01a113c8-6171-72ca-9b6b-1c696dd443e1.jsonl"}}}
 {"dir":"in","frame":{"id":"req_6","message":"Inline edit of notes.txt lines 2-2. Change only the selected text, with your edit tool.\nSelected:\nbeta\nInstruction: make this line uppercase","type":"prompt"}}
 {"dir":"out","frame":{"command":"prompt","id":"req_6","success":true,"type":"response"}}
 {"dir":"out","frame":{"configured":"auto","resolved":"high","thinkingLevel":"high","type":"thinking_level_changed"}}

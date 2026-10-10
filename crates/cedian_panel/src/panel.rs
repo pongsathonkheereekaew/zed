@@ -194,6 +194,9 @@ struct QueuedFollowUp {
     /// The text OMP's queue lists it under, once listed: a slash command
     /// or template shows expanded.
     shown: Option<String>,
+    /// Steer now was clicked and OMP has not answered: leaving the queue
+    /// for the steering one is not a drain.
+    promoting: bool,
 }
 
 /// One edit-class tool call in flight: the open buffers marked before its
@@ -339,12 +342,12 @@ pub struct CedianPanel {
     session_notes: Vec<String>,
     /// OMP waits to retry a failed request: Stop retry is offered.
     retrying: bool,
-    /// Follow-ups sent to OMP to steer the running turn, until it answers.
-    promoting: Vec<QueuedFollowUp>,
     /// The model and thinking-level picker (ADR-0057 decision 3).
     picker: ModelPicker,
-    /// OMP's notices, oldest first, until dismissed (ADR-0057 decision 3).
-    toasts: Vec<cedian_omp::Toast>,
+    /// OMP's notices, oldest first, until dismissed (ADR-0057 decision 3),
+    /// each with the id its Dismiss button names.
+    toasts: Vec<(u64, cedian_omp::Toast)>,
+    next_toast: u64,
     /// The OMP the panel runs is not the pinned one (ADR-0057 decision 4).
     omp_warning: Option<String>,
     /// The `policy = "omp"` badge (ADR-0035 decision 4), shown while the
@@ -422,6 +425,8 @@ pub struct ModelPicker {
 
 /// The toasts kept: older ones fall off.
 const MAX_TOASTS: usize = 8;
+/// The session notes kept: older ones fall off.
+const MAX_SESSION_NOTES: usize = 32;
 
 /// How long a quitting app waits for Chromium to close itself (flushing its
 /// cookies) before killing it. The quit hook blocks the main thread.
@@ -487,10 +492,10 @@ impl CedianPanel {
             omp_warning: None,
             omp_policy: None,
             toasts: Vec::new(),
+            next_toast: 0,
             picker: ModelPicker::default(),
             session_notes: Vec::new(),
             retrying: false,
-            promoting: Vec::new(),
             calls: HashMap::default(),
             review: TaskReview::new(TASK_ID),
             watched: HashSet::default(),
@@ -583,16 +588,31 @@ impl CedianPanel {
     /// queue, so it joins the running turn and has no review turn of its
     /// own. An inline edit keeps its own turn, so it is not offered.
     pub fn promote_follow_up(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(link) = &self.link else {
-            return;
-        };
-        if self.follow_ups.get(index).is_none_or(|q| q.edit.is_some()) {
+        if self.link.is_none() {
             return;
         }
-        let queued = self.follow_ups.remove(index);
-        link.promote(queued.message.clone());
-        self.promoting.push(queued);
+        if let Some(text) = self.begin_promote(index)
+            && let Some(link) = &self.link
+        {
+            link.promote(text);
+        }
         cx.notify();
+    }
+
+    fn push_note(&mut self, note: String) {
+        self.session_notes.push(note);
+        let excess = self.session_notes.len().saturating_sub(MAX_SESSION_NOTES);
+        self.session_notes.drain(..excess);
+    }
+
+    /// Mark follow-up `index` as asked to steer; its text, to send.
+    fn begin_promote(&mut self, index: usize) -> Option<String> {
+        let queued = self
+            .follow_ups
+            .get_mut(index)
+            .filter(|q| q.edit.is_none() && !q.promoting)?;
+        queued.promoting = true;
+        Some(queued.message.clone())
     }
 
     pub fn picker(&self) -> &ModelPicker {
@@ -610,8 +630,18 @@ impl CedianPanel {
         cx.notify();
     }
 
-    pub fn toasts(&self) -> &[cedian_omp::Toast] {
-        &self.toasts
+    pub fn toasts(&self) -> Vec<cedian_omp::Toast> {
+        self.toasts.iter().map(|(_, toast)| toast.clone()).collect()
+    }
+
+    #[cfg(test)]
+    fn toast_handles(&self) -> Vec<u64> {
+        self.toasts.iter().map(|(id, _)| *id).collect()
+    }
+
+    /// The Dismiss button of toast `id`.
+    fn dismiss_toast(&mut self, id: u64) {
+        self.toasts.retain(|(shown, _)| *shown != id);
     }
 
     pub fn omp_warning(&self) -> Option<&str> {
@@ -1616,8 +1646,10 @@ impl CedianPanel {
             self.take_back(queued, window, cx);
         }
         self.follow_ups.clear();
-        self.promoting.clear();
         self.retrying = false;
+        self.picker = ModelPicker::default();
+        self.toasts.clear();
+        self.session_notes.clear();
         self.edit_turn = None;
         self.unblock_instruction();
     }
@@ -1717,9 +1749,17 @@ impl CedianPanel {
                 session_id,
                 resumed,
                 policy_note,
+                model,
+                thinking,
                 ..
             } => {
                 self.forget_subagents();
+                if model.is_some() {
+                    self.picker.model = model;
+                }
+                if thinking.is_some() {
+                    self.picker.thinking = thinking;
+                }
                 self.connection = Connection::Ready {
                     session_id,
                     resumed,
@@ -1810,23 +1850,32 @@ impl CedianPanel {
                     settings.update(cx, |settings, cx| settings.reload(cx));
                 }
             }
-            LinkEvent::Setting(result) => self.session_notes.push(match result {
+            LinkEvent::Setting(result) => self.push_note(match result {
                 Ok(note) => note,
                 Err(e) => format!("OMP refused the setting: {e}"),
             }),
             LinkEvent::Promoted { text, result } => {
-                let found = self.promoting.iter().position(|q| q.message == text);
-                let queued = found.map(|i| self.promoting.remove(i));
-                match result {
-                    Ok(true) => self.session_notes.push(format!("steering now: {text}")),
-                    refused => {
-                        let why = refused.err().unwrap_or_else(|| "not queued".to_string());
-                        if let Some(queued) = queued
-                            && matches!(self.turn, Turn::Queued | Turn::Streaming)
-                        {
-                            self.follow_ups.push(queued);
+                let asked = self
+                    .follow_ups
+                    .iter()
+                    .position(|q| q.promoting && q.message == text);
+                match (result, asked) {
+                    (Ok(true), asked) => {
+                        if let Some(i) = asked {
+                            self.follow_ups.remove(i);
                         }
+                        self.push_note(format!("steering now: {text}"));
+                    }
+                    (refused, Some(i)) => {
+                        self.follow_ups[i].promoting = false;
+                        let why = refused.err().unwrap_or_else(|| "not queued".to_string());
                         self.add_notice(format!("OMP did not steer with {text:?} now: {why}"));
+                    }
+                    (Ok(false), None) => self.add_notice(format!(
+                        "OMP ran {text:?} as its own turn before it could steer"
+                    )),
+                    (Err(why), None) => {
+                        self.add_notice(format!("OMP did not steer with {text:?}: {why}"))
                     }
                 }
             }
@@ -1834,7 +1883,7 @@ impl CedianPanel {
                 if let Some(retrying) = retrying {
                     self.retrying = retrying;
                 }
-                self.session_notes.push(text);
+                self.push_note(text);
             }
             LinkEvent::Picker(Ok(state)) => {
                 self.picker.models = state.models;
@@ -1856,15 +1905,14 @@ impl CedianPanel {
                 self.picker.error = Some(e);
             }
             LinkEvent::Event(RouterEvent::ModelChanged) => {
-                if self.picker.open
-                    && let Some(link) = &self.link
-                {
+                if let Some(link) = &self.link {
                     link.refresh_picker();
                 }
             }
             LinkEvent::Event(RouterEvent::ThinkingLevel(level)) => self.picker.thinking = level,
             LinkEvent::Event(RouterEvent::Toast(toast)) => {
-                self.toasts.push(toast);
+                self.toasts.push((self.next_toast, toast));
+                self.next_toast += 1;
                 let excess = self.toasts.len().saturating_sub(MAX_TOASTS);
                 self.toasts.drain(..excess);
             }
@@ -1877,6 +1925,7 @@ impl CedianPanel {
     /// ToolEnd never came is released, and a failed turn keeps its reason
     /// over `notice`.
     fn end_turn(&mut self, notice: Option<String>, cx: &mut Context<Self>) {
+        self.retrying = false;
         self.review.end_turn();
         self.release_in_flight(cx);
         if let Turn::Failed(reason) = std::mem::replace(&mut self.turn, Turn::Idle) {
@@ -1930,6 +1979,7 @@ impl CedianPanel {
 
     fn stop(&mut self, reason: String, cx: &mut Context<Self>) {
         self.link = None;
+        self.retrying = false;
         self.dialogs.clear();
         self.subagents.apply(&RouterEvent::Disconnected);
         for (id, call) in std::mem::take(&mut self.calls) {
@@ -2030,6 +2080,7 @@ impl CedianPanel {
                     message,
                     edit: Some(edit),
                     shown: None,
+                    promoting: false,
                 });
             }
             _ => {
@@ -2247,7 +2298,12 @@ impl CedianPanel {
     /// leaving at once (OMP's `followUpMode = all`) run as one turn. While
     /// Stop takes the queue back, OMP lists each removed entry gone before
     /// it answers the remove: those go through `take_back`, not here.
-    fn observe_follow_ups(&mut self, follow_up: &[String], cx: &mut Context<Self>) {
+    fn observe_follow_ups(
+        &mut self,
+        steering: &[String],
+        follow_up: &[String],
+        cx: &mut Context<Self>,
+    ) {
         if self.turn == Turn::Stopping {
             return;
         }
@@ -2269,10 +2325,20 @@ impl CedianPanel {
                 kept[i] = true;
             }
         }
+        // Steer now that OMP did: it left for the steering queue and joins
+        // the running turn.
+        let mut steering: Vec<&String> = steering.iter().collect();
         let mut drained = Vec::new();
         for i in (0..self.follow_ups.len()).rev() {
-            if !kept[i] && self.follow_ups[i].shown.is_some() {
-                drained.push(self.follow_ups.remove(i));
+            if kept[i] || self.follow_ups[i].shown.is_none() {
+                continue;
+            }
+            let queued = self.follow_ups.remove(i);
+            match steering.iter().position(|m| **m == queued.message) {
+                Some(j) if queued.promoting => {
+                    steering.remove(j);
+                }
+                _ => drained.push(queued),
             }
         }
         if drained.is_empty() {
@@ -2317,6 +2383,7 @@ impl CedianPanel {
                 message: text.clone(),
                 edit: None,
                 shown: None,
+                promoting: false,
             });
         }
         link.queue(text, steer);
@@ -2377,8 +2444,12 @@ impl CedianPanel {
             {
                 self.set_turn(Turn::Streaming)
             }
-            RouterEvent::Queue { follow_up, .. } => self.observe_follow_ups(follow_up, cx),
+            RouterEvent::Queue {
+                steering,
+                follow_up,
+            } => self.observe_follow_ups(steering, follow_up, cx),
             RouterEvent::Settled => {
+                self.retrying = false;
                 // OMP holds no follow-up once settled.
                 self.follow_ups.retain(|q| q.shown.is_none());
                 self.review.end_turn();
@@ -2698,7 +2769,8 @@ impl CedianPanel {
         self.toasts
             .iter()
             .enumerate()
-            .map(|(i, toast)| {
+            .map(|(i, (id, toast))| {
+                let id = *id;
                 let color = match toast.level {
                     cedian_omp::ToastLevel::Info => Color::Muted,
                     cedian_omp::ToastLevel::Warning => Color::Warning,
@@ -2718,9 +2790,7 @@ impl CedianPanel {
                             .child(
                                 Button::new(("cedian-toast-dismiss", i), "Dismiss").on_click(
                                     cx.listener(move |this, _, _, cx| {
-                                        if i < this.toasts.len() {
-                                            this.toasts.remove(i);
-                                        }
+                                        this.dismiss_toast(id);
                                         cx.notify();
                                     }),
                                 ),
@@ -5320,6 +5390,7 @@ mod tests {
                     message: message.clone(),
                     edit: Some(edit),
                     shown: None,
+                    promoting: false,
                 });
                 let queue = |follow_up: Vec<String>| RouterEvent::Queue {
                     steering: Vec::new(),
@@ -5393,7 +5464,172 @@ mod tests {
             message: message.to_string(),
             edit,
             shown: None,
+            promoting: false,
         }
+    }
+
+    fn promoted(text: &str, result: Result<bool, String>) -> LinkEvent {
+        LinkEvent::Promoted {
+            text: text.to_string(),
+            result,
+        }
+    }
+
+    /// Steer now that OMP refuses because it already ran the follow-up: the
+    /// follow-up had its own turn when it left the queue, no chip comes
+    /// back, and no later queue update "drains" it into a second turn.
+    #[gpui::test]
+    async fn a_refused_promote_of_a_follow_up_omp_ran_leaves_no_ghost(cx: &mut TestAppContext) {
+        let (f, _buffer) = fixture(cx).await;
+        f.window
+            .update(cx, |panel, window, cx| {
+                panel.set_turn(Turn::Streaming);
+                panel.follow_ups.push(follow_up("later", None));
+                panel.on_event(queue_of(vec!["later".to_string()]), cx);
+                let before = panel.review.current_turn();
+                assert_eq!(panel.begin_promote(0).as_deref(), Some("later"));
+                panel.on_event(queue_of(Vec::new()), cx);
+                assert_eq!(panel.review.current_turn(), before + 1, "it ran: its turn");
+                panel.on_link_event(promoted("later", Ok(false)), window, cx);
+                assert!(panel.queued_follow_ups().is_empty(), "no ghost chip");
+                panel.on_event(queue_of(Vec::new()), cx);
+                assert_eq!(panel.review.current_turn(), before + 1, "no second turn");
+                assert_eq!(
+                    panel.notice(),
+                    Some("OMP ran \"later\" as its own turn before it could steer")
+                );
+            })
+            .unwrap();
+    }
+
+    /// Steer now that OMP accepts: the follow-up leaves the follow-up queue
+    /// for the steering one, so it joins the running turn (no turn of its
+    /// own); one OMP refuses while still queued stays a chip.
+    #[gpui::test]
+    async fn a_promoted_follow_up_joins_the_turn_and_a_refused_one_stays(cx: &mut TestAppContext) {
+        let (f, _buffer) = fixture(cx).await;
+        f.window
+            .update(cx, |panel, window, cx| {
+                panel.set_turn(Turn::Streaming);
+                panel.follow_ups.push(follow_up("later", None));
+                panel.follow_ups.push(follow_up("after", None));
+                panel.on_event(queue_of(vec!["later".to_string(), "after".to_string()]), cx);
+                let before = panel.review.current_turn();
+                panel.begin_promote(0);
+                panel.on_event(
+                    RouterEvent::Queue {
+                        steering: vec!["later".to_string()],
+                        follow_up: vec!["after".to_string()],
+                    },
+                    cx,
+                );
+                panel.on_link_event(promoted("later", Ok(true)), window, cx);
+                assert_eq!(panel.review.current_turn(), before, "joined the turn");
+                assert_eq!(panel.queued_follow_ups(), ["after"]);
+                panel.begin_promote(0);
+                panel.on_link_event(promoted("after", Ok(false)), window, cx);
+                assert_eq!(panel.queued_follow_ups(), ["after"], "still queued");
+                panel.on_event(queue_of(vec!["after".to_string()]), cx);
+                assert_eq!(panel.review.current_turn(), before);
+            })
+            .unwrap();
+    }
+
+    fn toast(text: &str) -> LinkEvent {
+        LinkEvent::Event(RouterEvent::Toast(cedian_omp::Toast {
+            level: cedian_omp::ToastLevel::Info,
+            text: text.to_string(),
+        }))
+    }
+
+    /// Dismiss names its toast, not a place: a toast arriving between the
+    /// render and the click (the oldest falls off) does not shift it.
+    #[gpui::test]
+    async fn dismiss_removes_the_toast_it_was_rendered_with(cx: &mut TestAppContext) {
+        let (f, _buffer) = fixture(cx).await;
+        f.window
+            .update(cx, |panel, window, cx| {
+                for i in 0..MAX_TOASTS {
+                    panel.on_link_event(toast(&format!("t{i}")), window, cx);
+                }
+                let handle = panel.toast_handles()[3];
+                panel.on_link_event(toast("late"), window, cx);
+                panel.dismiss_toast(handle);
+                let texts: Vec<String> = panel.toasts().iter().map(|t| t.text.clone()).collect();
+                assert!(!texts.contains(&"t3".to_string()), "{texts:?}");
+                assert!(texts.contains(&"t4".to_string()), "{texts:?}");
+            })
+            .unwrap();
+    }
+
+    /// Restart forgets the old OMP's picker, toasts and notes; a settled
+    /// turn or a stop leaves no Stop retry; the notes are capped.
+    #[gpui::test]
+    async fn restart_and_settle_forget_the_old_session_state(cx: &mut TestAppContext) {
+        let (f, _buffer) = fixture(cx).await;
+        f.window
+            .update(cx, |panel, window, cx| {
+                panel.picker.model = Some("anthropic/claude-x".to_string());
+                panel.on_link_event(toast("old"), window, cx);
+                for i in 0..100 {
+                    panel.on_link_event(
+                        LinkEvent::Event(RouterEvent::RunNote {
+                            text: format!("note {i}"),
+                            retrying: Some(true),
+                        }),
+                        window,
+                        cx,
+                    );
+                }
+                assert!(panel.session_notes().len() <= 32, "capped");
+                assert_eq!(panel.session_notes().last().unwrap(), "note 99");
+                panel.on_event(RouterEvent::Settled, cx);
+                assert!(!panel.retrying(), "no Stop retry once settled");
+                panel.retrying = true;
+                panel.stop("gone".to_string(), cx);
+                assert!(!panel.retrying(), "no Stop retry once stopped");
+                panel.forget_old_omp(window, cx);
+                assert_eq!(panel.picker().model, None);
+                assert!(panel.toasts().is_empty());
+                assert!(panel.session_notes().is_empty());
+            })
+            .unwrap();
+    }
+
+    /// ADR-0057 decision 5 in the app: the person undoes the agent's hunk
+    /// and redoes it. The panel rebuilds the review on each of those edits,
+    /// so the hunk is STALE: Revert turn keeps the person's text and names
+    /// the hunk it kept.
+    #[gpui::test]
+    async fn undo_then_redo_of_an_agent_hunk_is_kept_by_revert_turn(cx: &mut TestAppContext) {
+        let (f, buffer) = fixture(cx).await;
+        tool_start(&f, cx, "c1", &["notes.txt"]);
+        omp_writes(&f, "/ws/notes.txt", "alpha\nBETA\ngamma\n").await;
+        tool_end(&f, cx, "c1");
+        settled(&f, cx);
+        buffer.update(cx, |b, cx| {
+            b.undo(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(buffer.read_with(cx, |b, _| b.text()), ORIGINAL);
+        buffer.update(cx, |b, cx| {
+            b.redo(cx);
+        });
+        cx.run_until_parked();
+        f.window
+            .update(cx, |panel, _, cx| {
+                let turn = panel.review.current_turn();
+                panel.revert_turn(turn, cx);
+                let notice = panel.notice().unwrap_or_default().to_string();
+                assert!(notice.contains("/notes.txt line 2"), "{notice}");
+                assert!(notice.contains("edited after the agent"), "{notice}");
+            })
+            .unwrap();
+        assert_eq!(
+            buffer.read_with(cx, |b, _| b.text()),
+            "alpha\nBETA\ngamma\n",
+            "nothing written over the redone text"
+        );
     }
 
     /// U10 fix 1: Restart while an inline edit is queued opens no edit turn

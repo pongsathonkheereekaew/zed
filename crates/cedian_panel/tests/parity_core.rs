@@ -5,7 +5,7 @@
 //! 1. One toast surface: `notice`, `extension_error`, the `notify` UI
 //!    request, `config_warnings_changed` and `ttsr_triggered` each show as
 //!    a toast with its level; Dismiss removes one.
-//! 2. The model and thinking-level picker: opening it reads `get_state`,
+//! 2. The model and thinking-level picker: connecting and opening it read `get_state`,
 //!    `get_available_models` and `get_available_thinking_levels`; picking a
 //!    model sends `set_model`, Next model `cycle_model`, a level
 //!    `set_thinking_level`, Next level `cycle_thinking_level` (replay checks
@@ -93,6 +93,13 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
     wait(cx, &window, "OMP ready", |p| {
         matches!(p.connection(), Connection::Ready { .. })
     });
+    wait(
+        cx,
+        &window,
+        "the closed picker reads OMP's state at connect",
+        |p| p.picker().model.is_some(),
+    );
+    assert_picker(cx, &window, "anthropic/claude-x", "high");
 
     // 1. Every OMP notice kind is a toast, with its level.
     submit(cx, &window, "hello");

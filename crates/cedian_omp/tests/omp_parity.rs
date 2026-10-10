@@ -82,38 +82,57 @@ fn every_omp_feature_in_wire_rs_has_a_parity_row() {
     );
 }
 
-/// The status cell (last column) of every table row, with its first column.
+/// The status cell of every table row, by its table's `Status` header, with
+/// its first column; a row with another number of cells has an empty one.
 fn statuses(ledger: &str) -> Vec<(String, String)> {
-    ledger
-        .lines()
-        .filter(|l| l.starts_with("| ") && !l.starts_with("|---"))
-        .filter_map(|l| {
-            let cells: Vec<&str> = l.trim_matches('|').split('|').map(str::trim).collect();
-            let status = *cells.last()?;
-            (status != "Status").then(|| (cells[0].to_string(), status.to_string()))
-        })
-        .collect()
+    let mut header: Option<(usize, usize)> = None;
+    let mut out = Vec::new();
+    for line in ledger.lines() {
+        if !line.starts_with("| ") {
+            if !line.starts_with("|---") {
+                header = None;
+            }
+            continue;
+        }
+        let cells: Vec<&str> = line.trim_matches('|').split('|').map(str::trim).collect();
+        match header {
+            None => {
+                header = cells
+                    .iter()
+                    .position(|c| *c == "Status")
+                    .map(|i| (i, cells.len()))
+            }
+            Some((at, width)) => {
+                let status = if cells.len() == width { cells[at] } else { "" };
+                out.push((cells[0].to_string(), status.to_string()));
+            }
+        }
+    }
+    out
 }
 
 /// Why `part` (one `;`-separated part of a status cell) is outside ADR-0057's
-/// vocabulary, if it is.
+/// vocabulary, if it is. A status is its exact word, then nothing or a
+/// parenthesised note.
 fn status_error(part: &str) -> Option<&'static str> {
-    let needs = |word: &str, what: &'static str| (!part.contains(word)).then_some(what);
-    if part.starts_with("native") || part.starts_with("pinned") {
-        None
-    } else if part.starts_with("internal") || part.starts_with("reviewer") {
-        None
-    } else if part.starts_with("gated") {
-        needs("ADR-", "`gated` names no ADR")
-    } else if part.starts_with("unused by decision") {
-        needs("ADR-", "`unused by decision` names no ADR")
-    } else if part.starts_with("upstream-blocked") {
-        needs("http", "`upstream-blocked` links no upstream issue")
-    } else if let Some(slice) = part.strip_prefix("deferred: ") {
-        let named = slice.starts_with('S') && slice[1..].starts_with(|c: char| c.is_ascii_digit());
-        (!named).then_some("`deferred` names no slice")
-    } else {
-        Some("not an ADR-0057 status")
+    if let Some(slice) = part.strip_prefix("deferred: S") {
+        let digits = slice.chars().take_while(char::is_ascii_digit).count();
+        let rest = &slice[digits..];
+        let named = digits > 0 && (rest.is_empty() || rest.starts_with(' '));
+        return (!named).then_some("`deferred` names no slice");
+    }
+    let (word, note) = match part.split_once(" (") {
+        Some((word, note)) if note.ends_with(')') => (word, note),
+        Some(_) => return Some("not an ADR-0057 status"),
+        None => (part, ""),
+    };
+    let needs = |what: &str, why: &'static str| (!note.contains(what)).then_some(why);
+    match word {
+        "native" | "pinned" | "internal" | "reviewer" => None,
+        "gated" => needs("ADR-", "`gated` names no ADR"),
+        "unused by decision" => needs("ADR-", "`unused by decision` names no ADR"),
+        "upstream-blocked" => needs("http", "`upstream-blocked` links no upstream issue"),
+        _ => Some("not an ADR-0057 status"),
     }
 }
 
@@ -159,6 +178,34 @@ fn every_parity_row_has_an_adr_0057_status() {
     );
 }
 
+/// The rows still `deferred: S9`, which S9 cannot close with. Listed here
+/// and printed, so a row cannot slip into or out of S9's partial exit
+/// unnoticed: changing one means changing this list.
+const DEFERRED_IN_S9: &[&str] = &[
+    "`abort_and_prompt`",
+    "`get_login_providers`, `login`",
+    "`set_host_tools`, `set_host_uri_schemes`",
+];
+
+#[test]
+fn the_rows_deferred_in_s9_are_the_listed_ones() {
+    let ledger = repo_file("cedian/OMP_PARITY.md");
+    let in_s9: Vec<String> = statuses(&ledger)
+        .into_iter()
+        .filter(|(_, status)| {
+            parts(status)
+                .iter()
+                .any(|part| part.starts_with("deferred: S9 ") || *part == "deferred: S9")
+        })
+        .map(|(name, _)| name)
+        .collect();
+    println!("deferred: S9 (S9 does not close with these):");
+    for name in &in_s9 {
+        println!("  {name}");
+    }
+    assert_eq!(in_s9, DEFERRED_IN_S9);
+}
+
 #[test]
 fn status_vocabulary_refuses_what_adr_0057_does() {
     for ok in [
@@ -181,9 +228,26 @@ fn status_vocabulary_refuses_what_adr_0057_does() {
         "deferred",
         "gated",
         "upstream-blocked",
+        "nativeX",
+        "natively planned S12",
+        "internal, later",
+        "internalfoo",
+        "reviewer anything",
+        "pinned later",
+        "deferred: S10x",
     ] {
         assert!(status_error(bad).is_some(), "{bad}");
     }
+    let table = "| Command | cedian surface | Status |\n|---|---|---|\n\
+                 | `a` | the panel | native |\n| `b` | native |\n";
+    assert_eq!(
+        statuses(table),
+        [
+            ("`a`".to_string(), "native".to_string()),
+            ("`b`".to_string(), String::new())
+        ],
+        "a row short of the header's cells has no status"
+    );
     assert_eq!(
         parts("native (a; b); deferred: S10"),
         ["native (a; b)", "deferred: S10"]

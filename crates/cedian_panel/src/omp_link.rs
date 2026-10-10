@@ -44,6 +44,10 @@ pub enum LinkEvent {
         resumed: bool,
         /// Set under `policy = "omp"` (ADR-0035): OMP's config decides.
         policy_note: Option<String>,
+        /// The session's model (`provider/id`) and thinking level, read once
+        /// it opened, for the closed picker.
+        model: Option<String>,
+        thinking: Option<omp_rpc::ThinkingLevel>,
     },
     /// The OMP the link runs is not the pinned one (ADR-0057 decision 4).
     OmpWarning(String),
@@ -696,6 +700,31 @@ impl Gate {
         (self.epoch() == epoch).then_some(sending)
     }
 
+    /// Promote the follow-up `text` clicked at `epoch` through `call`; on
+    /// yes, Stop's take-back looks for it in the steering queue.
+    fn promote(
+        &self,
+        epoch: u64,
+        text: &str,
+        call: impl FnOnce(&str) -> Result<bool, String>,
+    ) -> Result<bool, String> {
+        let Some(_sending) = self.admit(epoch) else {
+            return Err("Stop came first; it was not steered".to_string());
+        };
+        let result = call(text);
+        if result == Ok(true) {
+            let mut queue = self.queue.lock();
+            if let Some(entry) = queue
+                .accepted
+                .iter_mut()
+                .find(|(t, steer)| t == text && !*steer)
+            {
+                entry.1 = true;
+            }
+        }
+        result
+    }
+
     /// OMP accepted a steer or follow-up.
     fn accepted(&self, text: &str, steer: bool) {
         self.queue.lock().accepted.push((text.to_string(), steer));
@@ -1098,6 +1127,7 @@ impl OmpLink {
     /// in the current turn. Stop's take-back then looks for it there.
     pub fn promote(&self, text: String) {
         let gate = Arc::clone(&self.gate);
+        let epoch = gate.epoch();
         let Some(control) = gate.control.lock().clone() else {
             let _ = gate.events.unbounded_send(LinkEvent::Promoted {
                 text,
@@ -1106,26 +1136,14 @@ impl OmpLink {
             return;
         };
         std::thread::spawn(move || {
-            let result = {
-                let _sending = gate.sending.lock();
-                let result = control
+            let result = gate.promote(epoch, &text, |text| {
+                control
                     .call(&PromoteQueuedMessageCommand {
-                        message: text.clone(),
+                        message: text.to_string(),
                     })
                     .map(|r| r.promoted)
-                    .map_err(|e| e.to_string());
-                if result == Ok(true) {
-                    let mut queue = gate.queue.lock();
-                    if let Some(entry) = queue
-                        .accepted
-                        .iter_mut()
-                        .find(|(t, steer)| *t == text && !*steer)
-                    {
-                        entry.1 = true;
-                    }
-                }
-                result
-            };
+                    .map_err(|e| e.to_string())
+            });
             let _ = gate
                 .events
                 .unbounded_send(LinkEvent::Promoted { text, result });
@@ -1334,18 +1352,22 @@ fn run(
             reason,
         })
     };
-    let ready = |session: &Session| LinkEvent::Ready {
+    let ready = |session: &Session, state: Option<omp_rpc::SessionState>| LinkEvent::Ready {
         session_id: session.id.clone(),
         session_file: session.file.clone(),
         resumed: session.resumed,
         policy_note: chosen.badge.clone(),
+        model: state.as_ref().and_then(|s| s.model.as_ref()).map(model_key),
+        thinking: state.and_then(|s| s.thinking_level),
     };
     let first = if session.resumed {
         taken(&session)
     } else {
         None
     };
-    let _ = events.unbounded_send(first.unwrap_or_else(|| ready(&session)));
+    let _ = events.unbounded_send(
+        first.unwrap_or_else(|| ready(&session, runtime.control().call(&GetStateCommand {}).ok())),
+    );
     let idle = |turn: &mut TurnState| turn.phase = Phase::Idle;
     for command in commands {
         if gate.turn.lock().closed {
@@ -1383,7 +1405,8 @@ fn run(
                 }
             }
             Command::Retry => {
-                let _ = events.unbounded_send(taken(&session).unwrap_or_else(|| ready(&session)));
+                let _ =
+                    events.unbounded_send(taken(&session).unwrap_or_else(|| ready(&session, None)));
             }
             Command::NewSession => {
                 let refused = |reason: String| LinkEvent::Taken {
@@ -1393,11 +1416,11 @@ fn run(
                 let event = match runtime.new_session(None, "app") {
                     Ok(NewSession::Started(state)) => {
                         session = Session {
-                            id: state.session_id,
-                            file: state.session_file,
+                            id: state.session_id.clone(),
+                            file: state.session_file.clone(),
                             resumed: false,
                         };
-                        ready(&session)
+                        ready(&session, Some(state))
                     }
                     Ok(NewSession::Unknown(e)) => LinkEvent::Failed(format!(
                         "OMP started a new session but did not say which: {e}"
@@ -1854,6 +1877,37 @@ mod tests {
         assert!(!gate.turn.lock().unprompted, "our own run read late");
         gate.observe_run(&RouterEvent::AgentStart);
         assert!(gate.turn.lock().unprompted, "the next one is OMP's");
+    }
+
+    #[test]
+    fn a_promote_after_stop_is_not_sent() {
+        let gate = Arc::new(bare_gate());
+        gate.accepted("later", false);
+        let epoch = gate.epoch();
+        gate.cancel(false);
+        let mut sent = false;
+        let result = gate.promote(epoch, "later", |_| {
+            sent = true;
+            Ok(true)
+        });
+        assert!(!sent, "Stop came between the click and the call");
+        assert!(result.is_err(), "{result:?}");
+        let (calls, _) = removes(&gate, |_| Ok(true));
+        assert_eq!(calls, [("later".to_string(), false)], "still a follow-up");
+    }
+
+    #[test]
+    fn a_promoted_follow_up_is_taken_back_as_a_steer_and_a_refused_one_is_not() {
+        let gate = Arc::new(bare_gate());
+        gate.accepted("later", false);
+        gate.accepted("after", false);
+        assert_eq!(gate.promote(gate.epoch(), "later", |_| Ok(true)), Ok(true));
+        assert_eq!(
+            gate.promote(gate.epoch(), "after", |_| Ok(false)),
+            Ok(false)
+        );
+        let (calls, _) = removes(&gate, |_| Ok(true));
+        assert_eq!(calls, [steer("later"), ("after".to_string(), false)]);
     }
 
     #[test]

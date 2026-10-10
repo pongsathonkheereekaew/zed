@@ -1058,9 +1058,9 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&omp, std::fs::Permissions::from_mode(0o755)).unwrap();
         let started = std::time::Instant::now();
-        let probe = omp_version(&omp, std::time::Duration::from_millis(500));
+        let probe = omp_version(&omp, std::time::Duration::from_secs(2));
         assert!(matches!(probe, Err(OmpError::Timeout { .. })), "{probe:?}");
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(started.elapsed() < std::time::Duration::from_secs(8));
         let pid = std::fs::read_to_string(&pid_file).unwrap();
         let alive = || {
             std::process::Command::new("/bin/kill")

@@ -1932,6 +1932,44 @@ mod tests {
         assert_eq!(text(&f, cx), "alpha\nbeta\ngamma\ndelta by user\n");
     }
 
+    /// ADR-0057 decision 5: the person undoes an agent hunk, then redoes
+    /// it, with a rebuild after each as the panel makes on every edit. The
+    /// hunk stays STALE, so Revert turn never writes over the person's
+    /// text, and its notice names the hunk it kept.
+    #[gpui::test]
+    async fn undo_then_redo_of_an_agent_hunk_stays_stale(cx: &mut TestAppContext) {
+        let mut f = setup(cx).await;
+        agent_writes(&mut f, "c1", "alpha\nBETA\ngamma\n", cx).await;
+        f.review.end_turn();
+        f.buffer.update(cx, |b, cx| {
+            b.undo(cx);
+        });
+        assert_eq!(
+            text(&f, cx),
+            ORIGINAL,
+            "the person's undo takes the agent's write back"
+        );
+        cx.update(|cx| f.review.rebuild(cx));
+        f.buffer.update(cx, |b, cx| {
+            b.redo(cx);
+        });
+        assert_eq!(text(&f, cx), "alpha\nBETA\ngamma\n");
+        cx.update(|cx| f.review.rebuild(cx));
+        let event = cx.update(|cx| f.review.revert_turn(1, cx)).unwrap();
+        assert_eq!(
+            event,
+            ReviewEvent::TurnReverted {
+                turn: 1,
+                reverted: 0,
+                stale: vec!["/notes.txt line 2".to_string()],
+                overwritten: 0,
+                accepted: 0,
+            }
+        );
+        assert_eq!(text(&f, cx), "alpha\nBETA\ngamma\n", "nothing written over");
+        assert!(event.to_string().contains("/notes.txt line 2"));
+    }
+
     #[gpui::test]
     async fn revert_of_a_streaming_turn_is_refused(cx: &mut TestAppContext) {
         let mut f = setup(cx).await;

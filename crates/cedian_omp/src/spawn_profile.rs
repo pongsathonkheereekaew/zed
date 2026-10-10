@@ -572,13 +572,22 @@ fn run_captured(
         .map_err(|e| OmpError::Spawn(format!("omp {what}: {e}")))?;
     // Drain stdout while waiting: output larger than the pipe buffer
     // would otherwise block the child until the timeout.
-    let reader = child.stdout.take().map(|mut stdout| {
+    let (sent, read) = std::sync::mpsc::channel();
+    if let Some(mut stdout) = child.stdout.take() {
         std::thread::spawn(move || {
             let mut out = String::new();
             let _ = stdout.read_to_string(&mut out);
-            out
-        })
-    });
+            let _ = sent.send(out);
+        });
+    }
+    // The whole group: a launcher's child holding stdout would otherwise
+    // keep the reader thread blocked for good.
+    let kill_group = |child: &std::process::Child| {
+        if let Ok(pid) = i32::try_from(child.id()) {
+            // SAFETY: signals only the group this call spawned.
+            unsafe { libc::killpg(pid, libc::SIGKILL) };
+        }
+    };
     let deadline = std::time::Instant::now() + timeout;
     let status = loop {
         if let Some(status) = child
@@ -588,16 +597,9 @@ fn run_captured(
             break status;
         }
         if std::time::Instant::now() >= deadline {
-            // The whole group: a launcher's child holding stdout would
-            // otherwise keep the reader thread blocked for good.
-            if let Ok(pid) = i32::try_from(child.id()) {
-                // SAFETY: signals only the group this call spawned.
-                unsafe { libc::killpg(pid, libc::SIGKILL) };
-            }
+            kill_group(&child);
             let _ = child.wait();
-            if let Some(reader) = reader {
-                let _ = reader.join();
-            }
+            let _ = read.recv();
             return Err(OmpError::Timeout {
                 command: what,
                 after: Some(timeout),
@@ -605,7 +607,12 @@ fn run_captured(
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     };
-    let out = reader.and_then(|r| r.join().ok()).unwrap_or_default();
+    // The launcher exited; what is left of its group gets until the deadline.
+    let left = deadline.saturating_duration_since(std::time::Instant::now());
+    let out = read.recv_timeout(left).unwrap_or_else(|_| {
+        kill_group(&child);
+        read.recv().unwrap_or_default()
+    });
     if !status.success() {
         return Err(OmpError::Spawn(format!("omp {what}: {status}")));
     }
@@ -634,6 +641,24 @@ pub fn resolve_on_path(name: &str, path_var: Option<&str>) -> Result<PathBuf, Om
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A launcher that exits while its child keeps stdout open returns
+    /// within the timeout, with what it printed.
+    #[test]
+    fn a_grandchild_holding_stdout_does_not_outlast_the_timeout() {
+        let dir = std::env::temp_dir().join(format!("cedian-grandchild-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("omp");
+        std::fs::write(&script, "#!/bin/sh\necho 18.6.1\nsleep 20 &\n").unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = std::time::Instant::now();
+        let out = run_captured(&script, &dir, &[], std::time::Duration::from_secs(2));
+        let took = started.elapsed();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(took < std::time::Duration::from_secs(5), "took {took:?}");
+        assert_eq!(out.unwrap().trim(), "18.6.1");
+    }
 
     fn profile() -> SpawnProfile {
         SpawnProfile {

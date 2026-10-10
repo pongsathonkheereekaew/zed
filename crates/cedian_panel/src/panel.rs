@@ -1979,6 +1979,8 @@ impl CedianPanel {
 
     fn stop(&mut self, reason: String, cx: &mut Context<Self>) {
         self.link = None;
+        self.omp_policy = None;
+        self.omp_warning = None;
         self.retrying = false;
         self.dialogs.clear();
         self.subagents.apply(&RouterEvent::Disconnected);
@@ -2334,7 +2336,8 @@ impl CedianPanel {
                 continue;
             }
             let queued = self.follow_ups.remove(i);
-            match steering.iter().position(|m| **m == queued.message) {
+            let text = queued.shown.as_ref().unwrap_or(&queued.message);
+            match steering.iter().position(|m| *m == text) {
                 Some(j) if queued.promoting => {
                     steering.remove(j);
                 }
@@ -5531,6 +5534,47 @@ mod tests {
                 assert_eq!(panel.queued_follow_ups(), ["after"], "still queued");
                 panel.on_event(queue_of(vec!["after".to_string()]), cx);
                 assert_eq!(panel.review.current_turn(), before);
+            })
+            .unwrap();
+    }
+
+    /// A slash command or template OMP expanded: its queue lists it by the
+    /// expanded text in both queues, so Steer now still joins the turn.
+    #[gpui::test]
+    async fn a_promoted_expanded_follow_up_joins_the_turn(cx: &mut TestAppContext) {
+        let (f, _buffer) = fixture(cx).await;
+        f.window
+            .update(cx, |panel, window, cx| {
+                panel.set_turn(Turn::Streaming);
+                panel.follow_ups.push(follow_up("/x", None));
+                panel.on_event(queue_of(vec!["expanded x".to_string()]), cx);
+                let before = panel.review.current_turn();
+                panel.begin_promote(0);
+                panel.on_event(
+                    RouterEvent::Queue {
+                        steering: vec!["expanded x".to_string()],
+                        follow_up: Vec::new(),
+                    },
+                    cx,
+                );
+                panel.on_link_event(promoted("/x", Ok(true)), window, cx);
+                assert_eq!(panel.review.current_turn(), before, "joined the turn");
+                assert!(panel.queued_follow_ups().is_empty());
+            })
+            .unwrap();
+    }
+
+    /// A launch that fails clears the `policy = "omp"` badge placeholder.
+    #[gpui::test]
+    async fn a_failed_launch_leaves_no_policy_badge(cx: &mut TestAppContext) {
+        let (f, _buffer) = fixture(cx).await;
+        f.window
+            .update(cx, |panel, window, cx| {
+                panel.omp_policy = Some("OMP policy (reading it…)".to_string());
+                panel.omp_warning = Some("omp 18.7.0, pin 18.6.1".to_string());
+                panel.on_link_event(LinkEvent::Failed("no omp".to_string()), window, cx);
+                assert_eq!(panel.omp_policy_badge(), None);
+                assert_eq!(panel.omp_warning(), None);
             })
             .unwrap();
     }

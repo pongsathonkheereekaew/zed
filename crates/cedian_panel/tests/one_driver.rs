@@ -5,7 +5,7 @@
 //! 1. OMP resumes a session another process holds: the panel says so,
 //!    offers "Start a new session" and "Retry", and refuses prompts;
 //! 2. Retry while it is still held changes nothing; once the holder exits,
-//!    Retry opens the session;
+//!    Retry opens the session and reads its model for the picker;
 //! 3. a holder that appears later stops the next prompt before OMP sees it;
 //! 4. "Start a new session" moves to a fresh session, which takes prompts.
 //!
@@ -152,6 +152,14 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
     wait(cx, &window, "the session to open", |p| {
         matches!(p.connection(), Connection::Ready { resumed: true, .. })
     });
+    assert_eq!(
+        window
+            .update(cx, |p, _, _| p.picker().model.clone())
+            .unwrap()
+            .as_deref(),
+        Some("anthropic/claude-x"),
+        "Retry read the session's state for the closed picker"
+    );
 
     // 3. A driver appears before the next prompt.
     let holder = hold(&held);

@@ -77,9 +77,11 @@ impl OmpSettings {
         let workdir = this.workdir.clone();
         std::thread::spawn(move || {
             let _ = tx.send(LaunchSpec::resolve(&workdir).and_then(|mut spec| {
-                let chosen = spec.choose()?;
+                // Not `choose`: the policy badge is the panel's, not this page's.
+                let (binary, _) = spec.choose_binary()?;
+                spec.read_allows(&binary)?;
                 let pinned = spec.policy.overlay().map_err(|e| e.to_string())?;
-                Ok((OmpConfig::new(chosen.binary), overlay_keys(&pinned)))
+                Ok((OmpConfig::new(binary), overlay_keys(&pinned)))
             }));
         });
         cx.spawn(async move |this, cx| {

@@ -335,6 +335,19 @@ impl LaunchSpec {
     /// under `policy = "omp"` the badge (ADR-0035 decision 4). Fills in
     /// `binary` and `policy`; returns the off-pin warning and the badge.
     pub fn choose(&mut self) -> Result<Chosen, String> {
+        let (binary, warning) = self.choose_binary()?;
+        self.read_allows(&binary)?;
+        let badge = (self.policy_source == Policy::Omp)
+            .then(|| cedian_shell::launch::omp_policy_badge(&binary, &self.workdir));
+        Ok(Chosen {
+            binary,
+            warning,
+            badge,
+        })
+    }
+
+    /// The `omp` to run and its pin warning, without reading OMP's config.
+    pub fn choose_binary(&mut self) -> Result<(PathBuf, Option<String>), String> {
         let warning = match &self.binary {
             Some(_) => None,
             None => {
@@ -343,23 +356,16 @@ impl LaunchSpec {
                 omp.warning
             }
         };
-        let binary = self.binary.clone().ok_or("no omp binary")?;
-        let badge = match self.policy_source {
-            Policy::Cedian => {
-                self.policy.config_allows =
-                    cedian_shell::launch::config_allows(&binary, &self.workdir)?;
-                None
-            }
-            Policy::Omp => Some(cedian_shell::launch::omp_policy_badge(
-                &binary,
-                &self.workdir,
-            )),
-        };
-        Ok(Chosen {
-            binary,
-            warning,
-            badge,
-        })
+        Ok((self.binary.clone().ok_or("no omp binary")?, warning))
+    }
+
+    /// Under cedian's policy, the tools OMP's config allows, which the
+    /// overlay pins to a prompt.
+    pub fn read_allows(&mut self, binary: &Path) -> Result<(), String> {
+        if self.policy_source == Policy::Cedian {
+            self.policy.config_allows = cedian_shell::launch::config_allows(binary, &self.workdir)?;
+        }
+        Ok(())
     }
 }
 
@@ -1405,8 +1411,9 @@ fn run(
                 }
             }
             Command::Retry => {
-                let _ =
-                    events.unbounded_send(taken(&session).unwrap_or_else(|| ready(&session, None)));
+                let _ = events.unbounded_send(taken(&session).unwrap_or_else(|| {
+                    ready(&session, runtime.control().call(&GetStateCommand {}).ok())
+                }));
             }
             Command::NewSession => {
                 let refused = |reason: String| LinkEvent::Taken {

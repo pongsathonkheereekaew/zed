@@ -295,51 +295,6 @@ fn host_tools(
     Ok(tools)
 }
 
-/// The opt-in badge (ADR-0035 decision 4): OMP's effective approval mode
-/// and `computer`, and whether the workspace's own `.omp/config.yml` set them
-/// (OMP's answer in the workspace differs from its answer in an empty dir).
-fn omp_policy_badge(workdir: &Path) -> String {
-    let binary = omp_binary_path();
-    let empty = std::env::temp_dir().join(format!("cedian-omp-global-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&empty);
-    let get = |cwd: &Path, key: &str| {
-        let binary = binary.as_ref().ok()?;
-        cedian_omp::omp_config_get(binary, cwd, key, Duration::from_secs(10)).ok()
-    };
-    let describe = |key: &str, show: &dyn Fn(&serde_json::Value) -> String| {
-        let here = get(workdir, key);
-        let from = if here.is_some() && here != get(&empty, key) {
-            " from the project's .omp/config.yml"
-        } else {
-            ""
-        };
-        match here {
-            Some(v) => format!("{}{from}", show(&v)),
-            None => "unknown, assume on".to_string(),
-        }
-    };
-    let mode = describe("tools.approvalMode", &|v| {
-        v.as_str().unwrap_or("unknown").to_string()
-    });
-    let computer = describe("computer.enabled", &|v| {
-        if v.as_bool() == Some(true) {
-            "on"
-        } else {
-            "off"
-        }
-        .to_string()
-    });
-    let _ = std::fs::remove_dir(&empty);
-    format!(
-        "◆ OMP policy — approvals and computer from your OMP config (approvalMode: {mode}; computer: {computer})"
-    )
-}
-
-/// The `omp` binary a spawn will run (ADR-0057 decision 4).
-fn omp_binary_path() -> Result<PathBuf, String> {
-    cedian_shell::launch::omp_binary().map(|choice| choice.binary)
-}
-
 /// Spawn the runtime with workspace host tools + cedian:// wired.
 fn spawn(
     session_dir: &Path,
@@ -359,7 +314,10 @@ fn spawn(
         println!("note: {note}");
     }
     if choice.policy == cedian_shell::Policy::Omp {
-        println!("{}", omp_policy_badge(workdir));
+        println!(
+            "{}",
+            cedian_shell::launch::omp_policy_badge(&omp.binary, workdir)
+        );
         let p = &settings.permissions;
         if [p.safe, p.project_write, p.dangerous].contains(&cedian_shell::Verdict::Ask) {
             println!(

@@ -45,6 +45,11 @@ pub enum LinkEvent {
         /// Set under `policy = "omp"` (ADR-0035): OMP's config decides.
         policy_note: Option<String>,
     },
+    /// The OMP the link runs is not the pinned one (ADR-0057 decision 4).
+    OmpWarning(String),
+    /// The `policy = "omp"` badge, with what OMP's config says (ADR-0035
+    /// decision 4).
+    OmpPolicy(String),
     /// One of OMP's events, `Disconnected` included.
     Event(RouterEvent),
     /// OMP could not start, or its session could not open.
@@ -195,17 +200,20 @@ pub struct Prompt {
     pub images: Vec<ImageContent>,
 }
 
-/// Everything one launch needs, resolved before any process starts.
+/// Everything one launch needs, resolved before any process starts. What
+/// needs `omp` itself to run is left to [`LaunchSpec::choose`], off the UI
+/// thread.
 pub struct LaunchSpec {
-    pub binary: PathBuf,
-    /// Set when `binary` is not the pinned OMP (ADR-0057 decision 4).
-    pub omp_warning: Option<String>,
+    /// `None`: chosen by [`LaunchSpec::choose`] (ADR-0057 decision 4).
+    pub binary: Option<PathBuf>,
     pub workdir: PathBuf,
     /// The workspace's state dir: the spawn overlay (`omp/`) and the audit log.
     pub state_dir: PathBuf,
     pub sessions: Sessions,
     pub policy: SpawnPolicy,
-    pub policy_note: Option<String>,
+    /// `policy = "omp"` (ADR-0035): OMP's config decides, and the panel
+    /// shows the badge.
+    pub policy_source: Policy,
     /// OMP's state root, where session owner leases live.
     pub omp_state: Option<PathBuf>,
     /// The host URI schemes registered before the session opens.
@@ -240,8 +248,6 @@ impl LaunchSpec {
     /// dialog); the panel adds its `cedian://` scheme.
     pub fn resolve(workdir: &Path) -> Result<Self, String> {
         let settings = cedian_shell::resolve_settings(workdir).map_err(|e| e.to_string())?;
-        let omp = cedian_shell::launch::omp_binary()?;
-        let binary = omp.binary;
         let choice = settings.policy_for(workdir, RunKind::Interactive);
         let state_dir = cedian_shell::state::dir(workdir)?;
         let router: Arc<OnceLock<Arc<EventRouter>>> = Arc::default();
@@ -301,25 +307,14 @@ impl LaunchSpec {
             ));
             names.push(cedian_worker::WORKTREE_REQUEST_TOOL);
         }
-        let mut policy = cedian_shell::launch::spawn_policy(&settings, choice.policy, &names);
-        let policy_note = match choice.policy {
-            Policy::Cedian => {
-                policy.config_allows = cedian_shell::launch::config_allows(&binary, workdir)?;
-                None
-            }
-            Policy::Omp => Some(
-                "policy = \"omp\": OMP's own config decides approvals, computer and task isolation"
-                    .to_string(),
-            ),
-        };
+        let policy = cedian_shell::launch::spawn_policy(&settings, choice.policy, &names);
         Ok(Self {
-            binary,
-            omp_warning: omp.warning,
+            binary: None,
             workdir: workdir.to_path_buf(),
             state_dir,
             sessions: Sessions::OmpDefault,
             policy,
-            policy_note,
+            policy_source: choice.policy,
             omp_state: cedian_omp::driver::state_root(),
             uris: Vec::new(),
             tools,
@@ -330,6 +325,45 @@ impl LaunchSpec {
             settings,
         })
     }
+
+    /// What needs `omp` to run, so never on the UI thread: the binary
+    /// (ADR-0057 decision 4), the ADR-0041 pin of OMP's own allows, and
+    /// under `policy = "omp"` the badge (ADR-0035 decision 4). Fills in
+    /// `binary` and `policy`; returns the off-pin warning and the badge.
+    pub fn choose(&mut self) -> Result<Chosen, String> {
+        let warning = match &self.binary {
+            Some(_) => None,
+            None => {
+                let omp = cedian_shell::launch::omp_binary()?;
+                self.binary = Some(omp.binary);
+                omp.warning
+            }
+        };
+        let binary = self.binary.clone().ok_or("no omp binary")?;
+        let badge = match self.policy_source {
+            Policy::Cedian => {
+                self.policy.config_allows =
+                    cedian_shell::launch::config_allows(&binary, &self.workdir)?;
+                None
+            }
+            Policy::Omp => Some(cedian_shell::launch::omp_policy_badge(
+                &binary,
+                &self.workdir,
+            )),
+        };
+        Ok(Chosen {
+            binary,
+            warning,
+            badge,
+        })
+    }
+}
+
+/// What [`LaunchSpec::choose`] found.
+pub struct Chosen {
+    pub binary: PathBuf,
+    pub warning: Option<String>,
+    pub badge: Option<String>,
 }
 
 /// Where the app's reviewer runs: its run dir and the role it reads sit
@@ -1175,6 +1209,20 @@ fn run(
     gate: Arc<Gate>,
     previous: Option<Previous>,
 ) {
+    let mut spec = spec;
+    let chosen = match spec.choose() {
+        Ok(chosen) => chosen,
+        Err(e) => {
+            let _ = events.unbounded_send(LinkEvent::Failed(e));
+            return;
+        }
+    };
+    if let Some(warning) = chosen.warning {
+        let _ = events.unbounded_send(LinkEvent::OmpWarning(warning));
+    }
+    if let Some(badge) = &chosen.badge {
+        let _ = events.unbounded_send(LinkEvent::OmpPolicy(badge.clone()));
+    }
     match AuditLog::open(&spec.state_dir, spec.policy.approvals) {
         Ok(audit) => gate.state.lock().audit = Some(audit),
         Err(e) => {
@@ -1185,7 +1233,7 @@ fn run(
         }
     }
     let mut runtime = match OmpRuntime::spawn(RuntimeConfig {
-        binary: OmpBinary::Bundled(spec.binary),
+        binary: OmpBinary::Bundled(chosen.binary),
         session_dir: spec.state_dir.join("omp"),
         sessions: spec.sessions,
         cwd: spec.workdir,
@@ -1290,7 +1338,7 @@ fn run(
         session_id: session.id.clone(),
         session_file: session.file.clone(),
         resumed: session.resumed,
-        policy_note: spec.policy_note.clone(),
+        policy_note: chosen.badge.clone(),
     };
     let first = if session.resumed {
         taken(&session)
@@ -1890,13 +1938,12 @@ mod tests {
         std::fs::create_dir_all(root.join("ws")).unwrap();
         let root = root.canonicalize().unwrap();
         let spec = || LaunchSpec {
-            binary: cedian_shell::launch::omp_binary().unwrap().binary,
-            omp_warning: None,
+            binary: Some(cedian_shell::launch::omp_binary().unwrap().binary),
             workdir: root.join("ws"),
             state_dir: root.join("state"),
             sessions: Sessions::OmpDefault,
             policy: SpawnPolicy::default(),
-            policy_note: None,
+            policy_source: Policy::Cedian,
             omp_state: cedian_omp::driver::state_root(),
             uris: Vec::new(),
             tools: Vec::new(),
@@ -1918,7 +1965,7 @@ mod tests {
         let (first, resumed, file) = ready(&mut rx);
         assert!(!resumed);
         let file = PathBuf::from(file.expect("OMP names the session file"));
-        let agent = cedian_omp::OmpConfig::new(spec().binary)
+        let agent = cedian_omp::OmpConfig::new(spec().binary.unwrap())
             .dir(&root)
             .unwrap();
         assert!(

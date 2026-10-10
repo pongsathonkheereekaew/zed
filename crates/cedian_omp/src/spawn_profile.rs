@@ -557,9 +557,11 @@ fn run_captured(
     timeout: std::time::Duration,
 ) -> Result<String, OmpError> {
     use std::io::Read as _;
+    use std::os::unix::process::CommandExt as _;
     let what = args.join(" ");
     let mut child = std::process::Command::new(binary)
         .args(args)
+        .process_group(0)
         .current_dir(cwd)
         .env_clear()
         .envs(scrub_env(std::env::vars()))
@@ -586,8 +588,16 @@ fn run_captured(
             break status;
         }
         if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
+            // The whole group: a launcher's child holding stdout would
+            // otherwise keep the reader thread blocked for good.
+            if let Ok(pid) = i32::try_from(child.id()) {
+                // SAFETY: signals only the group this call spawned.
+                unsafe { libc::killpg(pid, libc::SIGKILL) };
+            }
             let _ = child.wait();
+            if let Some(reader) = reader {
+                let _ = reader.join();
+            }
             return Err(OmpError::Timeout {
                 command: what,
                 after: Some(timeout),
@@ -1029,6 +1039,44 @@ mod tests {
         let raw = std::fs::read_to_string(&plan.overlay_path).unwrap();
         let parsed: Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(parsed["computer"]["enabled"], false);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_hung_version_probe_takes_its_children_down() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("cedian-hung-omp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (omp, pid_file) = (dir.join("omp"), dir.join("pid"));
+        std::fs::write(
+            &omp,
+            format!(
+                "#!/bin/sh\n/bin/sleep 30 &\necho $! > {}\nwait\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&omp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = std::time::Instant::now();
+        let probe = omp_version(&omp, std::time::Duration::from_millis(500));
+        assert!(matches!(probe, Err(OmpError::Timeout { .. })), "{probe:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let alive = || {
+            std::process::Command::new("/bin/kill")
+                .args(["-0", pid.trim()])
+                .status()
+                .unwrap()
+                .success()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while alive() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            !alive(),
+            "the probe's grandchild, which holds its stdout, is killed too"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

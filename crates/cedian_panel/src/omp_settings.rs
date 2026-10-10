@@ -56,7 +56,7 @@ impl OmpSettings {
         })
         .detach();
         let value = cx.new(|cx| Editor::single_line(window, cx));
-        let mut this = Self {
+        let this = Self {
             focus_handle: cx.focus_handle(),
             project,
             workdir,
@@ -71,18 +71,36 @@ impl OmpSettings {
             selected: None,
             _watch: None,
         };
-        match LaunchSpec::resolve(&this.workdir).and_then(|spec| {
-            let pinned = spec.policy.overlay().map_err(|e| e.to_string())?;
-            Ok((OmpConfig::new(spec.binary), overlay_keys(&pinned)))
-        }) {
-            Ok((config, pinned)) => {
-                this.config = Some(config);
-                this.pinned = Arc::new(pinned);
-                this.watch(cx);
-                this.reload(cx);
-            }
-            Err(e) => this.message = Some(e),
-        }
+        // `omp` runs to choose the binary and read its allows: off the UI
+        // thread (ADR-0057 decision 4).
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let workdir = this.workdir.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(LaunchSpec::resolve(&workdir).and_then(|mut spec| {
+                let chosen = spec.choose()?;
+                let pinned = spec.policy.overlay().map_err(|e| e.to_string())?;
+                Ok((OmpConfig::new(chosen.binary), overlay_keys(&pinned)))
+            }));
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(resolved) = rx.await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                match resolved {
+                    Ok((config, pinned)) => {
+                        this.config = Some(config);
+                        this.pinned = Arc::new(pinned);
+                        this.watch(cx);
+                        this.reload(cx);
+                    }
+                    Err(e) => this.message = Some(e),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
         this
     }
 

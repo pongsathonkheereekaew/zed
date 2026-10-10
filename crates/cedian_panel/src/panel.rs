@@ -347,6 +347,9 @@ pub struct CedianPanel {
     toasts: Vec<cedian_omp::Toast>,
     /// The OMP the panel runs is not the pinned one (ADR-0057 decision 4).
     omp_warning: Option<String>,
+    /// The `policy = "omp"` badge (ADR-0035 decision 4), shown while the
+    /// launch runs under it.
+    omp_policy: Option<String>,
     /// The correction ledger's last failed write: one line, however many
     /// rows failed, so a ledger that keeps failing does not grow the notice.
     ledger_error: Option<String>,
@@ -482,6 +485,7 @@ impl CedianPanel {
             link: None,
             connection: Connection::NotStarted,
             omp_warning: None,
+            omp_policy: None,
             toasts: Vec::new(),
             picker: ModelPicker::default(),
             session_notes: Vec::new(),
@@ -612,6 +616,10 @@ impl CedianPanel {
 
     pub fn omp_warning(&self) -> Option<&str> {
         self.omp_warning.as_deref()
+    }
+
+    pub fn omp_policy_badge(&self) -> Option<&str> {
+        self.omp_policy.as_deref()
     }
 
     pub fn connection(&self) -> &Connection {
@@ -1272,7 +1280,10 @@ impl CedianPanel {
                 return;
             }
         };
-        self.omp_warning = spec.omp_warning.clone();
+        self.omp_warning = None;
+        self.omp_policy = (spec.policy_source == cedian_shell::Policy::Omp).then(|| {
+            "◆ OMP policy — approvals and computer from your OMP config (reading it…)".to_string()
+        });
         self.state_dir = Some(spec.state_dir.clone());
         self.refresh_workflow(cx);
         if self.browser.is_none() {
@@ -1715,6 +1726,8 @@ impl CedianPanel {
                     policy_note,
                 };
             }
+            LinkEvent::OmpWarning(warning) => self.omp_warning = Some(warning),
+            LinkEvent::OmpPolicy(badge) => self.omp_policy = Some(badge),
             LinkEvent::Failed(reason) => self.stop(reason, cx),
             LinkEvent::Taken { session_id, reason } => {
                 if self.turn != Turn::Idle {
@@ -3862,10 +3875,11 @@ impl Render for CedianPanel {
                 "OMP ready, session {} ({}){}",
                 session_id.get(..8).unwrap_or(session_id),
                 if *resumed { "resumed" } else { "new" },
-                policy_note
-                    .as_deref()
-                    .map(|n| format!(" · {n}"))
-                    .unwrap_or_default()
+                if policy_note.is_some() {
+                    " · OMP policy"
+                } else {
+                    ""
+                }
             ),
             Connection::Stopped(reason) => reason.clone(),
             Connection::Taken { session_id, reason } => format!(
@@ -3988,6 +4002,17 @@ impl Render for CedianPanel {
             .child(self.render_picker(cx))
             .child(self.render_session(cx))
             .children(self.render_toasts(cx))
+            .when_some(self.omp_policy.clone(), |panel, badge| {
+                panel.child(
+                    div()
+                        .debug_selector(|| "cedian-omp-policy".to_string())
+                        .child(
+                            Label::new(badge)
+                                .size(LabelSize::Small)
+                                .color(Color::Warning),
+                        ),
+                )
+            })
             .when_some(self.omp_warning.clone(), |panel, warning| {
                 panel.child(
                     div()

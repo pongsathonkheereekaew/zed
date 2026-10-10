@@ -17,6 +17,7 @@
 //!    `abort_retry`; Steer now on a queued follow-up sends
 //!    `promote_queued_message`, and the follow-up joins the running turn
 //!    with no review turn of its own.
+//! 4. Under `policy = "omp"` the panel shows the OMP policy badge.
 //!
 //! Harness off: invoked with `--mode` (or `config`) this binary is fake-omp.
 
@@ -50,7 +51,7 @@ fn main() {
         std::env::set_var("CEDIAN_CONFIG", root.join("cedian.toml"));
         std::env::set_var("CEDIAN_STATE_DIR", root.join("state"));
         std::env::set_var("HOME", root.join("home"));
-        std::env::set_var("CEDIAN_OMP_BINARY", std::env::current_exe().unwrap());
+        std::env::set_var("CEDIAN_OMP_BINARY", slow_version(&root));
     }
     print!("test parity_core ... ");
     gpui::run_test_once(
@@ -81,7 +82,13 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
     let state = cedian_shell::state::dir(&ws).unwrap();
     cedian_fake_omp::install_replay(&state.join("omp"), Path::new(FIXTURE)).unwrap();
     let project = Project::test(fs::RealFs::new(None, cx.executor()), [ws.as_path()], cx).await;
+    let opened = Instant::now();
     let window = cx.add_window(|window, cx| CedianPanel::new(project.clone(), window, cx));
+    assert!(
+        opened.elapsed() < Duration::from_secs(1),
+        "the panel opens while `omp --version` is still running ({:?})",
+        opened.elapsed()
+    );
     let mut vcx = VisualTestContext::from_window(window.into(), cx);
     wait(cx, &window, "OMP ready", |p| {
         matches!(p.connection(), Connection::Ready { .. })
@@ -213,6 +220,51 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
         "the promoted follow-up opened no turn of its own"
     );
     assert_connected(cx, &window);
+
+    // 4. Under `policy = "omp"` the panel shows the badge, with what OMP's
+    //    config says (ADR-0035 decision 4).
+    assert!(
+        window
+            .update(cx, |p, _, _| p.omp_policy_badge().is_none())
+            .unwrap(),
+        "no badge under cedian's policy"
+    );
+    std::fs::write(
+        root.join("cedian.toml"),
+        format!(
+            "schema = 1\n[projects.{:?}]\npolicy = \"omp\"\n",
+            ws.display().to_string()
+        ),
+    )
+    .unwrap();
+    window
+        .update(cx, |p, window, cx| p.restart(window, cx))
+        .unwrap();
+    wait(cx, &window, "the OMP policy badge", |p| {
+        p.omp_policy_badge()
+            .is_some_and(|b| b.contains("OMP policy") && b.contains("approvalMode: write"))
+    });
+    assert!(
+        rendered(&mut vcx, "cedian-omp-policy").is_some(),
+        "the badge renders"
+    );
+}
+
+/// fake-omp behind a launcher whose `--version` takes 2 s, so a probe on
+/// the UI thread shows as a slow panel open.
+fn slow_version(root: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = root.join("slow-omp");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then /bin/sleep 2; fi\nexec {:?} \"$@\"\n",
+            std::env::current_exe().unwrap()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
 }
 
 fn level(p: &CedianPanel) -> Option<&'static str> {

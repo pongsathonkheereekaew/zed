@@ -4,9 +4,6 @@ version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 
-# The host side of the editor: WorkspaceHost and cedian:// URIs.
-# No integration tests: the live ones drove cedian_apply_edit (ADR-0057).
-autotests = false
 
 [dependencies]
 omp-rpc = { path = "../../vendor/omp-rpc" }

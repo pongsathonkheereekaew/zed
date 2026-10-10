@@ -437,8 +437,26 @@ pub struct Onboarding {
     pub running: Option<String>,
     /// OMP's sign-in page for the running login, kept as a link.
     pub url: Option<omp_rpc::OpenUrlUiRequest>,
+    /// The dialogs OMP opened during the running login (its code prompt).
+    pub dialogs: Vec<String>,
+    /// A login finished and the picker is being re-read: when OMP still has
+    /// no model, the providers are read again.
+    pub logged_in: bool,
     /// OMP's refusal of the provider list or of the last login.
     pub error: Option<String>,
+}
+
+/// Whether the system browser may open a login's page: `https`, or
+/// `http` to this machine (OMP's `launchUrl` loopback redirect). Any other
+/// scheme is refused, named.
+fn login_link(link: &str) -> Result<String, String> {
+    let parsed = url::Url::parse(link).map_err(|e| format!("not a URL ({e}): {link}"))?;
+    let local = matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    match parsed.scheme() {
+        "https" => Ok(link.to_string()),
+        "http" if local => Ok(link.to_string()),
+        scheme => Err(format!("refused to open a {scheme}: page: {link}")),
+    }
 }
 
 /// The toasts kept: older ones fall off.
@@ -1915,6 +1933,13 @@ impl CedianPanel {
             }
             LinkEvent::Event(RouterEvent::UiRequest(ExtensionUiRequest::Cancel(cancel))) => {
                 self.dialogs.shift_remove(&cancel.target_id);
+                if let Some(onboarding) = &mut self.onboarding
+                    && onboarding.dialogs.contains(&cancel.target_id)
+                {
+                    onboarding.running = None;
+                    onboarding.url = None;
+                    onboarding.dialogs.clear();
+                }
             }
             LinkEvent::Event(RouterEvent::UiRequest(ExtensionUiRequest::OpenUrl(request))) => {
                 self.open_url(request, cx);
@@ -1930,6 +1955,11 @@ impl CedianPanel {
                         cx.background_executor().timer(DIALOG_TIMEOUT).await;
                         this.update(cx, |this, cx| this.expire(&expiring, cx)).ok();
                     }));
+                    if let Some(onboarding) = &mut self.onboarding
+                        && onboarding.running.is_some()
+                    {
+                        onboarding.dialogs.push(id.clone());
+                    }
                     self.dialogs.insert(id, dialog);
                 }
             }
@@ -1988,13 +2018,18 @@ impl CedianPanel {
                 }
             }
             LinkEvent::LoggedIn { provider, result } => {
+                // A cancelled login's late result leaves a later one running.
                 if let Some(onboarding) = &mut self.onboarding {
-                    onboarding.running = None;
-                    onboarding.url = None;
+                    if onboarding.running.as_deref() == Some(provider.as_str()) {
+                        onboarding.running = None;
+                        onboarding.url = None;
+                        onboarding.dialogs.clear();
+                    }
                     match result {
                         Ok(()) => {
                             if let Some(link) = &self.link {
                                 link.refresh_picker();
+                                onboarding.logged_in = true;
                             }
                         }
                         Err(e) => onboarding.error = Some(format!("login with {provider}: {e}")),
@@ -2004,6 +2039,11 @@ impl CedianPanel {
             LinkEvent::Picker(Ok(state)) => {
                 if state.model.is_some() {
                     self.onboarding = None;
+                } else if let Some(onboarding) = &mut self.onboarding
+                    && std::mem::take(&mut onboarding.logged_in)
+                    && let Some(link) = &self.link
+                {
+                    link.login_providers();
                 }
                 self.picker.models = state.models;
                 self.picker.levels = state.levels;
@@ -2889,10 +2929,16 @@ impl CedianPanel {
     /// only shown, so OMP or an extension cannot open pages unasked.
     fn open_url(&mut self, request: omp_rpc::OpenUrlUiRequest, cx: &mut Context<Self>) {
         match &mut self.onboarding {
-            Some(onboarding) if onboarding.running.is_some() => {
-                cx.open_url(&request.url);
-                onboarding.url = Some(request);
-            }
+            Some(onboarding) if onboarding.running.is_some() => match login_link(&request.url) {
+                Ok(link) => {
+                    cx.open_url(&link);
+                    onboarding.url = Some(request);
+                }
+                Err(e) => self.push_toast(cedian_omp::Toast {
+                    level: cedian_omp::ToastLevel::Warning,
+                    text: format!("OMP's login: {e}"),
+                }),
+            },
             _ => self.push_toast(cedian_omp::Toast {
                 level: cedian_omp::ToastLevel::Info,
                 text: format!("OMP asks to open {}", request.url),
@@ -2917,6 +2963,23 @@ impl CedianPanel {
         onboarding.running = Some(provider.clone());
         onboarding.error = None;
         link.login(provider);
+        cx.notify();
+    }
+
+    /// Cancel on a running login: OMP has no call to stop one, so its
+    /// open prompts are dismissed (OMP's login then fails on its own) and
+    /// the view leaves "signing in…" now.
+    fn cancel_login(&mut self, cx: &mut Context<Self>) {
+        let Some(onboarding) = &mut self.onboarding else {
+            return;
+        };
+        onboarding.running = None;
+        onboarding.url = None;
+        for id in std::mem::take(&mut onboarding.dialogs) {
+            if self.dialogs.contains_key(&id) {
+                self.answer(&id, UserAnswer::Dismiss, cx);
+            }
+        }
         cx.notify();
     }
 
@@ -2956,8 +3019,23 @@ impl CedianPanel {
                     "OMP has no model to use yet: log in to a provider.",
                 ))
                 .child(h_flex().flex_wrap().gap_1().children(providers))
+                .when(running.is_some(), |panel| {
+                    panel.child(
+                        div()
+                            .debug_selector(|| "cedian-login-cancel".to_string())
+                            .child(
+                                Button::new("cedian-login-cancel", "Cancel")
+                                    .on_click(cx.listener(|this, _, _, cx| this.cancel_login(cx))),
+                            ),
+                    )
+                })
                 .when_some(onboarding.url.clone(), |panel, url| {
-                    let link = url.launch_url.clone().unwrap_or_else(|| url.url.clone());
+                    // The shown link is the one opened: `launchUrl` is OMP's
+                    // truncation-safe copy of `url`.
+                    let Ok(link) = login_link(url.launch_url.as_deref().unwrap_or(&url.url)) else {
+                        return panel;
+                    };
+                    let shown = link.clone();
                     panel.child(
                         v_flex()
                             .debug_selector(|| "cedian-login-url".to_string())
@@ -2965,8 +3043,8 @@ impl CedianPanel {
                                 panel.child(Label::new(text).size(LabelSize::Small))
                             })
                             .child(
-                                Button::new("cedian-login-url", link)
-                                    .on_click(move |_, _, cx| cx.open_url(&url.url)),
+                                Button::new("cedian-login-url", shown)
+                                    .on_click(move |_, _, cx| cx.open_url(&link)),
                             ),
                     )
                 })
@@ -4463,6 +4541,80 @@ mod tests {
     use gpui::{Modifiers, TestAppContext, VisualTestContext};
     use settings::SettingsStore;
     use std::time::{Duration, Instant};
+
+    /// A login ends in the view when OMP cancels its code prompt or the
+    /// person presses Cancel; a late result for an earlier login leaves
+    /// a later one running.
+    #[gpui::test]
+    async fn a_login_can_be_cancelled_and_a_stale_result_is_ignored(cx: &mut TestAppContext) {
+        init(cx);
+        let project = Project::test(fs::FakeFs::new(cx.executor()), [], cx).await;
+        let window = cx.add_window(|window, cx| CedianPanel::new(project.clone(), window, cx));
+        let running = |provider: &str| Onboarding {
+            running: Some(provider.to_string()),
+            dialogs: vec!["login-code".to_string()],
+            ..Default::default()
+        };
+        window
+            .update(cx, |panel, window, cx| {
+                panel.onboarding = Some(running("anthropic"));
+                panel.on_link_event(
+                    LinkEvent::Event(RouterEvent::UiRequest(ExtensionUiRequest::Cancel(
+                        omp_rpc::CancelUiRequest {
+                            id: "c1".into(),
+                            target_id: "login-code".into(),
+                        },
+                    ))),
+                    window,
+                    cx,
+                );
+                assert_eq!(
+                    panel.onboarding.as_ref().unwrap().running,
+                    None,
+                    "OMP cancelled"
+                );
+
+                panel.onboarding = Some(running("anthropic"));
+                panel.cancel_login(cx);
+                assert_eq!(panel.onboarding.as_ref().unwrap().running, None, "Cancel");
+
+                panel.onboarding = Some(running("openai-codex"));
+                panel.on_link_event(
+                    LinkEvent::LoggedIn {
+                        provider: "anthropic".into(),
+                        result: Err("cancelled".into()),
+                    },
+                    window,
+                    cx,
+                );
+                assert_eq!(
+                    panel.onboarding.as_ref().unwrap().running.as_deref(),
+                    Some("openai-codex")
+                );
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn a_login_opens_only_https_or_a_local_http_page() {
+        let open = login_link;
+        for refused in [
+            "file:///Applications/Calculator.app",
+            "x-custom-app://run",
+            "javascript:alert(1)",
+            "http://example.com/login",
+        ] {
+            assert!(open(refused).is_err(), "{refused} must be refused");
+        }
+        assert!(open("file:///etc").unwrap_err().contains("file"));
+        for opened in [
+            "https://auth.example.com/authorize?x=1",
+            "http://localhost:1455/callback",
+            "http://127.0.0.1:8080/",
+        ] {
+            assert_eq!(open(opened).as_deref(), Ok(opened));
+        }
+    }
 
     fn init(cx: &mut TestAppContext) {
         cx.update(|cx| {

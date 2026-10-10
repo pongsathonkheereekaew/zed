@@ -36,6 +36,7 @@ editor.workspace = true
 fs.workspace = true
 futures.workspace = true
 gpui.workspace = true
+url.workspace = true
 language.workspace = true
 log.workspace = true
 omp-rpc = { path = "../../vendor/omp-rpc" }

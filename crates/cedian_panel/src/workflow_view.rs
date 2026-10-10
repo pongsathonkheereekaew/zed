@@ -20,6 +20,21 @@ pub struct WorkflowView {
     /// The last `cedian_complete`: accepted or not, and each claim with its
     /// label, evidence and flag.
     pub claims: Option<String>,
+    /// The files an edit must touch to change what this view shows: every
+    /// file the evidence binds, or all when some binds the whole tree.
+    pub covers: Covers,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Covers {
+    pub tree: bool,
+    pub files: std::collections::BTreeSet<String>,
+}
+
+impl Covers {
+    pub fn covers(&self, path: &str) -> bool {
+        self.tree || self.files.contains(path)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +86,16 @@ impl WorkflowView {
                 .parse::<u64>()
                 .unwrap_or(u64::MAX)
         });
+        let mut covers = Covers::default();
+        for e in &items {
+            match &e.code_state {
+                Some(cedian_workflow::CodeState::Files(files)) => {
+                    covers.files.extend(files.keys().cloned())
+                }
+                Some(cedian_workflow::CodeState::Tree(_)) => covers.tree = true,
+                None => {}
+            }
+        }
         let evidence = items
             .iter()
             .map(|e| {
@@ -110,6 +135,7 @@ impl WorkflowView {
             gates,
             evidence,
             claims,
+            covers,
         }
     }
 }

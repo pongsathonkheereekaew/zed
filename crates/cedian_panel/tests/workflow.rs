@@ -85,6 +85,7 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
     });
     let ws = root.join("ws");
     std::fs::write(ws.join("notes.txt"), "alpha\nbeta\ngamma\n").unwrap();
+    std::fs::write(ws.join("other.txt"), "delta\n").unwrap();
     let state = cedian_shell::state::dir(&ws).unwrap();
     cedian_fake_omp::install_replay(&state.join("omp"), Path::new(FIXTURE)).unwrap();
 
@@ -176,15 +177,38 @@ async fn scenario(cx: &mut TestAppContext, root: &Path) {
 
     // 4. A keystroke in notes.txt, never saved, makes its evidence stale
     // (ADR-0057 decision 7): evidence binds to the Zed buffer's version.
+    // Typing in a file no evidence covers scans nothing; typing in a
+    // covered one scans once, after the typing pauses.
+    let reads = |cx: &mut TestAppContext| window.update(cx, |p, _, _| p.workflow_reads()).unwrap();
+    let pause = |cx: &mut TestAppContext| {
+        cx.executor().advance_clock(Duration::from_millis(400));
+        cx.run_until_parked();
+    };
+    let before = reads(cx);
+    let other = project
+        .update(cx, |p, cx| p.open_local_buffer(ws.join("other.txt"), cx))
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        other.update(cx, |b, cx| b.edit([(0..0, "y")], None, cx));
+        cx.run_until_parked();
+    }
+    pause(cx);
+    assert_eq!(reads(cx), before, "other.txt is no evidence's file");
     let buffer = project
         .update(cx, |p, cx| p.open_local_buffer(ws.join("notes.txt"), cx))
         .await
         .unwrap();
-    buffer.update(cx, |b, cx| b.edit([(0..0, "x")], None, cx));
+    for _ in 0..3 {
+        buffer.update(cx, |b, cx| b.edit([(0..0, "x")], None, cx));
+        cx.run_until_parked();
+    }
+    pause(cx);
     wait(cx, &window, "the unsaved edit to stale e1", |p| {
         p.workflow()
             .is_some_and(|w| w.evidence[0].contains("stale: notes.txt changed since"))
     });
+    assert_eq!(reads(cx), before + 1, "one scan for the typing");
     assert_eq!(
         std::fs::read_to_string(ws.join("notes.txt")).unwrap(),
         "alpha\nbeta\ngamma\n",

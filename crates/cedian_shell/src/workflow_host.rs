@@ -69,8 +69,19 @@ pub fn bound_call(calls: &[FinishedToolCall], tool: &str, needle: &str) -> Optio
 /// The workspace hashed now. Files over the buffer cap are hashed by size
 /// and mtime, not read.
 pub fn current_state(workdir: &Path) -> CurrentState {
+    current_state_unless(workdir, &std::sync::atomic::AtomicBool::new(false))
+        .expect("never stopped")
+}
+
+/// [`current_state`], given up (`None`) as soon as `stop` is set.
+pub fn current_state_unless(
+    workdir: &Path,
+    stop: &std::sync::atomic::AtomicBool,
+) -> Option<CurrentState> {
+    let stopped = || stop.load(std::sync::atomic::Ordering::Relaxed);
     let files: Vec<(String, Vec<u8>)> = workspace_files::scan_code_state_files(workdir)
         .into_iter()
+        .take_while(|_| !stopped())
         .filter_map(|path| {
             let rel = path
                 .strip_prefix(workdir)
@@ -92,11 +103,14 @@ pub fn current_state(workdir: &Path) -> CurrentState {
             Some((rel, bytes))
         })
         .collect();
-    CurrentState::from_files(
+    if stopped() {
+        return None;
+    }
+    Some(CurrentState::from_files(
         files
             .iter()
             .map(|(rel, bytes)| (rel.clone(), bytes.as_slice())),
-    )
+    ))
 }
 
 /// §54 escalation: `why` went unanswered. A running workflow blocks at
@@ -178,6 +192,17 @@ pub fn end_turn(
 mod tests {
     use super::*;
     use cedian_workflow::{TaskKind, TaskProfile, WorkflowState};
+
+    #[test]
+    fn a_stopped_scan_gives_up() {
+        let dir = crate::test_dir::TestDir::new("scan-stop");
+        std::fs::write(dir.join("a.txt"), "a").unwrap();
+        let stop = std::sync::atomic::AtomicBool::new(true);
+        assert!(current_state_unless(&dir, &stop).is_none());
+        stop.store(false, std::sync::atomic::Ordering::Relaxed);
+        let state = current_state_unless(&dir, &stop).unwrap();
+        assert!(state.files.contains_key("a.txt"), "{state:?}");
+    }
 
     #[test]
     fn an_unanswered_dialog_blocks_a_running_workflow_only() {

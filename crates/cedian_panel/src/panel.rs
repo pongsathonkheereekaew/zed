@@ -51,6 +51,7 @@ pub const BROWSER_GATE: &str = "browser";
 use project::Project;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use ui::{Button, Label, prelude::*};
 use workspace::{
@@ -383,6 +384,8 @@ pub struct CedianPanel {
     /// The channel OMP's workflow tools call, once OMP was started.
     workflow_channel: Option<Arc<WorkflowChannel>>,
     _workflow_load: Option<Task<()>>,
+    /// The workspace scans the workflow view has started.
+    workflow_reads: usize,
     /// The §54 escalation the blocked workflow waits on the person for.
     escalation: Option<String>,
     _worktree_changes: Option<Subscription>,
@@ -458,6 +461,10 @@ fn login_link(link: &str) -> Result<String, String> {
         scheme => Err(format!("refused to open a {scheme}: page: {link}")),
     }
 }
+
+/// How long typing in a file the shown evidence covers pauses before the
+/// workflow view re-reads the workspace.
+const UNSAVED_DEBOUNCE: Duration = Duration::from_millis(300);
 
 /// The toasts kept: older ones fall off.
 const MAX_TOASTS: usize = 8;
@@ -549,6 +556,7 @@ impl CedianPanel {
             state_dir: None,
             workflow: None,
             _workflow_load: None,
+            workflow_reads: 0,
             workflow_channel: None,
             escalation: None,
             workspace: None,
@@ -607,36 +615,42 @@ impl CedianPanel {
                         | BufferEvent::Saved
                         | BufferEvent::Reloaded
                         | BufferEvent::FileHandleChanged
-                ) && this.note_unsaved(&buffer, cx)
-                    && this.workflow.is_some()
+                ) && let Some(path) = this.note_unsaved(&buffer, cx)
+                    && this
+                        .workflow
+                        .as_ref()
+                        .is_some_and(|w| w.covers.covers(&path))
                 {
-                    this.refresh_workflow(cx);
+                    this.load_workflow(UNSAVED_DEBOUNCE, cx);
                 }
             }));
     }
 
     /// Record `buffer`'s version while it has unsaved edits (ADR-0057
-    /// decision 7); a saved buffer is the disk again. Whether it changed.
-    fn note_unsaved(&mut self, buffer: &Entity<Buffer>, cx: &App) -> bool {
+    /// decision 7); a saved buffer is the disk again. Its workspace path,
+    /// when that changed.
+    fn note_unsaved(&mut self, buffer: &Entity<Buffer>, cx: &App) -> Option<String> {
         let (Some(root), Some(file)) = (
             self.workspace_root(cx),
             project::File::from_dyn(buffer.read(cx).file()),
         ) else {
-            return false;
+            return None;
         };
-        let abs = language::LocalFile::abs_path(file, cx);
-        let Ok(rel) = abs.strip_prefix(&root) else {
-            return false;
-        };
+        // A symlinked root or a buffer opened through its target: both
+        // sides resolved, the key is the path the disk scan uses.
+        let canonical = |path: PathBuf| path.canonicalize().unwrap_or(path);
+        let abs = canonical(language::LocalFile::abs_path(file, cx));
+        let rel = abs.strip_prefix(canonical(root)).ok()?;
         let rel = rel.to_string_lossy().into_owned();
         let buffer = buffer.read(cx);
         let mut unsaved = self.unsaved.lock();
-        if buffer.is_dirty() {
+        let changed = if buffer.is_dirty() {
             let version = format!("unsaved {:?}", buffer.version());
-            unsaved.insert(rel, version.clone()) != Some(version)
+            unsaved.insert(rel.clone(), version.clone()) != Some(version)
         } else {
             unsaved.remove(&rel).is_some()
-        }
+        };
+        changed.then_some(rel)
     }
 
     /// The workspace whose active editor and selection OMP is told about.
@@ -649,6 +663,10 @@ impl CedianPanel {
             })
         });
         self.workspace = Some(workspace);
+    }
+
+    pub fn workflow_reads(&self) -> usize {
+        self.workflow_reads
     }
 
     pub fn session_notes(&self) -> &[String] {
@@ -2661,29 +2679,24 @@ impl CedianPanel {
     /// Read the workflow again, off the UI thread: its gates are evaluated
     /// against the workspace hashed now (row H).
     fn refresh_workflow(&mut self, cx: &mut Context<Self>) {
-        let (Ok(dir), Some(root)) = (self.state_dir(cx), self.workspace_root(cx)) else {
-            return;
-        };
-        let live = |status| matches!(status, WorkflowStatus::Running | WorkflowStatus::Blocked);
-        // A finished workflow's gates no longer change: once shown, it is
-        // not hashed again on every turn. `None` keeps the view.
-        let shown_finished = self.workflow.as_ref().is_some_and(|v| !live(v.status));
-        let frame_seq = self.current_state().frame_seq;
-        let unsaved = self.unsaved.lock().clone();
-        let read = cx.background_spawn(async move {
-            if !cedian_shell::workflow_store::exists(&dir) {
-                return Ok(Some(None));
-            }
-            let state = cedian_shell::workflow_store::load(&dir)?;
-            if shown_finished && !live(state.status) {
-                return Ok(None);
-            }
-            let mut current = cedian_shell::workflow_host::current_state(&root);
-            current.frame_seq = frame_seq;
-            current.overlay(&unsaved);
-            Ok::<_, String>(Some(Some(WorkflowView::new(&state, &current))))
-        });
+        self.load_workflow(Duration::ZERO, cx);
+    }
+
+    /// Re-read the workflow after `delay`. A later load supersedes this
+    /// one: its wait ends and a workspace scan already running stops.
+    fn load_workflow(&mut self, delay: Duration, cx: &mut Context<Self>) {
         self._workflow_load = Some(cx.spawn(async move |this, cx| {
+            if !delay.is_zero() {
+                cx.background_executor().timer(delay).await;
+            }
+            let stop = Arc::new(AtomicBool::new(false));
+            let _stop_on_drop = util::defer({
+                let stop = stop.clone();
+                move || stop.store(true, Ordering::Relaxed)
+            });
+            let Ok(Some(read)) = this.update(cx, |this, cx| this.read_workflow(stop, cx)) else {
+                return;
+            };
             let view = read.await;
             this.update(cx, |this, cx| {
                 match view {
@@ -2695,6 +2708,40 @@ impl CedianPanel {
             })
             .ok();
         }));
+    }
+
+    /// `Ok(None)`: keep the view (finished and shown, or the scan stopped).
+    fn read_workflow(
+        &mut self,
+        stop: Arc<AtomicBool>,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<Result<Option<Option<WorkflowView>>, String>>> {
+        let (Ok(dir), Some(root)) = (self.state_dir(cx), self.workspace_root(cx)) else {
+            return None;
+        };
+        let live = |status| matches!(status, WorkflowStatus::Running | WorkflowStatus::Blocked);
+        // A finished workflow's gates no longer change: once shown, it is
+        // not hashed again on every turn.
+        let shown_finished = self.workflow.as_ref().is_some_and(|v| !live(v.status));
+        let frame_seq = self.current_state().frame_seq;
+        let unsaved = self.unsaved.lock().clone();
+        self.workflow_reads += 1;
+        Some(cx.background_spawn(async move {
+            if !cedian_shell::workflow_store::exists(&dir) {
+                return Ok(Some(None));
+            }
+            let state = cedian_shell::workflow_store::load(&dir)?;
+            if shown_finished && !live(state.status) {
+                return Ok(None);
+            }
+            let Some(mut current) = cedian_shell::workflow_host::current_state_unless(&root, &stop)
+            else {
+                return Ok(None);
+            };
+            current.frame_seq = frame_seq;
+            current.overlay(&unsaved);
+            Ok::<_, String>(Some(Some(WorkflowView::new(&state, &current))))
+        }))
     }
 
     /// §54: during a workflow, a question nobody answered blocks its
@@ -4593,6 +4640,40 @@ mod tests {
                 );
             })
             .unwrap();
+    }
+
+    /// Through a symlinked worktree root, an unsaved buffer is keyed by
+    /// the same workspace path the disk scan uses.
+    #[gpui::test]
+    async fn an_unsaved_buffer_under_a_symlinked_root_keys_its_workspace_path(
+        cx: &mut TestAppContext,
+    ) {
+        init(cx);
+        cx.executor().allow_parking();
+        let dir = std::env::temp_dir().join(format!("cedian-symroot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::fs::write(dir.join("real/notes.txt"), "a\n").unwrap();
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).unwrap();
+        let link = dir.join("link");
+        let project =
+            Project::test(fs::RealFs::new(None, cx.executor()), [link.as_path()], cx).await;
+        let window = cx.add_window(|window, cx| CedianPanel::new(project.clone(), window, cx));
+        let buffer = project
+            .update(cx, |p, cx| {
+                p.open_local_buffer(dir.join("real/notes.txt"), cx)
+            })
+            .await
+            .unwrap();
+        buffer.update(cx, |b, cx| b.edit([(0..0, "x")], None, cx));
+        cx.run_until_parked();
+        let keys: Vec<String> = window
+            .update(cx, |panel, _, _| {
+                panel.unsaved.lock().keys().cloned().collect()
+            })
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(keys, ["notes.txt"]);
     }
 
     #[test]
